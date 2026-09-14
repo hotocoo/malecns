@@ -21,17 +21,12 @@ import { DRACOLoader } from "/vendor/three/loaders/DRACOLoader.js";
 import { RGBELoader } from "/vendor/three/loaders/RGBELoader.js";
 import { buildBarriers, buildBuildings, buildPiers, buildTunnel, buildWater } from "/scenery.js";
 
-const ROAD_TEXTURE_METRES = 6; // one asphalt tile covers this many metres
-const KERB_WIDTH = 1.2;
-const LINE_WIDTH = 0.25;
-const CAR_LENGTH_M = 4.5; // Ferrari 458 model's native size; scaled to the W11's 5.7 m
-const W11_LENGTH_M = 5.7;
-/* Drop a Mercedes-AMG F1 W11 glTF at web/assets/w11.glb and it replaces the
- * stand-in body: the model is scaled to W11_LENGTH_M along its longest
- * horizontal axis, rested on the ground and pointed down sim +x. `forward`
- * is the model's own nose direction ("-z" is the glTF convention). Nodes
- * named like wheels/tyres spin with the simulated speed. */
-const W11_MODEL = { url: "/assets/w11.glb", forward: "-z" };
+/* All dimensions, camera figures, asset URLs and colours come from the
+ * server's DriveStyleConfig (track.style) and CarConfig (track.car): nothing
+ * about the vehicle or the scene is written here. A car glTF at
+ * `style.car_model_url` replaces the stand-in body; either model is fitted to
+ * the physics footprint (track.car.length x track.car.width) from its own
+ * bounding box, so what you see is exactly what can hit the barrier. */
 
 /* Sim frame -> world frame: sim x is world x, sim y is world -z, up is +y. */
 const toWorld = (x, y, h = 0) => new THREE.Vector3(x, h, -y);
@@ -131,16 +126,17 @@ function kerbTexture() {
 /* ------------------------------------------------------------------ viewer */
 
 export class DriveView {
-  constructor(canvas) {
+  constructor(canvas, style) {
     this.canvas = canvas;
+    this.style = style;
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 0.85;
+    this.renderer.toneMappingExposure = style.exposure;
 
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(55, 1.6, 0.3, 2400);
+    this.camera = new THREE.PerspectiveCamera(style.camera_fov_deg, 1.6, 0.3, 2400);
     this.cameraGoal = new THREE.Vector3(0, 5, 12);
     this.lookGoal = new THREE.Vector3();
     this.camera.position.copy(this.cameraGoal);
@@ -155,8 +151,8 @@ export class DriveView {
   }
 
   _initLights() {
-    const sun = new THREE.DirectionalLight(0xfff2dc, 3.2);
-    sun.position.set(60, 90, 30);
+    const sun = new THREE.DirectionalLight(0xfff2dc, this.style.sun_intensity);
+    sun.position.set(...this.style.sun_offset_m);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
     sun.shadow.bias = -0.0004;
@@ -169,7 +165,7 @@ export class DriveView {
     this.sun = sun;
     this.scene.add(sun, sun.target);
     this.scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x4a5a3a, 0.35));
-    this.scene.fog = new THREE.FogExp2(0xb9c6d3, 0.0014);
+    this.scene.fog = new THREE.FogExp2(0xb9c6d3, this.style.fog_density);
   }
 
   _initSky() {
@@ -196,7 +192,8 @@ export class DriveView {
       metalness: 0.0,
       color: 0x9a9a9a,
     });
-    const road = new THREE.Mesh(ribbon(frames, -hw, hw, 0.0, ROAD_TEXTURE_METRES), asphalt);
+    const st = this.style;
+    const road = new THREE.Mesh(ribbon(frames, -hw, hw, 0.0, st.road_texture_m), asphalt);
     road.receiveShadow = true;
     this.scene.add(road);
 
@@ -207,24 +204,26 @@ export class DriveView {
     // wall: lidar rays end there and a body touching it has crashed.
     [-1, 1].forEach((side) => {
       const kerb = new THREE.Mesh(
-        ribbon(frames, side * (hw - KERB_WIDTH), side * hw, 0.04, 2.5),
+        ribbon(frames, side * (hw - st.kerb_width_m), side * hw, 0.04, 2.5),
         kerbMaterial,
       );
       kerb.receiveShadow = true;
       this.scene.add(kerb);
       const line = new THREE.Mesh(
-        ribbon(frames, side * (hw - LINE_WIDTH - 0.5), side * (hw - 0.5), 0.01, 1),
+        ribbon(frames, side * (hw - st.line_width_m - st.line_inset_m), side * (hw - st.line_inset_m), 0.01, 1),
         new THREE.MeshStandardMaterial({ color: 0xe8e4d8, roughness: 0.6 }),
       );
       this.scene.add(line);
     });
 
-    // Triple-stacked Armco with posts every 2 m along both edges, as on a
-    // street circuit; the rail sits just outside the kerb.
-    this.scene.add(buildBarriers(frames, hw + 0.03));
+    // Armco with posts along both edges; the rail face stands where the
+    // physics puts the wall (the road edge) plus the configured offset.
+    this.sceneryStyle = null;
+    this.frames = frames;
+    this.barrierOffset = hw;
 
-    const urban = track.layout === "monaco";
-    const groundRepeat = urban ? [420, 420] : [140, 140];
+    const urban = track.urban;
+    const groundRepeat = urban ? st.ground_repeat_urban : st.ground_repeat_rural;
     const groundMaterial = new THREE.MeshStandardMaterial({
       map: loadTexture(this.textures, urban ? "/assets/asphalt_diff.jpg" : "/assets/ground_diff.jpg", groundRepeat, THREE.SRGBColorSpace),
       normalMap: loadTexture(this.textures, urban ? "/assets/asphalt_nor.jpg" : "/assets/ground_nor.jpg", groundRepeat),
@@ -234,7 +233,7 @@ export class DriveView {
     });
     this.groundMaterial = groundMaterial;
     if (!track.has_water) {
-      const extent = track.extent * 3.2;
+      const extent = track.extent * st.ground_extent_factor;
       const ground = new THREE.Mesh(new THREE.PlaneGeometry(extent, extent), groundMaterial);
       ground.rotation.x = -Math.PI / 2;
       ground.position.y = -0.03;
@@ -242,20 +241,24 @@ export class DriveView {
       this.scene.add(ground);
     }
 
-    if (track.has_scenery) this._loadScenery(frames, track);
+    this._loadScenery(frames, track);
 
     this._loadCar();
     this._initRays(track.n_rays);
   }
 
+  /** Scenery (buildings, tunnel, quays, water) and the barriers: all dimensions from the server's SceneryStyleConfig. */
   async _loadScenery(frames, track) {
     try {
       const scenery = await (await fetch("/api/scenery")).json();
       const t0 = performance.now();
-      this.scene.add(buildBuildings(scenery.buildings));
-      this.scene.add(buildTunnel(frames, scenery.tunnel_spans, track.halfwidth));
+      const sty = scenery.style;
+      this.scene.add(buildBarriers(frames, track.halfwidth + sty.rail_offset_m, sty));
+      if (!track.has_scenery) return;
+      this.scene.add(buildBuildings(scenery.buildings, sty));
+      this.scene.add(buildTunnel(frames, scenery.tunnel_spans, track.halfwidth, sty));
       this.scene.add(buildPiers(scenery.lines || []));
-      const water = buildWater(scenery.water, this.groundMaterial);
+      const water = buildWater(scenery.water, this.groundMaterial, sty);
       this.scene.add(water.group);
       this.waterMaterial = water.material;
       // the tunnel needs a longer shadow reach and a slightly darker fog inside
@@ -275,30 +278,34 @@ export class DriveView {
     this.car = new THREE.Group();
     this.scene.add(this.car);
 
-    fetch(W11_MODEL.url, { method: "HEAD" })
+    const url = this.style.car_model_url;
+    fetch(url, { method: "HEAD" })
       .then((res) => {
-        if (!res.ok) throw new Error(`${W11_MODEL.url} ${res.status}`);
-        return new Promise((resolve, reject) => loader.load(W11_MODEL.url, resolve, undefined, reject));
+        if (!res.ok) throw new Error(`${url} ${res.status}`);
+        return new Promise((resolve, reject) => loader.load(url, resolve, undefined, reject));
       })
-      .then((gltf) => this._mountW11(gltf))
+      .then((gltf) => this._mountModel(gltf))
       .catch((err) => {
-        console.info(`no W11 model (${err.message}); using the Ferrari 458 stand-in scaled to W11 length`);
-        this._loadFerrari(loader);
+        console.info(`no vehicle model at ${url} (${err.message}); using the stand-in body fitted to the physics footprint`);
+        this._loadStandIn(loader);
       });
   }
 
-  /** Fit any car glTF to the W11 footprint: longest horizontal axis = length, wheels on the ground, nose down sim +x. */
-  _mountW11(gltf) {
+  /** Fit any car glTF to the physics footprint: length and width from its bounding box, wheels on the ground, nose down sim +x. */
+  _mountModel(gltf) {
     const model = gltf.scene;
     model.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(model);
     const size = box.getSize(new THREE.Vector3());
-    const forwardAxis = W11_MODEL.forward.replace("-", "");
+    const forwardAxis = this.style.car_model_forward.replace("-", "");
     const length = forwardAxis === "x" ? size.x : size.z;
-    const carLength = this.track && this.track.car ? this.track.car.length : W11_LENGTH_M;
-    const k = carLength / Math.max(length, 1e-3);
-    model.scale.setScalar(k);
-    model.position.set(-box.getCenter(new THREE.Vector3()).x * k, -box.min.y * k, -box.getCenter(new THREE.Vector3()).z * k);
+    const width = forwardAxis === "x" ? size.z : size.x;
+    const car = this.track.car;
+    const kL = car.length / Math.max(length, 1e-3);
+    const kW = car.width / Math.max(width, 1e-3);
+    const k = kL;
+    model.scale.set(forwardAxis === "x" ? kL : kW, kL, forwardAxis === "x" ? kW : kL);
+    model.position.set(-box.getCenter(new THREE.Vector3()).x * model.scale.x, -box.min.y * k, -box.getCenter(new THREE.Vector3()).z * model.scale.z);
     model.traverse((node) => {
       if (node.isMesh) {
         node.castShadow = true;
@@ -312,17 +319,17 @@ export class DriveView {
     const rig = new THREE.Group();
     rig.add(model);
     // rotate the model's nose onto sim +x (world +x)
-    const yaw = { "-z": -Math.PI / 2, z: Math.PI / 2, x: 0, "-x": Math.PI }[W11_MODEL.forward] ?? -Math.PI / 2;
+    const yaw = { "-z": -Math.PI / 2, z: Math.PI / 2, x: 0, "-x": Math.PI }[this.style.car_model_forward] ?? -Math.PI / 2;
     rig.rotation.y = yaw;
     this.car.add(rig);
-    console.info(`W11 model mounted: ${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)} native, scale ${k.toFixed(3)}, ${this.wheels.length} wheel nodes`);
+    console.info(`vehicle model mounted: ${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)} native, fitted to ${car.length} x ${car.width} m, ${this.wheels.length} wheel nodes`);
   }
 
-  _loadFerrari(loader) {
-    loader.load("/assets/ferrari.glb", (gltf) => {
+  _loadStandIn(loader) {
+    loader.load(this.style.stand_in_url, (gltf) => {
       const model = gltf.scene.children[0];
       const body = new THREE.MeshPhysicalMaterial({
-        color: 0x1fb07a,
+        color: new THREE.Color(this.style.stand_in_body_colour),
         metalness: 1.0,
         roughness: 0.42,
         clearcoat: 1.0,
@@ -356,7 +363,7 @@ export class DriveView {
       const shadow = new THREE.Mesh(
         new THREE.PlaneGeometry(0.655 * 4, 1.3 * 4),
         new THREE.MeshBasicMaterial({
-          map: loadTexture(this.textures, "/assets/ferrari_ao.png", null, THREE.SRGBColorSpace),
+          map: loadTexture(this.textures, this.style.stand_in_shadow_url, null, THREE.SRGBColorSpace),
           blending: THREE.MultiplyBlending,
           toneMapped: false,
           transparent: true,
@@ -370,12 +377,18 @@ export class DriveView {
       const rig = new THREE.Group();
       rig.add(model, shadow);
       rig.rotation.y = -Math.PI / 2;
-      // The dynamics are a W11 (5.7 m long, 2.0 m wide); stretch the stand-in
-      // body to the same footprint so it covers what the physics covers.
-      const carLength = this.track && this.track.car ? this.track.car.length : W11_LENGTH_M;
-      const k = carLength / CAR_LENGTH_M;
-      rig.scale.set(k, k * 0.82, k * 0.9);
+      // Stretch the stand-in body to the physics footprint (length along the
+      // model's -z nose axis, width along x) so it covers exactly what can
+      // touch the barrier; height follows the width so proportions stay sane.
+      model.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(model);
+      const size = box.getSize(new THREE.Vector3());
+      const car = this.track.car;
+      const kL = car.length / Math.max(size.z, 1e-3);
+      const kW = car.width / Math.max(size.x, 1e-3);
+      rig.scale.set(kW, kW, kL);
       this.car.add(rig);
+      console.info(`stand-in body ${size.x.toFixed(2)} x ${size.z.toFixed(2)} m native, fitted to ${car.length} x ${car.width} m`);
     });
   }
 
@@ -397,13 +410,13 @@ export class DriveView {
     const fov = (fov_deg * Math.PI) / 180;
     const pos = this.rays.geometry.getAttribute("position");
     const color = this.rays.geometry.getAttribute("color");
-    const eye = toWorld(frame.pos[0], frame.pos[1], 0.75);
+    const eye = toWorld(frame.pos[0], frame.pos[1], this.style.lidar_height_m);
     frame.lidar.forEach((norm, i) => {
       // ray 0 looks left (+fov/2), the last ray right, as in car_env.py
       const offset = n_rays === 1 ? 0 : fov / 2 - (fov * i) / (n_rays - 1);
       const angle = frame.heading + offset;
       const reach = norm * max_range;
-      const hit = toWorld(frame.pos[0] + Math.cos(angle) * reach, frame.pos[1] + Math.sin(angle) * reach, 0.75);
+      const hit = toWorld(frame.pos[0] + Math.cos(angle) * reach, frame.pos[1] + Math.sin(angle) * reach, this.style.lidar_height_m);
       pos.setXYZ(i * 2, eye.x, eye.y, eye.z);
       pos.setXYZ(i * 2 + 1, hit.x, hit.y, hit.z);
       const hot = 1 - norm;
@@ -442,19 +455,21 @@ export class DriveView {
     this.car.rotation.y = heading;
 
     if (f) {
-      // F1 tyre radius ~0.36 m; spin from the simulated speed
-      this.wheelSpin += (f.speed / 0.36) * dt;
+      // wheel spin from the simulated speed and the configured tyre radius
+      this.wheelSpin += (f.speed / this.track.car.tyre_radius) * dt;
       this.wheels.forEach((wheel) => {
         wheel.rotation.x = this.wheelSpin;
       });
     }
 
     const speed = f ? f.speed : 0;
-    const back = 12 + Math.min(10, speed * 0.12);
-    const ahead = 10 + Math.min(40, speed * 0.6);
-    const goal = toWorld(sx - Math.cos(heading) * back, sy - Math.sin(heading) * back, 4.2 + Math.min(3, speed * 0.03));
-    const look = toWorld(sx + Math.cos(heading) * ahead, sy + Math.sin(heading) * ahead, 0.9);
-    const ease = f && f.step <= 1 ? 1 : 1 - Math.exp(-dt * 6);
+    const st = this.style;
+    const back = st.camera_back_m + Math.min(st.camera_back_max_extra_m, speed * st.camera_back_per_mps);
+    const ahead = st.camera_ahead_m + Math.min(st.camera_ahead_max_extra_m, speed * st.camera_ahead_per_mps);
+    const height = st.camera_height_m + Math.min(st.camera_height_max_extra_m, speed * st.camera_height_per_mps);
+    const goal = toWorld(sx - Math.cos(heading) * back, sy - Math.sin(heading) * back, height);
+    const look = toWorld(sx + Math.cos(heading) * ahead, sy + Math.sin(heading) * ahead, st.lidar_height_m);
+    const ease = f && f.step <= 1 ? 1 : 1 - Math.exp(-dt * st.camera_ease);
     this.camera.position.lerp(goal, ease);
     this.lookGoal.lerp(look, ease);
     this.camera.lookAt(this.lookGoal);
@@ -466,7 +481,8 @@ export class DriveView {
     }
 
     // keep the shadow frustum centred on the car
-    this.sun.position.set(carPos.x + 60, 90, carPos.z + 30);
+    const [ox, oy, oz] = this.style.sun_offset_m;
+    this.sun.position.set(carPos.x + ox, oy, carPos.z + oz);
     this.sun.target.position.copy(carPos);
     this.sun.target.updateMatrixWorld();
 

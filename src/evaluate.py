@@ -42,7 +42,7 @@ def load_checkpoint(path: Path | None, device: torch.device) -> dict | None:
 
 def agent_config_from(state: dict | None, substeps: int) -> AgentConfig:
     if state and "agent_cfg" in state:
-        return AgentConfig(**state["agent_cfg"])
+        return AgentConfig.from_saved(state["agent_cfg"])
     return AgentConfig(substeps=substeps)
 
 
@@ -329,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     # The learned readout lives in the projected space; fold the fixed random
     # projection back in to get an effective weight per descending neuron.
     theta1 = agent.unpack(mu.unsqueeze(0))
-    steer_w = (agent.projection @ theta1["w_out"][0, :, 0]).cpu().numpy()
+    steer_w = agent.dn_steer_weight(theta1).cpu().numpy()
     rate = agent.dn_rate_hz[0].cpu().numpy()
     influence = steer_w * rate
     order = np.argsort(-np.abs(influence))[: args.top_dn]

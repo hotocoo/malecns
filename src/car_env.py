@@ -51,6 +51,13 @@ class CarConfig:
     # --- vehicle (Mercedes-AMG F1 W11, 2020; public figures) ---------------------
     wheelbase: float = 3.70
     car_halfwidth: float = 1.00  # 2.0 m body
+    car_length: float = 5.70  # nose to tail
+    tyre_radius_m: float = 0.36
+    vehicle_name: str = "Mercedes-AMG F1 W11"
+    # Collision is tested on the oriented body rectangle: this many points
+    # along each long side (corners included), so a nose or tail poking into
+    # the barrier at an angle crashes even while the centre is clear.
+    body_samples: int = 3
     mass_kg: float = 795.0  # 746 kg minimum plus a Monaco fuel load
     power_w: float = 750_000.0  # ~1,000 hp combined ICE + MGU-K
     cda_m2: float = 1.60  # high-downforce configuration
@@ -98,6 +105,9 @@ class CarConfig:
     wall_margin: float = 1.5
     wall_penalty: float = 0.03
     crash_penalty: float = 20.0
+    # Speed penalty: discourages flooring it through corners. Scales with
+    # (speed/max_speed)^2 so low speeds are nearly free but high speeds hurt.
+    speed_penalty: float = 0.05
 
     @property
     def min_turn_radius(self) -> float:
@@ -322,14 +332,30 @@ class Track:
         row = ((xy[..., 1] + extent) / self.cell).round().long().clamp(0, res - 1)
         return row, col
 
-    def clearance_at(self, xy: torch.Tensor) -> torch.Tensor:
+    def clearance_at(self, xy: torch.Tensor, bilinear: bool = False) -> torch.Tensor:
         """Metres from the point to the nearest track edge; negative once off it.
 
-        Points outside the grid read as far off the track.
+        Nearest-cell lookup by default (lidar samples, thousands per car);
+        `bilinear` interpolates the four surrounding cells for sub-cell
+        accuracy where it matters, the car body. Points outside the grid read
+        as far off the track.
         """
-        row, col = self._cell_index(xy)
         inside = (xy.abs() < self.cfg.grid_extent).all(dim=-1)
-        return torch.where(inside, self.clearance[row, col], torch.full_like(xy[..., 0], -1e3))
+        far = torch.full_like(xy[..., 0], -1e3)
+        if not bilinear:
+            row, col = self._cell_index(xy)
+            return torch.where(inside, self.clearance[row, col], far)
+        res, extent = self.cfg.grid_res, self.cfg.grid_extent
+        fx = (xy[..., 0] + extent) / self.cell
+        fy = (xy[..., 1] + extent) / self.cell
+        x0 = fx.floor().long().clamp(0, res - 2)
+        y0 = fy.floor().long().clamp(0, res - 2)
+        tx = (fx - x0).clamp(0.0, 1.0)
+        ty = (fy - y0).clamp(0.0, 1.0)
+        c = self.clearance
+        top = (1 - tx) * c[y0, x0] + tx * c[y0, x0 + 1]
+        bottom = (1 - tx) * c[y0 + 1, x0] + tx * c[y0 + 1, x0 + 1]
+        return torch.where(inside, (1 - ty) * top + ty * bottom, far)
 
     def is_drivable(self, xy: torch.Tensor, margin: float = 0.0) -> torch.Tensor:
         """True where a body of half-width `margin` fits on the road."""
@@ -378,6 +404,12 @@ class CarEnv:
         self.march = frac.pow(self.cfg.march_power) * self.cfg.max_range
         self.stuck_steps = max(1, int(round(self.cfg.stuck_window_s / self.cfg.dt_s)))
         self.max_step_progress = 3.0 * self.cfg.max_speed * self.cfg.dt_s / self.track.length_m
+        # Body outline in the car frame (x forward, y left): both long sides
+        # sampled nose to tail, so collision sees the whole rectangle.
+        along = torch.linspace(-0.5, 0.5, max(2, self.cfg.body_samples), device=device) * self.cfg.car_length
+        self.body_offsets = torch.cat(
+            [torch.stack([along, torch.full_like(along, side * self.cfg.car_halfwidth)], dim=1) for side in (-1.0, 1.0)]
+        )
         self.reset()
 
     @property
@@ -427,6 +459,18 @@ class CarEnv:
         self.step_count[mask] = 0
         self.done_reason[mask] = DONE_ALIVE
         return self.observe()
+
+    def body_points(self, pos: torch.Tensor, heading: torch.Tensor) -> torch.Tensor:
+        """World coordinates of the body outline samples, (batch, points, 2)."""
+        c, s = heading.cos(), heading.sin()
+        ox, oy = self.body_offsets[:, 0], self.body_offsets[:, 1]
+        x = pos[:, 0:1] + ox * c.unsqueeze(1) - oy * s.unsqueeze(1)
+        y = pos[:, 1:2] + ox * s.unsqueeze(1) + oy * c.unsqueeze(1)
+        return torch.stack([x, y], dim=-1)
+
+    def body_clearance(self, pos: torch.Tensor, heading: torch.Tensor) -> torch.Tensor:
+        """Metres between the body outline and the road edge; <= 0 means the body touches or crosses it."""
+        return self.track.clearance_at(self.body_points(pos, heading), bilinear=True).min(dim=1).values
 
     def observe(self) -> torch.Tensor:
         angles = self.heading.unsqueeze(1) + self.ray_angles.unsqueeze(0)
@@ -517,7 +561,7 @@ class CarEnv:
         new_laps = (torch.floor(self.laps) - torch.floor(self.best_laps)).clamp(min=0.0)
         self.best_laps = torch.maximum(self.best_laps, self.laps)
 
-        clearance = self.track.clearance_at(self.pos) - cfg.car_halfwidth
+        clearance = self.body_clearance(self.pos, self.heading)
         crashed = clearance <= 0.0
         reversed_ = self.laps <= cfg.reverse_limit_laps
         window_over = (self.step_count - self.anchor_step) >= self.stuck_steps
@@ -537,13 +581,20 @@ class CarEnv:
         progress_term = delta * self.progress_scale
         bonus_term = new_laps * cfg.lap_bonus
         wall_term = -cfg.wall_penalty * near_wall * near_wall
-        reward = progress_term + bonus_term + wall_term - cfg.time_tax
+        speed_norm = self.speed / cfg.max_speed
+        speed_term = -cfg.speed_penalty * speed_norm * speed_norm
+        reward = progress_term + bonus_term + wall_term + speed_term - cfg.time_tax
         reward = torch.where(alive, reward, torch.full_like(reward, -cfg.crash_penalty))
-        # Per-term breakdown for the exploit monitor and debugging.
+        # A crashed car stays at its last legal pose: the crash frame shows the
+        # body against the barrier, not one step's travel through it.
+        self.pos = torch.where(crashed.unsqueeze(1), self.prev_pos, self.pos)
+        self.heading = torch.where(crashed, self.prev_heading, self.heading)
+        # Per-term breakdown for the exploit monitor, telemetry and debugging.
         self.last_terms = {
             "progress": progress_term,
             "bonus": bonus_term,
             "wall": wall_term,
+            "time_tax": torch.full_like(reward, -cfg.time_tax),
             "delta": delta,
             "raw_delta": raw_delta,
             "clearance": clearance,
@@ -559,7 +610,10 @@ class CarEnv:
             "speed_max": float(self.speed.max()),
             "steer_abs_mean": float(self.steer.abs().mean()) / self.cfg.max_steer_rad,
             "lat_g_max": float(self.lat_g.max()),
+            "lat_g_mean": float(self.lat_g.mean()),
+            "laps_min": float(self.laps.min()),
             "crash": counts[DONE_CRASH],
             "reverse": counts[DONE_REVERSE],
             "stuck": counts[DONE_STUCK],
+            "alive": counts[DONE_ALIVE],
         }

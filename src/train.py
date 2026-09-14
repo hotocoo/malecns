@@ -31,7 +31,7 @@ import torch
 import defaults
 from agent import AgentConfig, ConnectomeAgent
 from brain import Brain, LIFConfig, load_connectome, pick_device, synchronize
-from car_env import CarConfig, CarEnv, Track, build_centerline, monaco_config
+from car_env import DONE_NAMES, CarConfig, CarEnv, Track, build_centerline, monaco_config
 from exploits import ExploitMonitor
 
 STOP = False
@@ -51,8 +51,14 @@ def _handle_stop(signum, frame) -> None:  # noqa: ANN001
     print("\n[stop] finishing generation, then checkpointing", flush=True)
 
 
-def rank_normalise(fitness: torch.Tensor) -> torch.Tensor:
+def rank_normalise(fitness: torch.Tensor, tie_tol: float = 0.0) -> torch.Tensor:
     """Ranks mapped to [-0.5, 0.5]; ties share their mean rank.
+
+    Members whose fitness differs by no more than `tie_tol` from the next one
+    in sorted order are tied. With every member crashing on the same step the
+    remaining differences are progress noise below one step's time tax, and
+    ranking them anyway turned that noise into a full-size update: the mean
+    then random-walked on a flat landscape instead of holding still.
 
     With plain argsort, a population whose members all score the same gets an
     arbitrary permutation of ranks, which is a random gradient of full size:
@@ -63,8 +69,10 @@ def rank_normalise(fitness: torch.Tensor) -> torch.Tensor:
     sorted_f = fitness[order]
     ranks = torch.empty(n, device=fitness.device)
     ranks[order] = torch.arange(n, device=fitness.device, dtype=torch.float32)
-    # average ranks inside runs of equal fitness
-    same_as_prev = torch.cat([torch.tensor([False], device=fitness.device), sorted_f[1:] == sorted_f[:-1]])
+    # average ranks inside runs of (near-)equal fitness
+    same_as_prev = torch.cat(
+        [torch.tensor([False], device=fitness.device), (sorted_f[1:] - sorted_f[:-1]).abs() <= tie_tol]
+    )
     group_start = torch.cumsum((~same_as_prev).long(), 0) - 1
     counts = torch.bincount(group_start, minlength=int(group_start.max()) + 1).float()
     firsts = torch.cumsum(counts, 0) - counts
@@ -120,6 +128,7 @@ def rollout(
         "speed_mean": float((speed_sum / steps_alive.clamp(min=1)).mean()),
         "dn_hz": float(agent.dn_rate_hz.mean()),
         "vis_hz": float(vis_hz / max(1, ran)),
+        "motor_abs_mean": float(agent.last_motor.abs().mean()),
         "steps_run": ran,
         "exploits": watch.report() if watch is not None else None,
         **env.telemetry(),
@@ -201,8 +210,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="start points each member is scored on per generation (batch = popsize x this)",
     )
-    parser.add_argument("--sigma", type=float, default=0.05)
+    parser.add_argument("--sigma", type=float, default=0.05, help="perturbation scale; grows while the landscape is flat")
+    parser.add_argument(
+        "--sigma-max",
+        type=float,
+        default=0.4,
+        help="ceiling for the adaptive perturbation scale (0 disables adaptation)",
+    )
+    parser.add_argument(
+        "--sigma-grow",
+        type=float,
+        default=1.25,
+        help="factor applied to sigma after a generation with no fitness differences above the tie tolerance",
+    )
+    parser.add_argument(
+        "--sigma-shrink",
+        type=float,
+        default=0.8,
+        help="factor pulling sigma back towards --sigma after an informative generation",
+    )
+    parser.add_argument(
+        "--tie-tol",
+        type=float,
+        default=-1.0,
+        help="fitness differences at or below this are ties; negative uses the environment's per-step time tax",
+    )
     parser.add_argument("--lr", type=float, default=0.05)
+    parser.add_argument(
+        "--precision",
+        default=None,
+        choices=("fp16", "fp32"),
+        help="brain state precision on the Metal path (default: MALECNS_PRECISION or fp16)",
+    )
     parser.add_argument(
         "--momentum",
         type=float,
@@ -239,6 +278,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-curriculum", action="store_true", help="train at the final stage only")
     parser.add_argument("--curriculum-window", type=int, default=25)
+    parser.add_argument(
+        "--progress-bins",
+        type=int,
+        default=24,
+        help="bins around the lap for the where-did-they-end histogram in the log",
+    )
     parser.add_argument("--eval-every", type=int, default=10, help="deterministic evaluation of the mean; 0 disables")
     parser.add_argument("--seed", type=int, default=0, help="perturbations and sensory noise are seeded from this")
     parser.add_argument("--no-exploit-monitor", action="store_true", help="skip the per-step exploit detector")
@@ -280,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
         config=LIFConfig(dt_ms=args.dt_ms, adapt_mv=args.adapt_mv),
         device=device,
         weight_scale=args.weight_scale,
+        precision=args.precision,
     )
     agent_cfg = AgentConfig(substeps=args.substeps)
     agent = ConnectomeAgent(brain, neurons, agent_cfg)
@@ -290,10 +336,12 @@ def main(argv: list[str] | None = None) -> int:
         base_cfg = CarConfig(dt_s=dt_s)
     bank = TrackBank(base_cfg, args.layout, args.tracks, device)
     _, track0 = bank.get(len(CURRICULUM) - 1)
+    tie_tol = args.tie_tol if args.tie_tol >= 0 else base_cfg.time_tax
     print(
         f"circuit {track0.length_m:,.0f} m, {2 * base_cfg.track_halfwidth:.0f} m wide, "
         f"tightest {track0.min_radius_m:.1f} m vs car {base_cfg.min_turn_radius:.1f} m; "
-        f"params {agent.n_params:,}; bodies {batch}; control step {dt_s * 1000:.0f} ms"
+        f"params {agent.n_params:,}; bodies {batch}; control step {dt_s * 1000:.0f} ms; "
+        f"brain {brain.precision} {'metal' if brain.uses_metal else 'torch'}; tie tolerance {tie_tol}"
     )
 
     mu = agent.initial_params().to(device)
@@ -301,7 +349,16 @@ def main(argv: list[str] | None = None) -> int:
     generation = 0
     stage = len(CURRICULUM) - 1 if args.no_curriculum else 0
     best_eval = -float("inf")
+    sigma = args.sigma
     recent_laps: list[float] = []
+    # best.pt is only ever overwritten by a better deterministic evaluation,
+    # whatever the resumed checkpoint remembers: a resumed run that had lost
+    # its best_eval once replaced a lap-completing best.pt with a crash.
+    if args.best.exists():
+        try:
+            best_eval = float(torch.load(args.best, map_location="cpu").get("best_eval", best_eval))
+        except (RuntimeError, EOFError, KeyError):
+            pass
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
     args.log.parent.mkdir(parents=True, exist_ok=True)
     if args.checkpoint.exists():
@@ -316,7 +373,8 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"{exc}: parameters restart from init, generation counter continues at {generation}")
         stage = int(state.get("stage", stage)) if not args.no_curriculum else stage
-        best_eval = float(state.get("best_eval", best_eval))
+        best_eval = max(best_eval, float(state.get("best_eval", -float("inf"))))
+        sigma = float(state.get("sigma", sigma))
         recent_laps = list(state.get("recent_laps", []))
 
     def save(path: Path) -> None:
@@ -327,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
                 "generation": generation,
                 "stage": stage,
                 "best_eval": best_eval,
+                "sigma": sigma,
                 "recent_laps": recent_laps[-args.curriculum_window :],
                 "n_params": agent.n_params,
                 "param_shapes": {k: list(v) for k, v in agent.param_shapes.items()},
@@ -334,6 +393,9 @@ def main(argv: list[str] | None = None) -> int:
                 "car_cfg": asdict(bank.get(stage)[0]),
                 "layout": args.layout,
                 "starts": args.tracks,
+                "precision": brain.precision,
+                "curriculum": [list(c) for c in CURRICULUM],
+                "saved_at": time.time(),
                 # str() everything: Path objects make torch.load refuse the
                 # file under the default weights_only=True.
                 "args": {k: str(v) for k, v in vars(args).items()},
@@ -349,18 +411,34 @@ def main(argv: list[str] | None = None) -> int:
         sample_gen.manual_seed(args.seed * 1_000_003 + generation)
         eps = torch.randn(half, mu.numel(), generator=sample_gen).to(device)
         perturb = torch.cat([eps, -eps], dim=0)
-        params = agent.clamp_params(mu.unsqueeze(0) + args.sigma * perturb)
+        params = agent.clamp_params(mu.unsqueeze(0) + sigma * perturb)
         theta = agent.unpack(params.repeat_interleave(args.starts_per_gen, dim=0))
 
         env = make_env(bank, stage, generation, args.popsize, args.starts_per_gen)
         result = rollout(agent, env, theta, steps, seed=args.seed * 7919 + generation, monitor=not args.no_exploit_monitor)
         fitness = result["fitness"].view(args.popsize, args.starts_per_gen).mean(1)
         laps = result["laps"].view(args.popsize, args.starts_per_gen).mean(1)
+        # Where around the lap did each car end (its lap fraction at the last
+        # step), so a corner that kills the whole population shows up by name.
+        starts_frac = env.start_index.float() / env.track.centerline.shape[0]
+        end_frac = (starts_frac + result["laps"]) % 1.0
+        end_hist = torch.histc(end_frac, bins=args.progress_bins, min=0.0, max=1.0).to(torch.int64).tolist()
+        reasons = env.done_reason
+        reason_by_start = [
+            {name: int((reasons.view(args.popsize, args.starts_per_gen)[:, k] == code).sum()) for code, name in DONE_NAMES.items()}
+            for k in range(args.starts_per_gen)
+        ]
 
-        advantage = rank_normalise(fitness)
-        grad = (perturb * advantage.unsqueeze(1)).sum(0) / (args.popsize * args.sigma)
+        advantage = rank_normalise(fitness, tie_tol)
+        informative = bool((advantage != 0).any())
+        grad = (perturb * advantage.unsqueeze(1)).sum(0) / (args.popsize * sigma)
         momentum = args.momentum * momentum + grad
         mu = agent.clamp_params((mu + args.lr * momentum).unsqueeze(0))[0]
+        # Adaptive search radius: a generation whose members are all tied says
+        # the perturbations were too small to change the outcome, so widen;
+        # an informative one pulls the radius back towards the base value.
+        if args.sigma_max > 0:
+            sigma = min(args.sigma_max, sigma * args.sigma_grow) if not informative else max(args.sigma, sigma * args.sigma_shrink)
 
         generation += 1
         recent_laps.append(float(laps.mean()))
@@ -373,22 +451,43 @@ def main(argv: list[str] | None = None) -> int:
             "track": (generation - 1) % args.tracks,
             "fitness_mean": float(fitness.mean()),
             "fitness_best": float(fitness.max()),
+            "fitness_min": float(fitness.min()),
             "fitness_std": float(fitness.std()),
+            "informative": informative,
             "laps_best": float(laps.max()),
             "laps_mean": float(laps.mean()),
+            "laps_min": result["laps_min"],
             "steps_alive_mean": float(result["steps_alive"].mean()),
+            "steps_alive_max": float(result["steps_alive"].max()),
+            "steps_run": result["steps_run"],
             "speed_mean": result["speed_mean"],
+            "speed_max": result["speed_max"],
             "lat_g_max": result["lat_g_max"],
+            "lat_g_mean": result["lat_g_mean"],
             "steer_abs_mean": result["steer_abs_mean"],
+            "motor_abs_mean": result["motor_abs_mean"],
             "crash": result["crash"],
             "reverse": result["reverse"],
             "stuck": result["stuck"],
+            "alive": result["alive"],
             "dn_hz": result["dn_hz"],
             "vis_hz": result["vis_hz"],
             "exploits": result["exploits"],
             "at_bounds": agent.fraction_at_bounds(mu),
+            "mu_norm": float(mu.norm()),
+            "grad_norm": float(grad.norm()),
             "momentum_norm": float(momentum.norm()),
-            "sigma": args.sigma,
+            "sigma": sigma,
+            "lr": args.lr,
+            "popsize": args.popsize,
+            "precision": brain.precision,
+            "road_halfwidth": bank.get(stage)[0].track_halfwidth,
+            "fitness_per_start": [round(float(v), 3) for v in result["fitness"].view(args.popsize, args.starts_per_gen).mean(0)],
+            "laps_per_start": [round(float(v), 4) for v in result["laps"].view(args.popsize, args.starts_per_gen).mean(0)],
+            "start_fractions": [round(float(v), 4) for v in starts_frac.view(args.popsize, args.starts_per_gen)[0]],
+            "end_progress_hist": end_hist,
+            "end_reason_per_start": reason_by_start,
+            "time": time.time(),
         }
 
         # Curriculum: advance when the rolling mean lap fraction clears the bar.
@@ -415,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
         elapsed = time.time() - started
         record["seconds"] = round(elapsed, 2)
         record["body_steps_per_s"] = round(batch * result["steps_run"] / max(elapsed, 1e-6))
+        record["control_step_ms"] = round(1000.0 * elapsed / max(1, result["steps_run"]), 2)
         with args.log.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
         print(
@@ -422,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
             f"best {record['fitness_best']:8.2f} | laps {record['laps_mean']:.3f}/{record['laps_best']:.3f} "
             f"| alive {record['steps_alive_mean']:6.0f}/{steps} | {record['speed_mean'] * 3.6:5.0f} km/h "
             f"| c{record['crash']} r{record['reverse']} s{record['stuck']} "
-            f"| {record['seconds']:.1f}s {record['body_steps_per_s']:,} body-steps/s"
+            f"| s{sigma:.3f} | {record['seconds']:.1f}s {record['body_steps_per_s']:,} body-steps/s"
             + (f" | eval {record['eval_fitness']:.1f} laps {record['eval_laps']:.3f}" if "eval_fitness" in record else ""),
             flush=True,
         )

@@ -2,7 +2,7 @@
 # Continuous headless training supervisor: restarts the ES loop if it ever
 # dies, and resumes from the checkpoint so no generations are lost.
 #
-#   ./run_training.sh                      # Monaco, curriculum, popsize 128
+#   ./run_training.sh                      # Monaco, curriculum, popsize 128 x 6 starts
 #   POPSIZE=32 ./run_training.sh --seed 3  # any train.py flag passes through
 #
 # Training never renders or paces: watch it from another process with
@@ -15,6 +15,10 @@ CHECKPOINT=${CHECKPOINT:-checkpoints/es.pt}
 BEST=${BEST:-checkpoints/best.pt}
 LOG=${LOG:-logs/train.jsonl}
 POPSIZE=${POPSIZE:-128}
+# Every member is scored on all start points each generation: one start per
+# generation made the objective rotate (a straight start scored +20, the
+# hairpin start -18) and the curve looked like noise.
+STARTS_PER_GEN=${STARTS_PER_GEN:-6}
 
 while true; do
   python3 -W ignore src/train.py \
@@ -22,6 +26,7 @@ while true; do
     --best "$BEST" \
     --log "$LOG" \
     --popsize "$POPSIZE" \
+    --starts-per-gen "$STARTS_PER_GEN" \
     "$@"
   status=$?
   if [ "$status" -eq 0 ]; then

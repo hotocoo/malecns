@@ -1,96 +1,121 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MaleCNS connectome driving</title>
-<link rel="stylesheet" href="/style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title id="page-title">connectome driving</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-
-<section class="stage" aria-label="Live simulation">
-  <div class="stage-bar">
-    <span class="tag">malecns <em>|</em> connectome driving <em>|</em> Circuit de Monaco, W11 dynamics</span>
-    <span class="tag right" id="stage-generation">generation -</span>
-  </div>
-
-  <div class="stage-grid">
-    <figure class="view drive-view">
-      <canvas id="drive-canvas"></canvas>
-      <canvas id="track-canvas" class="minimap" width="520" height="520"></canvas>
-      <figcaption class="overlay">
-        <span class="pill" id="pill-state">FORWARD</span>
-        <span class="speed" id="pill-speed">0 km/h</span>
-        <span class="foot" id="pill-foot">real time · 0.0 s elapsed</span>
-      </figcaption>
-    </figure>
-
-    <div class="side">
-      <figure class="view brain-view">
-        <span class="view-label">Fly brain</span>
-        <canvas id="brain-canvas"></canvas>
-        <figcaption class="hint" id="brain-meta">loading anatomy</figcaption>
-      </figure>
-
-      <figure class="view spike-view">
-        <span class="view-label">Spikes <small id="raster-meta"></small></span>
-        <canvas id="raster-canvas" width="640" height="300"></canvas>
-        <figcaption>
-          <ul class="legend" id="raster-legend"></ul>
+  <!-- Every label, number, colour and dimension on this page comes from the
+       server (/api/meta, /api/track, /api/config, /api/training, the frame
+       stream). The markup below is only the layout skeleton. -->
+  <section class="stage" aria-label="Live simulation">
+    <div class="stage-bar">
+      <span class="tag" id="stage-title">loading</span>
+      <span class="tag right" id="stage-generation"></span>
+    </div>
+    <div class="stage-grid">
+      <figure class="view drive-view">
+        <canvas id="drive-canvas"></canvas>
+        <canvas id="track-canvas" class="minimap"></canvas>
+        <figcaption class="overlay">
+          <span class="pill" id="pill-state"></span>
+          <span class="speed" id="pill-speed"></span>
+          <span class="foot" id="pill-foot"></span>
         </figcaption>
       </figure>
+      <div class="side">
+        <figure class="view brain-view">
+          <span class="view-label" id="brain-label"></span>
+          <canvas id="brain-canvas"></canvas>
+          <figcaption class="hint" id="brain-meta"></figcaption>
+        </figure>
+        <figure class="view spike-view">
+          <span class="view-label" id="raster-label"></span>
+          <canvas id="raster-canvas"></canvas>
+          <figcaption><ul class="legend" id="raster-legend"></ul></figcaption>
+        </figure>
+      </div>
     </div>
-  </div>
-
-  <div class="stage-strip">
-    <div class="gauge">
-      <span class="gauge-label">steer</span>
-      <span class="gauge-end">L</span>
-      <div class="bar bipolar"><i id="bar-steer"></i></div>
-      <span class="gauge-end">R</span>
-      <output id="val-steer">0.00</output>
+    <div class="stage-strip">
+      <div id="gauges" class="gauges"></div>
+      <dl class="strip-readout" id="strip-readout"></dl>
     </div>
-    <div class="gauge">
-      <span class="gauge-label">pedal</span>
-      <span class="gauge-end">brake</span>
-      <div class="bar bipolar"><i id="bar-throttle"></i></div>
-      <span class="gauge-end">gas</span>
-      <output id="val-throttle">0.00</output>
-    </div>
-    <dl class="strip-readout">
-      <div><dt>lap</dt><dd id="stat-laps">-</dd></div>
-      <div><dt>spiking</dt><dd id="stat-spiking">-</dd></div>
-      <div><dt>steps</dt><dd id="stat-fps">-</dd></div>
-      <div><dt>headroom</dt><dd id="stat-realtime">-</dd></div>
-      <div><dt>link</dt><dd id="stat-link" class="bad">connecting</dd></div>
-    </dl>
-  </div>
-</section>
-
-<main>
-  <section class="panel rates" aria-labelledby="rates-heading">
-    <h2 id="rates-heading">Population rate <small>Hz per neuron</small></h2>
-    <ul class="rate-list" id="rate-list"></ul>
   </section>
 
-  <section class="panel dn" aria-labelledby="dn-heading">
-    <h2 id="dn-heading">Descending neurons <small>top steering influence</small></h2>
-    <ul class="dn-list" id="dn-list"></ul>
-  </section>
+  <main class="panels">
+    <section class="panel fly-panel" aria-labelledby="fly-heading">
+      <h2 id="fly-heading"></h2>
+      <div class="fly-grid">
+        <figure class="fly-cell">
+          <canvas id="eyes-canvas"></canvas>
+          <figcaption id="eyes-caption"></figcaption>
+        </figure>
+        <figure class="fly-cell">
+          <canvas id="controls-canvas"></canvas>
+          <figcaption id="controls-caption"></figcaption>
+        </figure>
+        <div class="fly-cell" id="fly-telemetry"></div>
+      </div>
+    </section>
 
-  <section class="panel curve" aria-labelledby="curve-heading">
-    <h2 id="curve-heading">Training <small id="curve-meta"></small></h2>
-    <canvas id="curve-canvas" width="1200" height="220"></canvas>
-  </section>
-</main>
+    <section class="panel" aria-labelledby="telemetry-heading">
+      <h2 id="telemetry-heading"></h2>
+      <div class="telemetry-grid" id="telemetry"></div>
+    </section>
 
-<footer>
-  <span id="footer-meta">loading connectome</span>
-</footer>
+    <section class="panel two-col">
+      <div>
+        <h2 id="rates-heading"></h2>
+        <ul class="rate-list" id="rate-list"></ul>
+      </div>
+      <div>
+        <h2 id="dn-heading"></h2>
+        <ul class="dn-list" id="dn-list"></ul>
+      </div>
+    </section>
 
-<script type="importmap">
-{ "imports": { "three": "/vendor/three/three.module.js" } }
-</script>
-<script type="module" src="/app.js"></script>
+    <section class="panel" aria-labelledby="curve-heading">
+      <h2 id="curve-heading"></h2>
+      <div class="curve-controls" id="curve-controls"></div>
+      <canvas id="curve-canvas"></canvas>
+      <div class="training-grid">
+        <div>
+          <h3 id="training-status-heading"></h3>
+          <dl class="kv" id="training-status"></dl>
+        </div>
+        <div>
+          <h3 id="ending-heading"></h3>
+          <canvas id="ending-canvas"></canvas>
+          <dl class="kv" id="per-start"></dl>
+        </div>
+        <div>
+          <h3 id="episodes-heading"></h3>
+          <table class="episodes" id="episodes"></table>
+        </div>
+      </div>
+      <details>
+        <summary id="record-summary"></summary>
+        <dl class="kv wide" id="last-record"></dl>
+      </details>
+    </section>
+
+    <section class="panel" aria-labelledby="params-heading">
+      <h2 id="params-heading"></h2>
+      <table class="params" id="params"></table>
+      <details>
+        <summary id="config-summary"></summary>
+        <pre id="config-dump"></pre>
+      </details>
+    </section>
+  </main>
+
+  <footer><span id="footer-meta"></span></footer>
+
+  <script type="importmap">
+    {"imports": {"three": "/vendor/three/three.module.js"}}
+  </script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

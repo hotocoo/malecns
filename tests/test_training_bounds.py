@@ -63,7 +63,7 @@ def test_clamp_is_batched_and_leaves_in_range_values_alone(agent):
     assert out.shape == base.shape
     assert torch.equal(out[0], base[0])
     assert torch.equal(out[2], base[2])
-    assert float(out[1].max()) <= 3.0
+    assert float(out[1].max()) <= max(hi for _, hi in agent.PARAM_BOUNDS.values())
 
 
 def test_driving_backwards_ends_the_episode():

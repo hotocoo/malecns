@@ -98,6 +98,11 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize()
 
 
+def default_precision() -> str:
+    """State precision for the Metal path: `MALECNS_PRECISION` or fp16."""
+    return os.environ.get("MALECNS_PRECISION", "fp16")
+
+
 class Brain:
     """Population-batched LIF network over a fixed connectome.
 
@@ -108,6 +113,11 @@ class Brain:
     with spikes packed one bit per body; the torch path below is the reference
     implementation and is used on CPU/CUDA, when a per-neuron `gain` is set,
     or when `MALECNS_NO_METAL` is in the environment.
+
+    Sensory input comes either as explicit mV values per driven cell or as a
+    kick probability per cell (`poisson_prob`), in which case the step draws
+    the kicks itself from a counter hash seeded by the caller: identical seeds
+    give identical episodes on both paths.
     """
 
     def __init__(
@@ -118,12 +128,16 @@ class Brain:
         device: torch.device | None = None,
         weight_scale: float = 1.0,
         use_metal: bool | None = None,
+        precision: str | None = None,
     ) -> None:
         self.cfg = config or LIFConfig()
         self.device = device or pick_device()
         self.n = connectome.n
         self.batch = batch
         self.roles = connectome.roles
+        self.precision = precision or default_precision()
+        if self.precision not in metal_lif.STATE_DTYPES:
+            raise ValueError(f"precision must be one of {sorted(metal_lif.STATE_DTYPES)}, got {self.precision!r}")
 
         idx = torch.from_numpy(
             np.stack([connectome.post.astype(np.int64), connectome.pre.astype(np.int64)])
@@ -159,11 +173,15 @@ class Brain:
         self.delay_steps = max(1, int(round(cfg.delay_ms / dt)))
 
         self.gain: torch.Tensor | None = None
+        self.kick_mv = 0.0
+        self.dn_index: torch.Tensor | None = None
+        self.dn_acc = torch.zeros(batch, 0, device=self.device)
         if use_metal is None:
             use_metal = metal_lif.available(self.device) and "MALECNS_NO_METAL" not in os.environ
         self.metal = None
         if use_metal:
-            self.metal = metal_lif.library()
+            self.metal = metal_lif.library(self.precision)
+            self.state_dtype = metal_lif.STATE_DTYPES[self.precision]
             self.words = (batch + 31) // 32
             coo_cpu = coo.coalesce()
             self.rowptr, self.col, self.val = metal_lif.csr_by_post(
@@ -171,23 +189,20 @@ class Brain:
             )
             self.fparams = torch.tensor(
                 [self.syn_kick, self.decay_s, self.decay_v, self.decay_a, self.adapt_kick,
-                 self.u_thresh, self.u_reset, float(self.ref_steps)],
+                 self.u_thresh, self.u_reset, float(self.ref_steps), 0.0, 0.0],
                 dtype=torch.float32, device=self.device,
             )
             self.short_rows, self.long_rows = metal_lif.split_rows(self.rowptr)
-            # one (n, batch, words, read, write, n_short, n_long) tuple per ring position, built once
-            self.iparams = [
-                torch.tensor(
-                    [self.n, batch, self.words, pos, (pos + self.delay_steps) % (self.delay_steps + 1),
-                     self.short_rows.numel(), self.long_rows.numel()],
-                    dtype=torch.int32, device=self.device,
-                )
-                for pos in range(self.delay_steps + 1)
-            ]
+            self._ip_cache: dict[tuple, torch.Tensor] = {}
             self._rows_ip_cache: dict[tuple[int, int], torch.Tensor] = {}
+            self._unpack_ip_cache: dict[tuple[int, int], torch.Tensor] = {}
             self.no_ext_slot = torch.full((self.n,), -1, dtype=torch.int32, device=self.device)
             self.no_ext = torch.zeros(1, batch, dtype=torch.float32, device=self.device)
+            self.no_dn_slot = torch.full((self.n,), -1, dtype=torch.int32, device=self.device)
+            self.dn_slot = self.no_dn_slot
             self._slot_cache: tuple[int, torch.Tensor] | None = None
+        else:
+            self.state_dtype = torch.float32
         self.reset()
 
     @property
@@ -197,26 +212,54 @@ class Brain:
     def reset(self) -> None:
         shape = (self.n, self.batch)
         # u = V - V_rest, so rest is zero and the leak is a plain multiply.
-        self.u = torch.zeros(shape, device=self.device)
-        self.j_syn = torch.zeros(shape, device=self.device)
-        self.adapt = torch.zeros(shape, device=self.device)
+        self.u = torch.zeros(shape, device=self.device, dtype=self.state_dtype)
+        self.j_syn = torch.zeros(shape, device=self.device, dtype=self.state_dtype)
+        self.adapt = torch.zeros(shape, device=self.device, dtype=self.state_dtype)
         self.last_fired = torch.zeros(shape, dtype=torch.bool, device=self.device)
-        self.refrac = torch.zeros(shape, device=self.device)
+        # The refractory counter is only stored when the period spans more than
+        # one step; at one step the previous spike itself is the flag.
+        self.refrac = torch.zeros(shape if self.ref_steps > 1 else (1, 1), device=self.device)
         self.last_spikes = torch.zeros(shape, device=self.device)
         self.spike_buffer = [
             torch.zeros(shape, device=self.device) for _ in range(self.delay_steps)
         ]
         self.buf_pos = 0
+        self.dn_acc = torch.zeros(self.batch, self.dn_index.numel() if self.dn_index is not None else 0, device=self.device)
         if self.metal is not None:
             self.bits = torch.zeros(
                 (self.delay_steps + 1, self.n, self.words), dtype=torch.int32, device=self.device
             )
+            # one bit per neuron per ring slot: did any body spike this step
+            self.any_bits = torch.zeros((self.delay_steps + 1, (self.n + 31) // 32), dtype=torch.int32, device=self.device)
+            # one byte per (neuron, word): every body at exactly zero state
+            self.quiet = torch.ones(self.n * self.words, dtype=torch.uint8, device=self.device)
             self.written_slot = self.delay_steps % (self.delay_steps + 1)
 
     @property
     def v(self) -> torch.Tensor:
         """Membrane potential in mV, shape (batch, n)."""
-        return (self.u + self.cfg.v_rest).t()
+        return (self.u.float() + self.cfg.v_rest).t()
+
+    def set_dn_index(self, index: torch.Tensor | None) -> None:
+        """Neurons whose spikes are counted into `dn_acc` (batch, len(index)) every step."""
+        if index is None:
+            self.dn_index = None
+            self.dn_acc = torch.zeros(self.batch, 0, device=self.device)
+            if self.metal is not None:
+                self._ip_cache.clear()
+                self._rows_ip_cache.clear()
+                self.fparams[metal_lif.FP_N_DN] = 0.0
+                self.dn_slot = self.no_dn_slot
+            return
+        self.dn_index = index.to(self.device).to(torch.long)
+        self.dn_acc = torch.zeros(self.batch, self.dn_index.numel(), device=self.device)
+        if self.metal is not None:
+            self._ip_cache.clear()
+            self._rows_ip_cache.clear()
+            self.fparams[metal_lif.FP_N_DN] = float(self.dn_index.numel())
+            slots = torch.full((self.n,), -1, dtype=torch.int32, device=self.device)
+            slots[self.dn_index] = torch.arange(self.dn_index.numel(), dtype=torch.int32, device=self.device)
+            self.dn_slot = slots
 
     def set_gain(self, gain: torch.Tensor | None) -> None:
         """Per-neuron presynaptic excitability multiplier, shape (batch, n).
@@ -240,14 +283,18 @@ class Brain:
             self.last_spikes = self.spike_buffer[d - 1]
             self.last_fired = self.last_spikes > 0
             self.buf_pos = 0
+            self.u, self.j_syn, self.adapt = self.u.float(), self.j_syn.float(), self.adapt.float()
         else:
             # torch buffer[(buf_pos + k) % d] holds step t+1-d+k; Metal reads slot
             # buf_pos as step t+1-d, so slot k takes that same entry.
             p0 = self.buf_pos
             for k in range(d):
                 self.bits[k] = self._pack(self.spike_buffer[(p0 + k) % d])
+                self.any_bits[k] = self._pack_any(self.bits[k])
             self.buf_pos = 0
             self.written_slot = d - 1
+            self.u, self.j_syn, self.adapt = (t.to(self.state_dtype) for t in (self.u, self.j_syn, self.adapt))
+            self.quiet.zero_()
 
     # --- Metal helpers ------------------------------------------------------------------
     def _pack(self, dense: torch.Tensor) -> torch.Tensor:
@@ -257,9 +304,17 @@ class Brain:
         shifts = torch.arange(32, dtype=torch.int32, device=self.device)
         return (padded.view(self.n, self.words, 32) << shifts).sum(dim=-1, dtype=torch.int32)
 
+    def _pack_any(self, packed: torch.Tensor) -> torch.Tensor:
+        """(n, words) bit masks -> (ceil(n/32),) int32: bit i set when neuron i spiked in any body."""
+        active = (packed != 0).any(dim=1).to(torch.int32)
+        padded = torch.zeros(self.any_bits.shape[1] * 32, dtype=torch.int32, device=self.device)
+        padded[: self.n] = active
+        shifts = torch.arange(32, dtype=torch.int32, device=self.device)
+        return (padded.view(-1, 32) << shifts).sum(dim=-1, dtype=torch.int32)
+
     def _unpack_all(self, slot: int) -> torch.Tensor:
         out = torch.empty(self.batch, self.n, dtype=torch.float32, device=self.device)
-        self.metal.unpack_all(out, self.bits[slot], self.iparams[0], threads=self.n * self.batch)
+        self.metal.unpack_all(out, self.bits[slot], self._ip(0, metal_lif.EXT_NONE, False), threads=self.n * self.batch)
         return out
 
     def _ext_slots(self, external_index: torch.Tensor | None) -> torch.Tensor:
@@ -274,12 +329,40 @@ class Brain:
             self._slot_cache = (key, slots)
         return self._slot_cache[1]
 
+    def _ip(self, pos: int, ext_mode: int, shared: bool) -> torch.Tensor:
+        """Integer parameter block for ring position `pos` (built once per combination)."""
+        key = (pos, ext_mode, shared)
+        ip = self._ip_cache.get(key)
+        if ip is None:
+            ring = self.delay_steps + 1
+            write = (pos + self.delay_steps) % ring
+            ip = torch.tensor(
+                [self.n, self.batch, self.words, pos, write, 0, (write + ring - 1) % ring, ext_mode,
+                 self.dn_acc.shape[1], int(shared)],
+                dtype=torch.int32, device=self.device,
+            )
+            self._ip_cache[key] = ip
+        return ip
+
+    def _rows_ip(self, ip: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+        key = (ip.data_ptr(), rows.numel())
+        out = self._rows_ip_cache.get(key)
+        if out is None:
+            out = ip.clone()
+            out[metal_lif.IP_ROWS] = rows.numel()
+            self._rows_ip_cache[key] = out
+        return out
+
     def _step_metal(
         self,
         external_mv: torch.Tensor | None,
         external_index: torch.Tensor | None,
         external_values: torch.Tensor | None,
+        poisson_prob: torch.Tensor | None,
+        seed: int,
+        shared: bool,
     ) -> None:
+        mode = metal_lif.EXT_VALUES
         if external_mv is not None:
             # dense input: every cell gets a slot
             ext = external_mv.t().contiguous()
@@ -287,18 +370,28 @@ class Brain:
             if external_values is not None:
                 ext = ext.clone()
                 ext.index_add_(0, external_index, external_values)
+        elif poisson_prob is not None:
+            ext = poisson_prob if poisson_prob.is_contiguous() else poisson_prob.contiguous()
+            slots = self._ext_slots(external_index)
+            mode = metal_lif.EXT_POISSON
         elif external_values is not None:
             ext = external_values if external_values.is_contiguous() else external_values.contiguous()
             slots = self._ext_slots(external_index)
         else:
-            ext, slots = self.no_ext, self.no_ext_slot
-        params = self.iparams[self.buf_pos]
+            ext, slots, mode = self.no_ext, self.no_ext_slot, metal_lif.EXT_NONE
+        ip = self._ip(self.buf_pos, mode, shared)
+        write_slot = (self.buf_pos + self.delay_steps) % (self.delay_steps + 1)
+        any_w = self.any_bits[write_slot]
+        any_w.zero_()
         common = (self.u, self.j_syn, self.adapt, self.refrac, self.bits,
-                  self.rowptr, self.col, self.val, slots, ext, self.fparams, params)
+                  self.rowptr, self.col, self.val, slots, ext, self.fparams)
+        tail = (self.dn_slot, self.dn_acc, int(seed) & 0x7FFFFFFF, self.any_bits[self.buf_pos], any_w, self.quiet)
         if self.short_rows.numel():
-            self.metal.lif_short(*common, self.short_rows, threads=self.short_rows.numel() * self.words, group_size=256)
+            self.metal.lif_short(*common, self._rows_ip(ip, self.short_rows), self.short_rows, *tail,
+                                 threads=self.short_rows.numel() * self.words, group_size=256)
         if self.long_rows.numel():
-            self.metal.lif_long(*common, self.long_rows, threads=self.long_rows.numel() * self.words * 32, group_size=256)
+            self.metal.lif_long(*common, self._rows_ip(ip, self.long_rows), self.long_rows, *tail,
+                                threads=self.long_rows.numel() * self.words * 32, group_size=256)
         self.written_slot = (self.buf_pos + self.delay_steps) % (self.delay_steps + 1)
         self.buf_pos = (self.buf_pos + 1) % (self.delay_steps + 1)
 
@@ -308,10 +401,10 @@ class Brain:
             rows = index if index.dtype == torch.int32 else index.to(torch.int32)
             out = torch.empty(self.batch, rows.numel(), dtype=torch.float32, device=self.device)
             key = (rows.data_ptr(), rows.numel())
-            ip = self._rows_ip_cache.get(key)
+            ip = self._unpack_ip_cache.get(key)
             if ip is None:
                 ip = torch.tensor([rows.numel(), self.batch, self.words], dtype=torch.int32, device=self.device)
-                self._rows_ip_cache[key] = ip
+                self._unpack_ip_cache[key] = ip
             self.metal.unpack_rows(out, self.bits[self.written_slot], rows, ip, threads=rows.numel() * self.batch)
             return out
         return self.last_spikes[index].t()
@@ -322,25 +415,44 @@ class Brain:
             return self._unpack_all(self.written_slot)
         return self.last_spikes.t()
 
+    def set_kick_mv(self, kick_mv: float) -> None:
+        """Size of one sensory kick for the `poisson_prob` input mode."""
+        self.kick_mv = float(kick_mv)
+        if self.metal is not None:
+            self.fparams[metal_lif.FP_KICK_MV] = self.kick_mv
+
     def step(
         self,
         external_mv: torch.Tensor | None = None,
         external_index: torch.Tensor | None = None,
         external_values: torch.Tensor | None = None,
         dense: bool = True,
+        poisson_prob: torch.Tensor | None = None,
+        seed: int = 0,
+        shared_noise: bool = True,
     ) -> torch.Tensor | None:
         """Advance one dt. Returns the binary spike tensor as a (batch, n) view.
 
         Input current in mV is either dense `external_mv` (batch, n) or, far
         cheaper when only a few thousand sensory cells are driven, the pair
-        `external_index` (k,) and `external_values` (k, batch).
+        `external_index` (k,) and `external_values` (k, batch). With
+        `poisson_prob` (k, batch) instead of values, each driven cell receives
+        a `kick_mv` kick with that probability, decided by a counter hash of
+        (`seed`, cell, body) — or (`seed`, cell) for every body when
+        `shared_noise` — so the same seed reproduces the same kicks.
 
         With `dense=False` nothing is returned; read spikes with `spikes_of`
         or `dense_spikes`. On the Metal path that saves a full-width unpack.
         """
         if self.uses_metal:
-            self._step_metal(external_mv, external_index, external_values)
+            self._step_metal(external_mv, external_index, external_values, poisson_prob, seed, shared_noise)
             return self.dense_spikes() if dense else None
+
+        if poisson_prob is not None:
+            cells = torch.arange(external_index.numel(), device=self.device)
+            body = 0 if shared_noise else torch.arange(self.batch, device=self.device).unsqueeze(0)
+            draw = metal_lif.hash01(seed, cells.unsqueeze(1), body)
+            external_values = (draw < poisson_prob).to(poisson_prob.dtype) * self.kick_mv
 
         delayed = self.spike_buffer[self.buf_pos % self.delay_steps]
         pre = delayed if self.gain is None else delayed * self.gain
@@ -376,6 +488,8 @@ class Brain:
         self.spike_buffer[self.buf_pos % self.delay_steps] = spikes
         self.last_spikes = spikes
         self.buf_pos = (self.buf_pos + 1) % self.delay_steps
+        if self.dn_index is not None and self.dn_acc.shape[1]:
+            self.dn_acc.add_(spikes[self.dn_index].t())
         return spikes.t() if dense else None
 
     def role_index(self, role: str, limit: int | None = None) -> torch.Tensor:

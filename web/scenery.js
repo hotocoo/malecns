@@ -13,20 +13,8 @@
 import * as THREE from "three";
 import { mergeGeometries } from "/vendor/three/utils/BufferGeometryUtils.js";
 
-const STOREY_M = 3.2;
-const BAY_M = 3.1;
-const RAIL_HEIGHTS = [0.32, 0.7, 1.08]; // three W-beams, Monaco style
-const POST_SPACING_M = 2.0;
-const PALETTE = [
-  ["#e6d7bf", "#c9b799"], // Monaco cream
-  ["#e9c9a4", "#c7a37d"], // ochre
-  ["#f0e3d4", "#cbbca9"], // pale stone
-  ["#d9c5b0", "#b39a82"], // sand
-  ["#e3b8a4", "#c1907a"], // terracotta pink
-  ["#cfd5d9", "#a3adb5"], // modern grey
-  ["#f2e9dc", "#d3c6b2"], // white-cream
-  ["#dcc7a1", "#b8a07a"], // yellow ochre
-];
+/* Every dimension and colour here comes from the server's SceneryStyleConfig
+ * (`style`, served with /api/scenery); nothing about Monaco is written in. */
 
 /* Sim frame -> world frame: sim x is world x, sim y is world -z, up is +y. */
 const toWorld = (x, y, h = 0) => new THREE.Vector3(x, h, -y);
@@ -41,7 +29,7 @@ function hash(i) {
 
 /* --------------------------------------------------------------- textures */
 
-function facadeTexture(base, trim, seed) {
+function facadeTexture(base, trim, seed, style) {
   const w = 256;
   const h = 256; // one storey tall, one bay wide, repeated
   const canvas = document.createElement("canvas");
@@ -102,7 +90,7 @@ function facadeTexture(base, trim, seed) {
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 8;
-  tex.repeat.set(1 / BAY_M, 1 / STOREY_M);
+  tex.repeat.set(1 / style.facade_bay_m, 1 / style.storey_m);
   return tex;
 }
 
@@ -161,12 +149,18 @@ function polygonArea(ring) {
   return Math.abs(a) / 2;
 }
 
-function buildingHeight(b, i) {
+function buildingHeight(b, i, style) {
   if (b.height > 0) return b.height;
-  // Monaco: dense 6-14 storey blocks; small footprints are lower annexes.
+  // unmapped height: storeys grow with footprint area, jittered per building
   const area = polygonArea(b.rings[0]);
-  const storeys = Math.max(2, Math.min(14, Math.round(3 + Math.sqrt(area) * 0.22 + hash(i) * 4)));
-  return storeys * STOREY_M;
+  const storeys = Math.max(
+    style.default_storeys_min,
+    Math.min(
+      style.default_storeys_max,
+      Math.round(style.default_storeys_base + Math.sqrt(area) * style.default_storeys_per_sqrt_m2 + hash(i) * style.default_storeys_jitter),
+    ),
+  );
+  return storeys * style.storey_m;
 }
 
 /** Vertex range [start, start+count) of a non-indexed geometry as its own geometry. */
@@ -181,10 +175,10 @@ function sliceGeometry(geometry, start, count) {
   return out;
 }
 
-export function buildBuildings(buildings) {
+export function buildBuildings(buildings, style) {
   const group = new THREE.Group();
-  const facades = PALETTE.map(([base, trim], k) => ({
-    wall: new THREE.MeshStandardMaterial({ map: facadeTexture(base, trim, k + 1), roughness: 0.9, metalness: 0.0 }),
+  const facades = style.facade_palette.map(([base, trim], k) => ({
+    wall: new THREE.MeshStandardMaterial({ map: facadeTexture(base, trim, k + 1, style), roughness: 0.9, metalness: 0.0 }),
     roof: new THREE.MeshStandardMaterial({ map: roofTexture(k + 1), roughness: 1.0 }),
     walls: [],
     roofs: [],
@@ -196,7 +190,7 @@ export function buildBuildings(buildings) {
     for (const hole of b.rings.slice(1)) {
       if (hole.length >= 3) shape.holes.push(new THREE.Path(hole.map(([x, y]) => new THREE.Vector2(x, y))));
     }
-    const height = buildingHeight(b, i);
+    const height = buildingHeight(b, i, style);
     const geometry = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false, steps: 1 });
     geometry.rotateX(-Math.PI / 2); // extrusion +z -> up, shape y -> world -z
     // ExtrudeGeometry is non-indexed with two groups: [0] caps, [1] side walls.
@@ -277,7 +271,7 @@ function wBeamProfile(side, base) {
   return pts.map(([x, y]) => [x, base + y]);
 }
 
-export function buildBarriers(frames, offset) {
+export function buildBarriers(frames, offset, style) {
   const group = new THREE.Group();
   const steel = new THREE.MeshStandardMaterial({
     color: 0xb4b8bd,
@@ -288,7 +282,7 @@ export function buildBarriers(frames, offset) {
   const postMaterial = new THREE.MeshStandardMaterial({ color: 0x6e7378, metalness: 0.7, roughness: 0.6 });
   const railGeos = [];
   [-1, 1].forEach((side) => {
-    RAIL_HEIGHTS.forEach((base) => {
+    style.rail_heights_m.forEach((base) => {
       const profile = wBeamProfile(side, base).map(([x, y]) => [side * offset + x, y]);
       railGeos.push(sweep(frames, 0, frames.length - 1, profile, true, 4));
     });
@@ -298,22 +292,22 @@ export function buildBarriers(frames, offset) {
   rails.receiveShadow = true;
   group.add(rails);
 
-  // Posts: I-section uprights every 2 m, instanced. Two per position (both sides).
+  // Posts: I-section uprights at the configured spacing, instanced. Two per position (both sides).
   const total = frames[frames.length - 1].s;
-  const nPosts = Math.floor(total / POST_SPACING_M);
-  const post = new THREE.BoxGeometry(0.12, 1.45, 0.18);
+  const nPosts = Math.floor(total / style.post_spacing_m);
+  const post = new THREE.BoxGeometry(...style.post_size_m);
   const posts = new THREE.InstancedMesh(post, postMaterial, nPosts * 2);
   const dummy = new THREE.Object3D();
   let fi = 0;
   let placed = 0;
   for (let k = 0; k < nPosts; k += 1) {
-    const s = k * POST_SPACING_M;
+    const s = k * style.post_spacing_m;
     while (fi < frames.length - 1 && frames[fi + 1].s < s) fi += 1;
     const f = frames[fi];
     const heading = Math.atan2(-f.normal[0], f.normal[1]); // tangent (tx, ty) = (n[1], -n[0])
     [-1, 1].forEach((side) => {
-      const lat = side * (offset + 0.1); // just behind the rail, away from the road
-      dummy.position.set(f.p[0] + f.normal[0] * lat, 0.72, -(f.p[1] + f.normal[1] * lat));
+      const lat = side * (offset + style.post_setback_m); // just behind the rail, away from the road
+      dummy.position.set(f.p[0] + f.normal[0] * lat, style.post_height_m, -(f.p[1] + f.normal[1] * lat));
       dummy.rotation.set(0, heading, 0);
       dummy.updateMatrix();
       posts.setMatrixAt(placed, dummy.matrix);
@@ -329,19 +323,19 @@ export function buildBarriers(frames, offset) {
 
 /* ------------------------------------------------------------------ tunnel */
 
-export function buildTunnel(frames, spans, halfwidth) {
+export function buildTunnel(frames, spans, halfwidth, style) {
   const group = new THREE.Group();
   if (!spans || !spans.length) return group;
   const concrete = new THREE.MeshStandardMaterial({ map: concreteTexture(), roughness: 0.95, side: THREE.DoubleSide });
   const shell = new THREE.MeshStandardMaterial({ color: 0x3b3f44, roughness: 1.0, side: THREE.DoubleSide });
   const lamp = new THREE.MeshStandardMaterial({ color: 0xffc98a, emissive: 0xffb45c, emissiveIntensity: 2.4, roughness: 0.4 });
-  const wall = halfwidth + 0.9; // barrier, narrow pavement, then the wall
-  const h0 = 4.4; // vertical wall height
-  const apex = 6.4;
+  const wall = halfwidth + style.tunnel_wall_offset_m; // barrier, narrow pavement, then the wall
+  const h0 = style.tunnel_wall_height_m;
+  const apex = style.tunnel_apex_m;
   // interior: vertical walls up to h0 then an arch to the apex
   const profile = [];
   profile.push([-wall - 0.5, -0.1], [-wall, 0.0], [-wall, h0]);
-  const arcN = 12;
+  const arcN = style.tunnel_arc_segments;
   for (let k = 1; k < arcN; k += 1) {
     const t = k / arcN;
     const x = -wall + t * 2 * wall;
@@ -371,7 +365,7 @@ export function buildTunnel(frames, spans, halfwidth) {
     let lastBay = -1;
     for (let i = a; i <= b; i += 1) {
       const f = frames[i];
-      const bay = Math.floor(f.s / 8);
+      const bay = Math.floor(f.s / style.tunnel_lamp_spacing_m);
       if (bay === lastBay) continue;
       lastBay = bay;
       const g = new THREE.BoxGeometry(1.2, 0.18, 0.5);
@@ -488,7 +482,7 @@ function rectsGeometry(rects, height, tileMetres) {
  * and the land that remains as the textured ground. Returns { group, water }
  * where `water` is the material to animate.
  */
-export function buildWater(water, groundMaterial) {
+export function buildWater(water, groundMaterial, style) {
   const group = new THREE.Group();
   if (!water || !water.water || !water.water.length) return { group, material: null };
   const normal = waterNormalTexture();
@@ -505,12 +499,12 @@ export function buildWater(water, groundMaterial) {
     clearcoat: 0.6,
     clearcoatRoughness: 0.1,
   });
-  const sea = new THREE.Mesh(rectsGeometry(water.water, water.level, 18), material);
+  const sea = new THREE.Mesh(rectsGeometry(water.water, water.level, style.water_tile_m), material);
   sea.receiveShadow = true;
   group.add(sea);
 
   if (water.land && water.land.length) {
-    const land = new THREE.Mesh(rectsGeometry(water.land, -0.03, 6), groundMaterial);
+    const land = new THREE.Mesh(rectsGeometry(water.land, -0.03, style.land_tile_m), groundMaterial);
     land.receiveShadow = true;
     group.add(land);
   }

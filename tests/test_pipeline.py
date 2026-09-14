@@ -125,7 +125,7 @@ def test_agent_parameter_roundtrip(connectome):
     assert params.shape[1] == agent.n_params
     theta = agent.unpack(params)
     assert theta["w_out"].shape == (2, agent.cfg.readout_dim, 2)
-    assert agent.projection.shape == (agent.n_dn, agent.cfg.readout_dim)
+    assert agent.projection.shape == (agent.n_readout, agent.cfg.readout_dim)
     assert theta["ray_gain"].shape == (2, agent.cfg.n_rays)
 
 

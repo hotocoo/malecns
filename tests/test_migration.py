@@ -30,12 +30,12 @@ def agent():
 
 @needs_graph
 def test_legacy_141_param_checkpoint_keeps_trained_blocks(agent):
-    assert agent.n_params == 142
+    assert agent.n_params == 144
     legacy = torch.arange(141, dtype=torch.float32) / 100.0
     state = {"mu": legacy, "momentum": torch.ones(141), "agent_cfg": asdict(agent.cfg)}
     mu, momentum, notes = agent.migrate_state(state)
-    assert mu.numel() == 142 and momentum.numel() == 142
-    assert notes == ["loom_gain from init"]
+    assert mu.numel() == 144 and momentum.numel() == 144
+    assert notes == ["loom_gain from init", "g_out from init"]
     theta = agent.unpack(mu.unsqueeze(0))
     assert torch.equal(theta["ray_gain"][0], legacy[:9])
     assert torch.equal(theta["bias_hz"][0], legacy[9:10])
@@ -74,12 +74,24 @@ def test_same_layout_roundtrips_exactly(agent):
 
 
 @needs_graph
-def test_readout_from_another_scale_is_reset(agent):
-    """A readout evolved at another readout_scale pins tanh here; only the sensory gains carry over."""
+def test_readout_without_metadata_is_kept(agent):
+    """No `agent_cfg` recorded: the trained readout is trusted, never reset."""
+    legacy = torch.full((141,), 2.0)
+    mu, momentum, notes = agent.migrate_state({"mu": legacy, "momentum": torch.ones(141)})
+    theta = agent.unpack(mu.unsqueeze(0))
+    assert torch.equal(theta["w_out"][0], torch.full((agent.cfg.readout_dim, 2), 2.0))
+    assert torch.equal(theta["b_out"][0], torch.full((2,), 2.0))
+    assert not any("reset" in n for n in notes)
+    assert float(momentum[-2:].sum()) == 2.0  # momentum carried for saved blocks
+
+
+@needs_graph
+def test_readout_from_another_configuration_is_reset(agent):
+    """A readout evolved under another normalisation means nothing here; only the sensory gains carry over."""
     legacy = torch.full((141,), 2.0)
     for state in (
-        {"mu": legacy, "momentum": torch.ones(141)},  # nothing recorded: pre-audit trainer
-        {"mu": legacy, "momentum": torch.ones(141), "agent_cfg": {**asdict(agent.cfg), "readout_scale": 50.0}},
+        {"mu": legacy, "momentum": torch.ones(141), "agent_cfg": {**asdict(agent.cfg), "readout_norm": "none"}},
+        {"mu": legacy, "momentum": torch.ones(141), "agent_cfg": {**asdict(agent.cfg), "readout_scale": 50.0, "readout_norm": "none"}},
     ):
         mu, momentum, notes = agent.migrate_state(state)
         theta = agent.unpack(mu.unsqueeze(0))

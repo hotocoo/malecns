@@ -69,7 +69,8 @@ def test_curve_payload_downsamples_and_totals(tmp_path):
 
 
 def test_curve_payload_handles_missing_or_empty_log(tmp_path):
-    assert curve_payload(tmp_path / "none.jsonl", 10) == {"generations": 0, "fitness": [], "laps": []}
+    missing = curve_payload(tmp_path / "none.jsonl", 10)
+    assert missing["generations"] == 0 and missing["fitness"] == [] and missing["laps"] == [] and missing["keys"] == []
     empty = tmp_path / "empty.jsonl"
     empty.write_text("\n\n")
     assert curve_payload(empty, 10)["generations"] == 0

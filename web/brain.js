@@ -104,17 +104,19 @@ function orbit(distance, yaw, pitch) {
 /* ------------------------------------------------------------------- viewer */
 
 export class BrainView {
-  constructor(canvas, roleColors) {
+  /** roleColors: Float32Array(8*3); view: the server's BrainViewConfig (decay, camera, point sizes). */
+  constructor(canvas, roleColors, view) {
     this.canvas = canvas;
     this.gl = canvas.getContext("webgl2", { antialias: true, alpha: false });
     if (!this.gl) throw new Error("WebGL2 unavailable");
     this.roleColors = roleColors;
+    this.view = view;
     this.count = 0;
     this.activation = null;
-    this.decay = 0.82;
-    this.yaw = 0.6;
-    this.pitch = 0.15;
-    this.distance = 1.75;
+    this.decay = view.activation_decay;
+    this.yaw = view.yaw;
+    this.pitch = view.pitch;
+    this.distance = view.distance;
     this.autoSpin = true;
     this.dirty = false;
     this._initProgram();
@@ -155,10 +157,10 @@ export class BrainView {
     });
     canvas.addEventListener("pointermove", (event) => {
       if (!dragging) return;
-      this.yaw += (event.clientX - lastX) * 0.008;
+      this.yaw += (event.clientX - lastX) * this.view.drag_rad_per_px;
       this.pitch = Math.max(
         -1.45,
-        Math.min(1.45, this.pitch + (event.clientY - lastY) * 0.008),
+        Math.min(1.45, this.pitch + (event.clientY - lastY) * this.view.drag_rad_per_px),
       );
       lastX = event.clientX;
       lastY = event.clientY;
@@ -173,7 +175,7 @@ export class BrainView {
       "wheel",
       (event) => {
         event.preventDefault();
-        this.distance = Math.max(1.2, Math.min(8, this.distance + event.deltaY * 0.002));
+        this.distance = Math.max(this.view.distance_min, Math.min(this.view.distance_max, this.distance + event.deltaY * this.view.zoom_per_wheel_unit));
         this.dirty = true;
       },
       { passive: false },
@@ -237,7 +239,7 @@ export class BrainView {
   render() {
     const gl = this.gl;
     if (this.autoSpin) {
-      this.yaw += 0.0016;
+      this.yaw += this.view.auto_spin_rad_per_frame;
       this.dirty = true;
     }
     const resized = this.resize();
@@ -263,10 +265,10 @@ export class BrainView {
     gl.uniformMatrix4fv(this.uniform.mvp, false, mvp);
     gl.uniform1f(
       this.uniform.pointScale,
-      Math.max(1.1, (gl.drawingBufferHeight / 620) * 1.6),
+      Math.max(this.view.point_scale_min, (gl.drawingBufferHeight / this.view.point_scale_ref_px) * this.view.point_scale),
     );
     gl.uniform3fv(this.uniform.roleColors, this.roleColors);
-    gl.uniform1f(this.uniform.inferredDim, 0.45);
+    gl.uniform1f(this.uniform.inferredDim, this.view.inferred_dim);
 
     gl.bindVertexArray(this.vao);
     gl.drawArrays(gl.POINTS, 0, this.count);

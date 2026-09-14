@@ -9,8 +9,9 @@ live in the browser, neuron by neuron, from a separate process.
 - 166,700 annotated neurons, 6.24M connections (>= 5 synapses), 89.9M synapses
 - leaky integrate-and-fire dynamics with the Shiu et al. 2024 parameter set
 - real neurotransmitter identity sets every connection's sign
-- vision enters at the visual projection neurons, control leaves at the 1,314
-  descending neurons, exactly as in the fly
+- vision enters at the visual projection neurons; control is read from the
+  1,314 descending neurons and the 815 ventral-cord motor neurons they drive,
+  the whole brain -> descending -> VNC -> muscle path
 - the circuit is the real Monaco centerline at full scale (3.29 km after
   corner smoothing, 11 m road), the car a Mercedes-AMG F1 W11 model
 - the training loop was audited item by item; see [docs/AUDIT.md](docs/AUDIT.md)
@@ -62,19 +63,38 @@ python3 src/viewer.py --replay logs/run.npz
 ## Speed
 
 On Apple GPUs the brain step is one fused Metal kernel (`src/metal_lif.py`,
-via `torch.mps.compile_shader`): spikes are packed one bit per body, so each
-synapse reads 4 bytes per 32 bodies instead of a 256-byte row, and the
-synaptic sum, current decay, membrane integration, threshold, reset,
-adaptation and refractory bookkeeping run in registers in one pass. Rows
-with more than 64 inputs (56% of synapses; hub neurons take up to 6,660) get
-a 32-lane SIMD group each so they no longer serialise the step. The torch
-path in `brain.py` is the reference and is used on CPU/CUDA, when a per-neuron
-gain is set, or with `MALECNS_NO_METAL=1`; `tests/test_metal.py` checks the two
-produce identical spikes.
+via `torch.mps.compile_shader`). Every one of the 166,700 neurons and 6.24M
+connections is stepped every 2 ms; what changed is only how:
 
-Measured on an M4 Max at a population of 64: brain step 7.6 -> 2.0 ms, control
-step (8 substeps + car) 70 -> 18 ms. Training is never paced or rendered;
-only the viewer sleeps to real time (`--speed 0` runs it uncapped too).
+- spikes are bit masks (one bit per body) and a 21 KB per-neuron "any body
+  spiked" bitmap lets the synapse loop skip silent presynaptic cells;
+- one thread owns one (neuron, 32-body word) and walks the row's synapses
+  once for all 32 bodies; hub neurons (over 256 inputs, up to 6,660) get a
+  whole SIMD group striding over their synapses; rows are sorted by in-degree
+  so the 32 threads of a group finish together; the accumulator loops are
+  fully unrolled (a dynamically indexed register array spilled to memory and
+  cost more than the synapses);
+- state is stored as fp16 by default (`--precision fp32` for the bit-exact
+  reference), the refractory array is gone at a one-step refractory period
+  (the previous spike bit is the flag), and a neuron-word whose 32 bodies sit
+  at exactly zero state with no input this step is skipped (exact: zero in,
+  zero out);
+- the sensory Poisson kicks are drawn inside the kernel from a counter hash
+  of (seed, substep, cell), and output-neuron spikes are counted into a
+  small buffer as they fire, so no random tensors or spike gathers cross the
+  bus per substep.
+
+The torch path in `brain.py` is the reference and is used on CPU/CUDA, when a
+per-neuron gain is set, or with `MALECNS_NO_METAL=1`; `tests/test_metal.py`
+checks the fp32 kernel reproduces it spike for spike (0 of 853M differ at
+batch 128) and the fp16 kernel statistically.
+
+Measured on an M4 Max, population 128, realistic activity: brain substep
+5.3-6.0 -> 1.3-1.7 ms, control step (8 substeps + car) 82 -> 12.4 ms, 1,560 ->
+10,300 body-steps/s (12,000 at 256 bodies). The remaining cost is the
+memory traffic of the fp16 state itself. Training is never paced or
+rendered; only the viewer sleeps to real time (`--speed 0` runs it uncapped
+too).
 
 Checkpoints from older parameter layouts (141 parameters, before the looming
 channel) are migrated block by block on load: trained blocks are kept, new
@@ -104,19 +124,27 @@ parameters a fly would get from development and neuromodulation:
 | `loom_gain` | 1 | extra drive from an expanding edge (proximity increasing) |
 | `bias_hz` | 1 | tonic drive on the visual sheet |
 | `speed_gain` | 1 | proprioceptive speed drive to ascending neurons |
-| `w_out` | 64 x 2 | readout from a fixed random mix of DN firing rates |
+| `w_out` | 64 x 2 | readout *direction* over a fixed random mix of output-neuron rates |
+| `g_out` | 2 | readout gain: the motor pre-activation lies within +-`g_out` |
 | `b_out` | 2 | readout bias |
 | `dn_gain` | 1,314 | per-DN excitability, off by default (`learn_dn_gain`) |
 
-142 parameters against 6.24M fixed synaptic weights. Descending-neuron rates
-are low-pass filtered, the population mean is removed, and a fixed random
-projection mixes them to 64 channels; `tanh` gives steering (positive = left)
+144 parameters against 6.24M fixed synaptic weights. Output-neuron rates
+(descending + motor) are low-pass filtered, the population mean is removed, a
+fixed random projection mixes them into 64 channels, the channel vector is
+scaled to unit length (with a floor at 5 Hz of activity so silence is not
+amplified), and `g_out * cos(pattern, w_out) + b_out` goes through `tanh`,
+which gives steering (positive = left)
 and the pedal (positive = throttle, negative = brake).
 
 Gradient descent is not an option: spikes are non-differentiable and the
 substrate is fixed, so antithetic ES with tie-aware rank normalisation is
 used. Each generation runs one episode for the whole population in parallel on
-one batched brain, rotating through six start points around the lap. A
+one batched brain, on all six start points around the lap at once (`--starts-per-gen`).
+Members whose fitness differs by less than one step of time tax are tied, and
+the perturbation scale widens while a generation shows no differences at all
+and shrinks back once it does, so a flat landscape never becomes a random
+walk. A
 curriculum starts on a 1.6x wide road with 1500-step episodes and tightens to
 the real 11 m and 3000 steps as the mean lap fraction improves. Every ten
 generations the mean is evaluated deterministically on all starts and the best

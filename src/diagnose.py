@@ -230,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {d:>5g} m: |delta| > 2 Hz in {strong:4d} / {dn.numel()} DNs; mean |delta| {np.abs(delta).mean():.2f} Hz; population delta {delta.mean():+.2f} Hz")
     delta_mean = np.mean(deltas, axis=0)
     order = np.argsort(-np.abs(delta_mean))[: args.top]
-    steer_w = (agent.projection @ agent.unpack(mu.unsqueeze(0))["w_out"][0, :, 0]).cpu().numpy()
+    steer_w = agent.dn_steer_weight(agent.unpack(mu.unsqueeze(0))).cpu().numpy()
     print(f"  top {args.top} DNs by |delta| averaged over distances (with their effective steering weight):")
     top = []
     for j in order:

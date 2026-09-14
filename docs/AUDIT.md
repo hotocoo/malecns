@@ -32,6 +32,14 @@ graph, batch 64.
 | 22 | debug telemetry | added | per generation: laps, steps alive, speed, lateral g, steer, crash/reverse/stuck counts, DN Hz, visual Hz, body-steps/s, eval fields |
 | 23 | long-horizon evaluation | added | `evaluate.py`: all 6 starts, 3000+ steps, lap time, endings, JSON table, trajectory plot, run recording |
 | 24 | stress tracks | added | mirrored Monaco, 0.8x road width, procedural loops at 1.6x harmonic amplitude, 8 m road loop (`--suite`) |
+| 25 | readout reset on resume | fixed | a checkpoint without `agent_cfg` was treated as a readout mismatch and its trained `w_out`/`b_out` thrown away (generation 112 of the first Monaco run collapsed from laps 1.0 to -21); missing metadata is now trusted, `best.pt` is only overwritten by a better evaluation |
+| 26 | flat-landscape random walk | fixed | rank normalisation ties members within one step of time tax; sigma grows while a generation is uninformative and shrinks back after (`--sigma-max/--sigma-grow/--sigma-shrink`) |
+| 27 | pinned tanh / bang-bang steering | fixed | readout is `g_out * cos(pattern, w_out)`: unit-length channel vector (5 Hz floor), unit readout direction, bounded gain; the motor pre-activation cannot exceed `g_out` whatever the firing level or the readout norm |
+| 28 | collision body | fixed | oriented rectangle (nose to tail, both sides) against a bilinearly sampled clearance field; the nose no longer pokes through the barrier at an angle; a crashed car keeps its last legal pose |
+| 29 | objective rotating with the start point | fixed | every member scored on all six starts each generation (`run_training.sh` default `STARTS_PER_GEN=6`); one start per generation made the objective swing between +20 and -18 |
+| 30 | output population | changed | readout over descending *and* VNC motor neurons (`readout_roles`), completing the brain -> DN -> ventral cord -> muscle path |
+| 31 | where did they die | telemetry | per generation: end-of-episode histogram around the lap, fitness/laps/reasons per start, motor pre-activation, grad/mu norms, timestamps; the viewer logs every episode ending to `logs/viewer_episodes.jsonl` |
+| 32 | viewer hardcoding | removed | every constant the page used (vehicle, scenery, camera, colours, thresholds) lives in `src/viewer_config.py`, served by `/api/config`, and the page builds its panels from the server's frame schema |
 
 ## Details
 
@@ -126,13 +134,20 @@ generations passes 0.12 then 0.20. The stage is checkpointed;
 
 ### Throughput (headless training)
 
-`train.py` never renders or paces. The brain state moved to an `(n, batch)`
-layout (the shape the sparse matmul produces), the membrane update was fused
-to 10 full-width passes (from ~19), and the refractory counter is skipped when
-`t_ref` rounds to one step. Batch 64 on MPS: brain step 14.3 -> 8.2 ms,
-control step (8 substeps + environment) 122 -> 77 ms, 830 body-steps/s; a
-3000-step generation takes ~4 minutes with 64 bodies. `torch.inference_mode`
-wraps rollouts; the only host sync is a liveness poll every 25 steps.
+`train.py` never renders or paces. History: torch path 830 body-steps/s at
+batch 64; first Metal kernel ~2,600 at batch 128; current kernel 10,300 at
+batch 128 and 12,000 at 256 (M4 Max, realistic activity). Where the time
+went, measured by ablation at batch 128: the original kernel's 5.3-6 ms per
+substep was not the state update (2.3 ms fp32, 1.3 ms fp16) but the synapse
+gather (4.1 ms), and of that almost all was a few hundred hub neurons with
+over 1,024 inputs each walked serially by one thread (rows over 1,024 inputs
+alone: 3.35 ms; rows up to 64 inputs: 0.36 ms). Fixes and their effect: SIMD
+group per hub row with unrolled accumulators (gather 4.1 -> 1.2 ms), rows
+sorted by in-degree (-> 0.8 ms), fp16 state (membrane 2.3 -> 1.3 ms), exact
+skip of all-zero neuron-words (~25% of the network under drive), sensory
+draws and output-spike counting inside the kernel (-6 ms of torch ops per
+control step). The environment step is 1.5 ms. `torch.inference_mode` wraps
+rollouts; the only host sync is a liveness poll every 25 steps.
 
 ### Diagnostics
 

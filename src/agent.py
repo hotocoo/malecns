@@ -11,7 +11,9 @@ excitability a real fly would get from development and neuromodulation:
     bias_hz     (1,)        tonic drive on the visual sheet
     speed_gain  (1,)        proprioceptive speed drive onto ascending neurons
     dn_gain     (n_dn,)     per-descending-neuron excitability multiplier
-    w_out       (readout_dim, 2)  readout from projected descending-neuron rates
+    w_out       (readout_dim, 2)  readout *direction* over the projected
+                            output-population channels (normalised in use)
+    g_out       (2,)        readout gain: motor pre-activation scale
     b_out       (2,)        readout bias
 
 Sensory input is delivered as Poisson spike kicks (as in Shiu et al. 2024)
@@ -24,17 +26,26 @@ the lamina/medulla stages that invert it are not what this task needs; LC-type
 projection neurons are the looming and feature detectors that actually drive
 descending steering. Ray 0 is the leftmost ray and feeds the left-eye group.
 
-Readout. Descending-neuron rates are low-pass filtered (`motor_tau`), the
+Readout. The output population is `readout_roles`: by default the descending
+neurons (the brain's only path to the body) *and* the VNC motor neurons they
+drive, so the whole brain -> descending -> ventral cord -> motor path is read.
+Their rates are low-pass filtered (`motor_tau`), the
 population mean is subtracted (the common mode a random projection would
 otherwise turn into a large random offset per channel), and the result goes
-through a fixed random projection to `readout_dim` channels. There is no
-temporal high-pass: one was tried and it removed the steady-state signal a car
-needs to hold a constant-radius corner.
+through a fixed random projection to `readout_dim` channels. The channel
+vector is then normalised to unit length (`readout_norm="layer"`), and `w_out`
+is used as a unit direction scaled by the bounded gain `g_out`: the motor
+pre-activation is `g_out * cos(angle between pattern and readout)`
+plus bias and lies within +-`g_out`, so neither the firing level nor a
+drifting readout norm can pin `tanh` (which is what turned steering into
+bang-bang and flattened the fitness landscape before).
+There is no temporal high-pass: one was tried and it removed the steady-state
+signal a car needs to hold a constant-radius corner.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import numpy as np
 import torch
@@ -57,9 +68,14 @@ class AgentConfig:
     # Low-pass on descending rates: 0.2 at a 16 ms step is an 80 ms time
     # constant, about the visual-motor latency of a fly.
     motor_tau: float = 0.2
-    # Projected channels have unit-order magnitude at typical DN rates with
-    # this scale (measured: DN rates ~12 Hz, |channel| ~ 3 at scale 50).
-    readout_scale: float = 16.0
+    # "layer": the projected channel vector is scaled to unit length (with a
+    # floor of `readout_floor_hz` of population activity below which the
+    # scaling relaxes to linear, so silence is not amplified into a full-scale
+    # command); the motor pre-activation is then g_out * cos(pattern, w_out)
+    # and lies in [-g_out, g_out]. "none": raw projected rates.
+    readout_norm: str = "layer"
+    readout_floor_hz: float = 5.0
+    readout_eps: float = 1e-6
     common_mode: bool = True
     # Looming: positive change in proximity per control step, scaled so a wall
     # approached at speed gives values of order 0.1-1.
@@ -67,6 +83,8 @@ class AgentConfig:
     loom_scale: float = 10.0
     substeps: int = 8
     max_dn: int = 1314
+    # Populations whose rates feed the motor readout, comma-separated roles.
+    readout_roles: str = "descending,motor"
     # The readout runs through a fixed random projection of the descending
     # population. A per-DN readout is 2,628 parameters, which evolution
     # strategies searches badly at a population of 64; 64 mixed channels keep
@@ -74,6 +92,14 @@ class AgentConfig:
     readout_dim: int = 64
     projection_seed: int = 17
     learn_dn_gain: bool = False
+
+    @classmethod
+    def from_saved(cls, saved: dict | None, **overrides) -> "AgentConfig":
+        """Config from a checkpoint's `agent_cfg`, ignoring fields this version no longer has."""
+        known = {f.name for f in fields(cls)}
+        kwargs = {k: v for k, v in (saved or {}).items() if k in known}
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
 
 def _azimuth_order(roles: dict[str, list[int]], neurons, role: str) -> np.ndarray:
@@ -134,8 +160,31 @@ class ConnectomeAgent:
         self.dn_bodies = neurons["bodyId"].to_numpy()[dn]
         self.dn_types = neurons["type"].to_numpy()[dn]
         self.n_dn = len(dn)
-        self.motor_state = torch.zeros(brain.batch, self.n_dn, device=self.device)
+
+        # Output population: every role in `readout_roles`, in order, deduplicated.
+        readout: list[int] = []
+        seen: set[int] = set()
+        self.readout_role_of: list[str] = []
+        for role in [r.strip() for r in self.cfg.readout_roles.split(",") if r.strip()]:
+            cells = dn if role == "descending" else np.asarray(brain.roles.get(role, []), dtype=np.int64)
+            for c in cells.tolist():
+                if c not in seen:
+                    seen.add(c)
+                    readout.append(c)
+                    self.readout_role_of.append(role)
+        if not readout:
+            raise ValueError(f"readout_roles {self.cfg.readout_roles!r} selects no neurons")
+        self.readout_index = torch.tensor(readout, dtype=torch.long, device=self.device)
+        self.n_readout = len(readout)
+        self.readout_bodies = neurons["bodyId"].to_numpy()[readout]
+        self.readout_types = neurons["type"].to_numpy()[readout]
+        position = {c: k for k, c in enumerate(readout)}
+        self.dn_in_readout = torch.tensor([position.get(int(c), -1) for c in dn], dtype=torch.long, device=self.device)
+        self.motor_state = torch.zeros(brain.batch, self.n_readout, device=self.device)
         self.prev_proximity: torch.Tensor | None = None
+        self.last_motor = torch.zeros(brain.batch, 2, device=self.device)
+        brain.set_dn_index(self.readout_index)
+        brain.set_kick_mv(self.cfg.kick_mv)
 
         # All driven cells in one index, each tagged with the rate channel that
         # feeds it (ray 0..n_rays-1, then speed). One gather + one Bernoulli
@@ -149,15 +198,22 @@ class ConnectomeAgent:
 
         generator = torch.Generator().manual_seed(self.cfg.projection_seed)
         self.projection = (
-            torch.randn(self.n_dn, self.cfg.readout_dim, generator=generator)
-            / np.sqrt(self.n_dn)
+            torch.randn(self.n_readout, self.cfg.readout_dim, generator=generator)
+            / np.sqrt(self.n_readout)
         ).to(self.device)
-        self.generator: torch.Generator | None = None
+        self.noise_seed = 0
+        self.step_counter = 0
         self.seed(0)
 
     def seed(self, seed: int) -> None:
-        """Fix the sensory Poisson draws; identical seeds give identical episodes."""
-        self.generator = make_generator(self.device, seed)
+        """Fix the sensory Poisson draws; identical seeds give identical episodes.
+
+        Kicks are drawn inside the brain step from a counter hash of (seed,
+        substep, cell[, body]), so the sequence is reproducible on every
+        backend and costs no random tensors on the bus.
+        """
+        self.noise_seed = int(seed)
+        self.step_counter = 0
 
     # --- parameter vector plumbing -------------------------------------------------
     @property
@@ -172,6 +228,7 @@ class ConnectomeAgent:
         if self.cfg.learn_dn_gain:
             shapes["dn_gain"] = (self.n_dn,)
         shapes["w_out"] = (self.cfg.readout_dim, 2)
+        shapes["g_out"] = (2,)
         shapes["b_out"] = (2,)
         return shapes
 
@@ -190,6 +247,9 @@ class ConnectomeAgent:
         "loom_gain": (0.0, 3.0),
         "dn_gain": (0.2, 3.0),
         "w_out": (-2.5, 2.5),
+        # |motor| <= g_out (reached only by a pattern aligned with w_out);
+        # a random pattern gives ~g_out / sqrt(readout_dim).
+        "g_out": (0.5, 8.0),
         "b_out": (-1.5, 2.5),
     }
 
@@ -226,9 +286,10 @@ class ConnectomeAgent:
             # Small: 64 unit-scale channels at 0.5 gave a motor std of ~12 and
             # a tanh pinned from generation 0 (flat landscape, then drift).
             "w_out": lambda size: torch.randn(size, generator=generator) * 0.1,
-            # Start rolling: tanh(0.5) is 46% throttle, so the very first
-            # generation already produces progress for ES to shape.
-            "b_out": lambda size: torch.tensor([0.0, 0.5])[:size],
+            "g_out": lambda size: torch.full((size,), 1.5),
+            # Start with modest throttle: tanh(0.3) is 29%, enough to move
+            # but leaves room to brake. Steering bias at 0.
+            "b_out": lambda size: torch.tensor([0.0, 0.3])[:size],
         }
         return torch.cat(
             [init[name](int(np.prod(shape))) for name, shape in self.param_shapes.items()]
@@ -238,6 +299,7 @@ class ConnectomeAgent:
     # blocks in the same order, without the looming channel.
     LEGACY_SHAPES: dict[int, dict[str, tuple[int, ...]]] = {
         141: {"ray_gain": (9,), "bias_hz": (1,), "speed_gain": (1,), "w_out": (64, 2), "b_out": (2,)},
+        142: {"ray_gain": (9,), "bias_hz": (1,), "speed_gain": (1,), "loom_gain": (1,), "w_out": (64, 2), "b_out": (2,)},
     }
 
     def migrate_params(
@@ -285,15 +347,21 @@ class ConnectomeAgent:
     # Blocks whose meaning depends on the readout configuration: a w_out trained
     # at another `readout_scale` / `readout_dim` / projection seed is a random
     # matrix here, and one from before those were recorded pinned tanh hard.
-    READOUT_BLOCKS = ("w_out", "b_out")
+    READOUT_BLOCKS = ("w_out", "g_out", "b_out")
 
     def readout_matches(self, state: dict) -> bool:
+        """False only when the checkpoint *records* a different readout configuration.
+
+        A checkpoint without `agent_cfg` is trusted as-is: resetting a trained
+        readout because its metadata is missing threw away a working policy
+        once (generation 112 of the first Monaco run).
+        """
         saved = state.get("agent_cfg")
         if not saved:
-            return False
+            return True
         return all(
             saved.get(key) == getattr(self.cfg, key)
-            for key in ("readout_scale", "readout_dim", "projection_seed", "common_mode", "motor_tau")
+            for key in ("readout_norm", "readout_roles", "readout_dim", "projection_seed", "common_mode", "motor_tau")
         )
 
     def _offsets(self, state: dict, reset: tuple[str, ...]) -> list[tuple[int, int]]:
@@ -345,7 +413,6 @@ class ConnectomeAgent:
             momentum, _ = self.migrate_params(state["momentum"], shapes)
             # blocks that came from init carry no momentum
             if notes:
-                fresh = self.unpack(self.initial_params().unsqueeze(0))
                 offset = 0
                 for name, shape in self.param_shapes.items():
                     size = int(np.prod(shape))
@@ -371,13 +438,33 @@ class ConnectomeAgent:
     # --- closed loop ----------------------------------------------------------------
     def reset(self) -> None:
         self.brain.reset()
-        self.motor_state = torch.zeros(self.brain.batch, self.n_dn, device=self.device)
+        self.motor_state = torch.zeros(self.brain.batch, self.n_readout, device=self.device)
         self.prev_proximity = None
+        self.last_motor = torch.zeros(self.brain.batch, 2, device=self.device)
+        self.step_counter = 0
+
+    def steer_weight(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Effective steering weight per output neuron: the fixed projection folded into `w_out`'s direction and gain."""
+        w = theta["w_out"][0, :, 0]
+        w_hat = w * torch.rsqrt(w.square().sum() + self.cfg.readout_eps)
+        return self.projection @ w_hat * theta["g_out"][0, 0]
+
+    def dn_steer_weight(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        """`steer_weight` restricted to the descending neurons (zero for DNs outside the readout)."""
+        w = self.steer_weight(theta)[self.dn_in_readout.clamp(min=0)]
+        return torch.where(self.dn_in_readout >= 0, w, torch.zeros_like(w))
+
+    @property
+    def readout_rate_hz(self) -> torch.Tensor:
+        """Filtered output-population rate per (body, neuron), in spikes/second."""
+        return self.motor_state * (1000.0 / self.brain.cfg.dt_ms)
 
     @property
     def dn_rate_hz(self) -> torch.Tensor:
-        """Filtered descending-neuron rate per (body, neuron), in spikes/second."""
-        return self.motor_state * (1000.0 / self.brain.cfg.dt_ms)
+        """Filtered descending-neuron rate per (body, neuron), in spikes/second (zero for DNs outside the readout)."""
+        rates = self.readout_rate_hz
+        picked = rates[:, self.dn_in_readout.clamp(min=0)]
+        return torch.where((self.dn_in_readout >= 0).unsqueeze(0), picked, torch.zeros_like(picked))
 
     def sensory_rates(self, obs: torch.Tensor, theta: dict[str, torch.Tensor]) -> torch.Tensor:
         """Poisson rates (batch, n_rays + 1) in Hz for the ray groups and speed."""
@@ -392,8 +479,10 @@ class ConnectomeAgent:
             loom = ((proximity - prev) * cfg.loom_scale).clamp(min=0.0)
             drive = drive + loom * theta["loom_gain"]
             self.prev_proximity = proximity
-        vis_hz = drive.clamp(0.0, 1.0) * cfg.max_input_hz
-        speed_hz = (speed * theta["speed_gain"]).clamp(0.0, 1.0) * cfg.max_input_hz
+        # Soft saturation: a hard clamp made every ray read the same once the
+        # gains grew, erasing the left/right difference the steering needs.
+        vis_hz = (1.0 - torch.exp(-drive.clamp(min=0.0))) * cfg.max_input_hz
+        speed_hz = (1.0 - torch.exp(-(speed * theta["speed_gain"]).clamp(min=0.0))) * cfg.max_input_hz
         return torch.cat([vis_hz, speed_hz], dim=1)
 
     def act(
@@ -410,6 +499,7 @@ class ConnectomeAgent:
         cfg = self.cfg
         batch = obs.shape[0]
         rates_hz = self.sensory_rates(obs, theta)
+        self.last_rates_hz = rates_hz
 
         if "dn_gain" in theta:
             gain = torch.ones(batch, self.brain.n, device=self.device)
@@ -419,31 +509,37 @@ class ConnectomeAgent:
             self.brain.set_gain(None)
 
         # Bernoulli spike kicks (as in Shiu et al. 2024): per driven cell, the
-        # probability of a kick this substep from its channel's rate. Laid out
-        # (cells, bodies) to match the brain's native state layout.
+        # probability of a kick this substep from its channel's rate, laid out
+        # (cells, bodies) to match the brain's native state layout. The draws
+        # themselves happen inside the brain step.
         prob = (rates_hz[:, self.input_channel] * (self.brain.cfg.dt_ms / 1000.0)).clamp_(
             0.0, 1.0
-        ).t()
-        rows = 1 if cfg.shared_noise else batch
-        draws = torch.rand(
-            cfg.substeps, self.input_index.numel(), rows, device=self.device, generator=self.generator
-        )
+        ).t().contiguous()
+        base = (self.noise_seed * 1_000_003 + self.step_counter * cfg.substeps) & 0x7FFFFFFF
+        self.step_counter += 1
 
-        spikes = torch.zeros(batch, self.n_dn, device=self.device)
+        self.brain.dn_acc.zero_()
         for s in range(cfg.substeps):
-            kicks = (draws[s] < prob).to(prob.dtype).mul_(cfg.kick_mv)
-            self.brain.step(external_index=self.input_index, external_values=kicks, dense=False)
-            spikes = spikes + self.brain.spikes_of(self.dn_index32)
+            self.brain.step(
+                external_index=self.input_index,
+                poisson_prob=prob,
+                seed=(base + s) & 0x7FFFFFFF,
+                shared_noise=cfg.shared_noise,
+                dense=False,
+            )
             if spike_sink is not None:
                 spike_sink.add_(self.brain.dense_spikes())
 
-        rate = spikes / cfg.substeps
+        rate = self.brain.dn_acc / cfg.substeps
         self.motor_state = (1 - cfg.motor_tau) * self.motor_state + cfg.motor_tau * rate
-        signal = self.motor_state * cfg.readout_scale
+        signal = self.motor_state
         if cfg.common_mode:
             signal = signal - signal.mean(dim=1, keepdim=True)
         mixed = signal @ self.projection
-        motor = torch.einsum("bd,bdk->bk", mixed, theta["w_out"]) + theta["b_out"]
-        steer = torch.tanh(motor[:, 0])
-        pedal = torch.tanh(motor[:, 1])
-        return torch.stack([steer, pedal], dim=1)
+        if cfg.readout_norm == "layer":
+            floor = cfg.readout_floor_hz * self.brain.cfg.dt_ms / 1000.0  # spikes per substep
+            mixed = mixed * torch.rsqrt(mixed.square().sum(dim=1, keepdim=True) + cfg.readout_dim * floor * floor)
+        w_hat = theta["w_out"] * torch.rsqrt(theta["w_out"].square().sum(dim=1, keepdim=True) + cfg.readout_eps)
+        motor = theta["g_out"] * torch.einsum("bd,bdk->bk", mixed, w_hat) + theta["b_out"]
+        self.last_motor = motor
+        return torch.tanh(motor)
