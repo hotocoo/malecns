@@ -2,7 +2,7 @@
 # Continuous headless training supervisor: restarts the ES loop if it ever
 # dies, and resumes from the checkpoint so no generations are lost.
 #
-#   ./run_training.sh                      # Monaco, curriculum, popsize 64
+#   ./run_training.sh                      # Monaco, curriculum, popsize 128
 #   POPSIZE=32 ./run_training.sh --seed 3  # any train.py flag passes through
 #
 # Training never renders or paces: watch it from another process with
@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 CHECKPOINT=${CHECKPOINT:-checkpoints/es.pt}
 BEST=${BEST:-checkpoints/best.pt}
 LOG=${LOG:-logs/train.jsonl}
-POPSIZE=${POPSIZE:-64}
+POPSIZE=${POPSIZE:-128}
 
 while true; do
   python3 -W ignore src/train.py \

@@ -192,8 +192,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--popsize",
         type=int,
-        default=64,
-        help="per-body cost falls ~30%% from 24 to 64 bodies; the step is memory-bound",
+        default=128,
+        help="per-body cost of the Metal step falls to 128 bodies (26 us/body vs 32 at 64) and the ES gradient gets 2x the samples",
     )
     parser.add_argument(
         "--starts-per-gen",
@@ -242,6 +242,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-every", type=int, default=10, help="deterministic evaluation of the mean; 0 disables")
     parser.add_argument("--seed", type=int, default=0, help="perturbations and sensory noise are seeded from this")
     parser.add_argument("--no-exploit-monitor", action="store_true", help="skip the per-step exploit detector")
+    parser.add_argument(
+        "--reset-blocks",
+        default="",
+        help="comma-separated parameter blocks to restart from init on resume, e.g. w_out,b_out for a pinned readout",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--checkpoint", default="checkpoints/es.pt", type=Path)
     parser.add_argument("--best", default="checkpoints/best.pt", type=Path)
@@ -303,7 +308,8 @@ def main(argv: list[str] | None = None) -> int:
         state = torch.load(args.checkpoint, map_location=device)
         generation = int(state["generation"])
         try:
-            mu_cpu, momentum_cpu, notes = agent.migrate_state(state)
+            reset = tuple(b for b in args.reset_blocks.split(",") if b)
+            mu_cpu, momentum_cpu, notes = agent.migrate_state(state, reset=reset)
             mu = agent.clamp_params(mu_cpu.to(device).unsqueeze(0))[0]
             momentum = momentum_cpu.to(device)
             print(f"resumed at generation {generation}" + (f"; migrated: {', '.join(notes)}" if notes else ""))

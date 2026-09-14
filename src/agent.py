@@ -282,9 +282,64 @@ class ConnectomeAgent:
                 notes.append(f"{name} dropped")
         return torch.cat(blocks), notes
 
-    def migrate_state(self, state: dict) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-        """(mu, momentum, notes) from a checkpoint dict for this agent's layout."""
+    # Blocks whose meaning depends on the readout configuration: a w_out trained
+    # at another `readout_scale` / `readout_dim` / projection seed is a random
+    # matrix here, and one from before those were recorded pinned tanh hard.
+    READOUT_BLOCKS = ("w_out", "b_out")
+
+    def readout_matches(self, state: dict) -> bool:
+        saved = state.get("agent_cfg")
+        if not saved:
+            return False
+        return all(
+            saved.get(key) == getattr(self.cfg, key)
+            for key in ("readout_scale", "readout_dim", "projection_seed", "common_mode", "motor_tau")
+        )
+
+    def _offsets(self, state: dict, reset: tuple[str, ...]) -> list[tuple[int, int]]:
+        """(offset, size) of every block *not* in `reset`, in the saved vector's own layout."""
+        flat = state["mu"].reshape(-1)
         shapes = state.get("param_shapes")
+        if shapes is None:
+            shapes = self.LEGACY_SHAPES.get(flat.numel()) if flat.numel() != self.n_params else self.param_shapes
+        out = []
+        offset = 0
+        for name, shape in shapes.items():
+            size = int(np.prod(shape))
+            if name not in reset:
+                out.append((offset, size))
+            offset += size
+        return out
+
+    def migrate_state(self, state: dict, reset: tuple[str, ...] = ()) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+        """(mu, momentum, notes) from a checkpoint dict for this agent's layout.
+
+        `reset` names blocks to take from `initial_params` regardless of what
+        the checkpoint holds. Readout blocks are reset automatically when the
+        checkpoint's readout configuration differs from this agent's (or was
+        never recorded): those weights only mean something at the scale they
+        were evolved at.
+        """
+        shapes = state.get("param_shapes")
+        reset = tuple(reset)
+        if not self.readout_matches(state):
+            reset = reset + tuple(b for b in self.READOUT_BLOCKS if b not in reset)
+        if reset and shapes is None:
+            flat = state["mu"].reshape(-1)
+            shapes = self.LEGACY_SHAPES.get(flat.numel()) if flat.numel() != self.n_params else dict(self.param_shapes)
+            if shapes is None:
+                raise ValueError(f"checkpoint has {flat.numel()} params, agent {self.n_params}, and no layout to migrate from")
+        if reset:
+            shapes = {k: v for k, v in shapes.items() if k not in reset}
+            keep = torch.cat(
+                [state["mu"].reshape(-1).cpu()[o : o + n] for o, n in self._offsets(state, reset)]
+            ) if shapes else torch.zeros(0)
+            mu, notes = self.migrate_params(keep, shapes)
+            notes = [
+                next((f"{b} (reset)" for b in reset if n.startswith(b + " from init")), n) for n in notes
+            ]
+            momentum = torch.zeros_like(mu)
+            return mu, momentum, notes
         mu, notes = self.migrate_params(state["mu"], shapes)
         if "momentum" in state and state["momentum"].numel() == state["mu"].numel():
             momentum, _ = self.migrate_params(state["momentum"], shapes)

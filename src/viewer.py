@@ -565,6 +565,18 @@ class Simulation(Source):
         last_emit = wall
         sim_seconds = defaults.control_dt_s(self.dt_ms, self.substeps)
         while True:
+            # Nobody watching: do not take GPU time from the trainer. Keep
+            # following the checkpoint so the first frame after a tab opens is
+            # the current policy.
+            if not self.clients:
+                if self.load_checkpoint():
+                    top_dn = self.top_dn_index()
+                    obs = self.env.reset()
+                    self.agent.reset()
+                    step = 0
+                time.sleep(0.25)
+                wall += 0.25
+                continue
             fired_total = torch.zeros(1, self.brain.n, device=self.device)
             started = time.time()
             with torch.inference_mode():

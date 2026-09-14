@@ -11,6 +11,8 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from dataclasses import asdict  # noqa: E402
+
 from agent import AgentConfig, ConnectomeAgent  # noqa: E402
 from brain import Brain, LIFConfig, load_connectome  # noqa: E402
 
@@ -30,7 +32,8 @@ def agent():
 def test_legacy_141_param_checkpoint_keeps_trained_blocks(agent):
     assert agent.n_params == 142
     legacy = torch.arange(141, dtype=torch.float32) / 100.0
-    mu, momentum, notes = agent.migrate_state({"mu": legacy, "momentum": torch.ones(141)})
+    state = {"mu": legacy, "momentum": torch.ones(141), "agent_cfg": asdict(agent.cfg)}
+    mu, momentum, notes = agent.migrate_state(state)
     assert mu.numel() == 142 and momentum.numel() == 142
     assert notes == ["loom_gain from init"]
     theta = agent.unpack(mu.unsqueeze(0))
@@ -60,9 +63,43 @@ def test_named_layout_migration_reorders_and_drops(agent):
 @needs_graph
 def test_same_layout_roundtrips_exactly(agent):
     mu = agent.initial_params() + 0.01
-    state = {"mu": mu, "momentum": torch.zeros_like(mu), "param_shapes": {k: list(v) for k, v in agent.param_shapes.items()}}
+    state = {
+        "mu": mu,
+        "momentum": torch.zeros_like(mu),
+        "param_shapes": {k: list(v) for k, v in agent.param_shapes.items()},
+        "agent_cfg": asdict(agent.cfg),
+    }
     out, _, notes = agent.migrate_state(state)
     assert torch.equal(out, mu) and notes == []
+
+
+@needs_graph
+def test_readout_from_another_scale_is_reset(agent):
+    """A readout evolved at another readout_scale pins tanh here; only the sensory gains carry over."""
+    legacy = torch.full((141,), 2.0)
+    for state in (
+        {"mu": legacy, "momentum": torch.ones(141)},  # nothing recorded: pre-audit trainer
+        {"mu": legacy, "momentum": torch.ones(141), "agent_cfg": {**asdict(agent.cfg), "readout_scale": 50.0}},
+    ):
+        mu, momentum, notes = agent.migrate_state(state)
+        theta = agent.unpack(mu.unsqueeze(0))
+        assert torch.equal(theta["ray_gain"][0], torch.full((9,), 2.0))
+        # w_out is drawn fresh (small random), b_out is the fixed init: neither is the saved 2.0
+        assert float(theta["w_out"][0].abs().mean()) < 0.3 and not (theta["w_out"][0] == 2.0).any()
+        assert torch.equal(theta["b_out"][0], torch.tensor([0.0, 0.5]))
+        assert any("w_out" in n and "reset" in n for n in notes)
+        assert float(momentum.abs().sum()) == 0.0
+
+
+@needs_graph
+def test_explicit_reset_blocks(agent):
+    mu0 = agent.initial_params() + 1.0
+    state = {"mu": mu0, "momentum": torch.ones_like(mu0), "param_shapes": {k: list(v) for k, v in agent.param_shapes.items()}, "agent_cfg": asdict(agent.cfg)}
+    mu, _, notes = agent.migrate_state(state, reset=("ray_gain",))
+    theta = agent.unpack(mu.unsqueeze(0))
+    assert torch.equal(theta["ray_gain"][0], torch.full((9,), 0.5))  # init
+    assert torch.equal(theta["bias_hz"][0], agent.unpack(mu0.unsqueeze(0))["bias_hz"][0])
+    assert notes == ["ray_gain (reset)"]
 
 
 @needs_graph
