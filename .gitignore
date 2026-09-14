@@ -1,0 +1,11 @@
+# connectome downloads and derived graphs are fetched/built locally (1+ GB)
+data/*
+!data/tracks/
+!data/tracks/*.geojson
+checkpoints/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.DS_Store

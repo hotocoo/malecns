@@ -1,0 +1,261 @@
+:root {
+  --bg: #07090c;
+  --surface: #11161c;
+  --surface-2: #1a2129;
+  --line: #232c36;
+  --text: #e9eef4;
+  --muted: #8494a4;
+  --accent: #3ddc97;
+  --warn: #e8894a;
+  --radius: 10px;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 var(--mono);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --------------------------------------------------------------- live stage */
+
+.stage {
+  margin: 18px auto 0;
+  max-width: 1640px;
+  padding: 0 18px;
+}
+
+.stage-bar,
+.stage-strip {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.stage-bar {
+  justify-content: space-between;
+  padding: 9px 14px;
+  border-radius: var(--radius) var(--radius) 0 0;
+  border-bottom: none;
+  font-size: 12px;
+}
+
+.tag em { color: var(--line); font-style: normal; }
+.tag.right { color: var(--accent); }
+
+.stage-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.62fr) minmax(300px, 1fr);
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+}
+
+.side { display: grid; grid-template-rows: 1.25fr 1fr; gap: 1px; background: var(--line); }
+
+.view {
+  position: relative;
+  margin: 0;
+  background: #05070a;
+  overflow: hidden;
+}
+
+.view canvas { display: block; width: 100%; height: 100%; }
+
+.drive-view { min-height: 100%; }
+.drive-view #drive-canvas { position: absolute; inset: 0; }
+.side { height: clamp(520px, 66vh, 760px); }
+
+.minimap {
+  position: absolute !important;
+  right: 14px;
+  bottom: 14px;
+  width: 26% !important;
+  height: auto !important;
+  aspect-ratio: 1;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(5, 7, 10, 0.82);
+}
+
+.spike-view canvas { height: calc(100% - 60px); margin-top: 30px; }
+.brain-view canvas { cursor: grab; touch-action: none; }
+.brain-view canvas:active { cursor: grabbing; }
+
+.view-label {
+  position: absolute;
+  top: 10px;
+  left: 12px;
+  z-index: 2;
+  color: var(--muted);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.view-label small { color: #55636f; }
+
+.overlay { position: absolute; inset: 0; pointer-events: none; }
+
+.pill {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  padding: 5px 12px;
+  background: rgba(232, 137, 74, 0.15);
+  border: 1px solid rgba(232, 137, 74, 0.45);
+  border-radius: 4px;
+  color: var(--warn);
+  letter-spacing: 0.12em;
+  font-size: 11px;
+}
+
+.pill.braking { background: rgba(224, 92, 110, 0.16); border-color: rgba(224, 92, 110, 0.5); color: #e05c6e; }
+
+.pill.crashed { background: rgba(224, 92, 110, 0.16); border-color: rgba(224, 92, 110, 0.5); color: #e05c6e; }
+
+.speed {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+.foot { position: absolute; left: 16px; bottom: 14px; color: var(--muted); font-size: 11px; }
+
+.hint {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  margin: 0;
+  color: #55636f;
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.stage-strip {
+  padding: 10px 14px;
+  border-radius: 0 0 var(--radius) var(--radius);
+  border-top: none;
+  flex-wrap: wrap;
+}
+
+.strip-readout { display: flex; gap: 22px; margin: 0 0 0 auto; }
+.strip-readout div { display: flex; align-items: baseline; gap: 7px; }
+.strip-readout dt { color: var(--muted); font-size: 11px; }
+.strip-readout dd { margin: 0; color: var(--text); font-variant-numeric: tabular-nums; }
+.strip-readout dd.bad { color: var(--warn); }
+.strip-readout dd.good { color: var(--accent); }
+
+.gauge { display: flex; align-items: center; gap: 9px; min-width: 240px; flex: 1; max-width: 340px; }
+.gauge-label { color: var(--muted); font-size: 11px; width: 52px; }
+
+.bar {
+  position: relative;
+  flex: 1;
+  height: 7px;
+  background: var(--surface-2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: var(--accent);
+  transition: width 70ms linear, left 70ms linear;
+}
+
+.bar.bipolar i { left: 50%; background: var(--warn); }
+.gauge output { width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 0;
+  padding: 8px 12px 0;
+  list-style: none;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.legend li { display: flex; align-items: center; gap: 6px; }
+.legend i { width: 8px; height: 8px; border-radius: 2px; }
+
+/* ------------------------------------------------------------- lower panels */
+
+main {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  gap: 14px;
+  max-width: 1640px;
+  margin: 14px auto 0;
+  padding: 0 18px;
+  align-items: start;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+
+.panel h2 {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.panel h2 small { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.curve { grid-column: 1 / -1; }
+.curve canvas { display: block; width: 100%; height: auto; background: #05070a; border-radius: 6px; }
+
+.rate-list, .dn-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 7px; }
+
+.rate-list li, .dn-list li {
+  display: grid;
+  grid-template-columns: 1fr 4fr auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.rate-list span:first-child, .dn-list span:first-child {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rate-list output, .dn-list output { font-variant-numeric: tabular-nums; min-width: 52px; text-align: right; }
+
+footer {
+  max-width: 1640px;
+  margin: 16px auto 0;
+  padding: 14px 18px 30px;
+  color: #55636f;
+  font-size: 11px;
+}
+
+@media (max-width: 1040px) {
+  .stage-grid { grid-template-columns: 1fr; }
+  .side { grid-template-rows: 380px 260px; }
+  .track-view { aspect-ratio: 1.1; }
+  main { grid-template-columns: 1fr; }
+}
