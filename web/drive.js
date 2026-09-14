@@ -19,13 +19,19 @@ import * as THREE from "three";
 import { GLTFLoader } from "/vendor/three/loaders/GLTFLoader.js";
 import { DRACOLoader } from "/vendor/three/loaders/DRACOLoader.js";
 import { RGBELoader } from "/vendor/three/loaders/RGBELoader.js";
-import { buildBarriers, buildBuildings, buildPiers, buildTunnel } from "/scenery.js";
+import { buildBarriers, buildBuildings, buildPiers, buildTunnel, buildWater } from "/scenery.js";
 
 const ROAD_TEXTURE_METRES = 6; // one asphalt tile covers this many metres
 const KERB_WIDTH = 1.2;
 const LINE_WIDTH = 0.25;
 const CAR_LENGTH_M = 4.5; // Ferrari 458 model's native size; scaled to the W11's 5.7 m
 const W11_LENGTH_M = 5.7;
+/* Drop a Mercedes-AMG F1 W11 glTF at web/assets/w11.glb and it replaces the
+ * stand-in body: the model is scaled to W11_LENGTH_M along its longest
+ * horizontal axis, rested on the ground and pointed down sim +x. `forward`
+ * is the model's own nose direction ("-z" is the glTF convention). Nodes
+ * named like wheels/tyres spin with the simulated speed. */
+const W11_MODEL = { url: "/assets/w11.glb", forward: "-z" };
 
 /* Sim frame -> world frame: sim x is world x, sim y is world -z, up is +y. */
 const toWorld = (x, y, h = 0) => new THREE.Vector3(x, h, -y);
@@ -226,12 +232,15 @@ export class DriveView {
       roughness: 1.0,
       color: urban ? 0x7d7f82 : 0x8b9a6a,
     });
-    const extent = track.extent * 3.2;
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(extent, extent), groundMaterial);
-    ground.rotation.x = -Math.PI / 2;
-    ground.position.y = -0.03;
-    ground.receiveShadow = true;
-    this.scene.add(ground);
+    this.groundMaterial = groundMaterial;
+    if (!track.has_water) {
+      const extent = track.extent * 3.2;
+      const ground = new THREE.Mesh(new THREE.PlaneGeometry(extent, extent), groundMaterial);
+      ground.rotation.x = -Math.PI / 2;
+      ground.position.y = -0.03;
+      ground.receiveShadow = true;
+      this.scene.add(ground);
+    }
 
     if (track.has_scenery) this._loadScenery(frames, track);
 
@@ -246,9 +255,13 @@ export class DriveView {
       this.scene.add(buildBuildings(scenery.buildings));
       this.scene.add(buildTunnel(frames, scenery.tunnel_spans, track.halfwidth));
       this.scene.add(buildPiers(scenery.lines || []));
+      const water = buildWater(scenery.water, this.groundMaterial);
+      this.scene.add(water.group);
+      this.waterMaterial = water.material;
       // the tunnel needs a longer shadow reach and a slightly darker fog inside
       console.info(
-        `scenery: ${scenery.buildings.length} buildings, tunnel spans ${JSON.stringify(scenery.tunnel_spans)} in ${Math.round(performance.now() - t0)} ms`,
+        `scenery: ${scenery.buildings.length} buildings, tunnel spans ${JSON.stringify(scenery.tunnel_spans)}, ` +
+          `${scenery.water ? scenery.water.water.length : 0} water rects in ${Math.round(performance.now() - t0)} ms`,
       );
       this.tunnelSpans = scenery.tunnel_spans;
     } catch (err) {
@@ -262,6 +275,50 @@ export class DriveView {
     this.car = new THREE.Group();
     this.scene.add(this.car);
 
+    fetch(W11_MODEL.url, { method: "HEAD" })
+      .then((res) => {
+        if (!res.ok) throw new Error(`${W11_MODEL.url} ${res.status}`);
+        return new Promise((resolve, reject) => loader.load(W11_MODEL.url, resolve, undefined, reject));
+      })
+      .then((gltf) => this._mountW11(gltf))
+      .catch((err) => {
+        console.info(`no W11 model (${err.message}); using the Ferrari 458 stand-in scaled to W11 length`);
+        this._loadFerrari(loader);
+      });
+  }
+
+  /** Fit any car glTF to the W11 footprint: longest horizontal axis = length, wheels on the ground, nose down sim +x. */
+  _mountW11(gltf) {
+    const model = gltf.scene;
+    model.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+    const forwardAxis = W11_MODEL.forward.replace("-", "");
+    const length = forwardAxis === "x" ? size.x : size.z;
+    const carLength = this.track && this.track.car ? this.track.car.length : W11_LENGTH_M;
+    const k = carLength / Math.max(length, 1e-3);
+    model.scale.setScalar(k);
+    model.position.set(-box.getCenter(new THREE.Vector3()).x * k, -box.min.y * k, -box.getCenter(new THREE.Vector3()).z * k);
+    model.traverse((node) => {
+      if (node.isMesh) {
+        node.castShadow = true;
+        node.receiveShadow = true;
+      }
+    });
+    this.wheels = [];
+    model.traverse((node) => {
+      if (/wheel|tyre|tire/i.test(node.name) && !/brake|disc|rim_?cap/i.test(node.name)) this.wheels.push(node);
+    });
+    const rig = new THREE.Group();
+    rig.add(model);
+    // rotate the model's nose onto sim +x (world +x)
+    const yaw = { "-z": -Math.PI / 2, z: Math.PI / 2, x: 0, "-x": Math.PI }[W11_MODEL.forward] ?? -Math.PI / 2;
+    rig.rotation.y = yaw;
+    this.car.add(rig);
+    console.info(`W11 model mounted: ${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)} native, scale ${k.toFixed(3)}, ${this.wheels.length} wheel nodes`);
+  }
+
+  _loadFerrari(loader) {
     loader.load("/assets/ferrari.glb", (gltf) => {
       const model = gltf.scene.children[0];
       const body = new THREE.MeshPhysicalMaterial({
@@ -401,6 +458,12 @@ export class DriveView {
     this.camera.position.lerp(goal, ease);
     this.lookGoal.lerp(look, ease);
     this.camera.lookAt(this.lookGoal);
+
+    if (this.waterMaterial) {
+      // slow drift of the ripple normal map: the harbour is sheltered water
+      this.waterMaterial.normalMap.offset.x += dt * 0.012;
+      this.waterMaterial.normalMap.offset.y += dt * 0.007;
+    }
 
     // keep the shadow frustum centred on the car
     this.sun.position.set(carPos.x + 60, 90, carPos.z + 30);

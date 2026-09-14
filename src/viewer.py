@@ -155,6 +155,9 @@ def load_scenery(path: Path, proj: GeoProjection, centerline: np.ndarray, halfwi
         elif geom["type"] == "LineString":
             lines.append({"kind": kind, "points": proj.project(np.asarray(geom["coordinates"])[:, :2]).round(2).tolist()})
     spans = tunnel_spans(centerline, tunnels, reach_m=14.0, stride=stride)
+    coast = [np.asarray(l["points"], dtype=np.float64) for l in lines if l["kind"] == "coastline"]
+    ground_half = float(np.abs(centerline).max() + halfwidth + 2.0) * 1.02 * 1.6
+    water = water_and_land(coast, centerline, halfwidth, ground_half)
     # Buildings whose footprint touches the open (non-tunnel) road are survey
     # mismatches: skip them. Buildings above the tunnel are real and stay.
     in_tunnel = np.zeros(len(centerline), dtype=bool)
@@ -174,6 +177,132 @@ def load_scenery(path: Path, proj: GeoProjection, centerline: np.ndarray, halfwi
         "tunnel_spans": spans,
         "tunnels": [t.round(2).tolist() for t in tunnels],
         "lines": lines,
+        "water": water,
+    }
+
+
+def coast_segments(lines: list[np.ndarray]) -> np.ndarray:
+    """(m, 2, 2) segments from coastline polylines (OSM: land on the left, water on the right)."""
+    segs = [np.stack([pts[:-1], pts[1:]], axis=1) for pts in lines if len(pts) >= 2]
+    return np.concatenate(segs) if segs else np.zeros((0, 2, 2))
+
+
+def water_side(points: np.ndarray, segments: np.ndarray, chunk: int = 4096) -> np.ndarray:
+    """True where each point lies on the water side of the nearest coastline segment.
+
+    Ties at shared vertices go to the segment the point is most clearly beside
+    (largest |cross|), the usual angle-weighted rule for signed distance to a
+    polyline.
+    """
+    if len(segments) == 0 or len(points) == 0:
+        return np.zeros(len(points), dtype=bool)
+    a = segments[:, 0]
+    d = segments[:, 1] - segments[:, 0]
+    dd = np.maximum((d * d).sum(1), 1e-12)
+    out = np.zeros(len(points), dtype=bool)
+    for start in range(0, len(points), chunk):
+        p = points[start : start + chunk]
+        rel = p[:, None, :] - a[None, :, :]
+        t = np.clip((rel * d[None]).sum(-1) / dd[None], 0.0, 1.0)
+        foot = a[None] + t[..., None] * d[None]
+        dist = np.hypot(*(p[:, None, :] - foot).transpose(2, 0, 1))
+        cross = d[None, :, 0] * rel[..., 1] - d[None, :, 1] * rel[..., 0]
+        tie = dist <= dist.min(1, keepdims=True) + 1e-6
+        pick = np.where(tie, np.abs(cross), -1.0).argmax(1)
+        out[start : start + chunk] = cross[np.arange(len(p)), pick] < 0.0
+    return out
+
+
+def merge_rects(mask: np.ndarray, x0: float, y0: float, cell: float) -> list[list[float]]:
+    """Greedy rectangles [x0, y0, x1, y1] covering the True cells of a (rows, cols) mask."""
+    rows, cols = mask.shape
+    runs: list[list[list[float]]] = []
+    for r in range(rows):
+        row = mask[r]
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], row.astype(np.int8), [0]])))
+        runs.append([[float(edges[k]), float(edges[k + 1])] for k in range(0, len(edges), 2)])
+    rects: list[list[float]] = []
+    open_: dict[tuple[float, float], int] = {}  # (c0, c1) -> start row
+    for r in range(rows + 1):
+        current = {tuple(run): True for run in runs[r]} if r < rows else {}
+        for key, start in list(open_.items()):
+            if key not in current:
+                rects.append([x0 + key[0] * cell, y0 + start * cell, x0 + key[1] * cell, y0 + r * cell])
+                del open_[key]
+        for key in current:
+            if key not in open_:
+                open_[key] = r
+    return [[round(v, 1) for v in rect] for rect in rects]
+
+
+def water_and_land(
+    coast: list[np.ndarray],
+    centerline: np.ndarray,
+    halfwidth: float,
+    ground_half: float,
+    fine_m: float = 4.0,
+    coarse_m: float = 40.0,
+    pad_m: float = 120.0,
+) -> dict:
+    """Sea and harbour water as rectangles, plus the land that is left.
+
+    A fine grid covers the coastline's bounding box (padded); a coarse grid
+    covers the rest of the ground square. Cells under or beside the road are
+    always land, so survey offsets in the coastline can never flood the track.
+    """
+    segments = coast_segments(coast)
+    if len(segments) == 0:
+        return {"water": [], "land": [], "quays": [], "level": 0.0}
+    verts = segments.reshape(-1, 2)
+    lo = np.maximum(verts.min(0) - pad_m, -ground_half)
+    hi = np.minimum(verts.max(0) + pad_m, ground_half)
+    lo = np.floor(lo / fine_m) * fine_m
+    hi = np.ceil(hi / fine_m) * fine_m
+    road_keep = halfwidth + 2.0
+
+    def classify(x0: float, y0: float, cols: int, rows: int, cell: float, skip_box: tuple | None) -> np.ndarray:
+        cx = x0 + (np.arange(cols) + 0.5) * cell
+        cy = y0 + (np.arange(rows) + 0.5) * cell
+        gx, gy = np.meshgrid(cx, cy)
+        pts = np.stack([gx.ravel(), gy.ravel()], 1)
+        wet = water_side(pts, segments)
+        # any cell touching the road corridor is land
+        reach = road_keep + cell * 0.71
+        near_road = np.zeros(len(pts), dtype=bool)
+        for start in range(0, len(pts), 4096):
+            block = pts[start : start + 4096]
+            dmin = np.sqrt(((block[:, None, :] - centerline[None, ::2, :]) ** 2).sum(-1)).min(1)
+            near_road[start : start + 4096] = dmin < reach
+        wet &= ~near_road
+        if skip_box is not None:
+            bx0, by0, bx1, by1 = skip_box
+            inside = (pts[:, 0] > bx0) & (pts[:, 0] < bx1) & (pts[:, 1] > by0) & (pts[:, 1] < by1)
+            return wet.reshape(rows, cols), inside.reshape(rows, cols)
+        return wet.reshape(rows, cols), np.zeros((rows, cols), dtype=bool)
+
+    fcols = int(round((hi[0] - lo[0]) / fine_m))
+    frows = int(round((hi[1] - lo[1]) / fine_m))
+    fine_wet, _ = classify(lo[0], lo[1], fcols, frows, fine_m, None)
+    g0 = -ground_half
+    ccols = crows = int(np.ceil(2 * ground_half / coarse_m))
+    coarse_wet, coarse_inside = classify(g0, g0, ccols, crows, coarse_m, (lo[0], lo[1], hi[0], hi[1]))
+    # coarse cells overlapping the fine box are handled by the fine grid
+    cx = g0 + (np.arange(ccols) + 0.5) * coarse_m
+    cy = g0 + (np.arange(crows) + 0.5) * coarse_m
+    gx, gy = np.meshgrid(cx, cy)
+    overlap = (gx + coarse_m / 2 > lo[0]) & (gx - coarse_m / 2 < hi[0]) & (gy + coarse_m / 2 > lo[1]) & (gy - coarse_m / 2 < hi[1])
+    coarse_wet = coarse_wet & ~overlap
+    coarse_land = ~coarse_wet & ~overlap
+    water = merge_rects(fine_wet, lo[0], lo[1], fine_m) + merge_rects(coarse_wet, g0, g0, coarse_m)
+    land = merge_rects(~fine_wet, lo[0], lo[1], fine_m) + merge_rects(coarse_land, g0, g0, coarse_m)
+    return {
+        "water": water,
+        "land": land,
+        "quays": [pts.round(2).tolist() for pts in coast if len(pts) >= 2],
+        "level": -1.2,
+        "fine_m": fine_m,
+        "coarse_m": coarse_m,
+        "cells_wet": int(fine_wet.sum() + coarse_wet.sum()),
     }
 
 
@@ -239,7 +368,8 @@ class Source:
             )
             print(
                 f"[viewer] scenery {len(self.scenery['buildings'])} buildings "
-                f"({self.scenery['dropped_on_road']} on open road dropped), tunnel spans {self.scenery['tunnel_spans']}"
+                f"({self.scenery['dropped_on_road']} on open road dropped), tunnel spans {self.scenery['tunnel_spans']}, "
+                f"water {len(self.scenery['water']['water'])} rects from {len(self.scenery['water']['quays'])} coastline ways"
             )
         else:
             self.scenery = None
@@ -260,11 +390,12 @@ class Source:
             "max_speed": cfg.max_speed,
             "car": {"length": 5.7, "width": 2 * cfg.car_halfwidth, "wheelbase": cfg.wheelbase, "name": "Mercedes-AMG F1 W11 (dynamics)"},
             "has_scenery": self.scenery is not None,
+            "has_water": bool(self.scenery and self.scenery["water"]["water"]),
             "tunnel_spans": self.scenery["tunnel_spans"] if self.scenery else [],
         }
 
     def scenery_payload(self) -> dict:
-        return self.scenery or {"buildings": [], "tunnel_spans": [], "tunnels": [], "lines": []}
+        return self.scenery or {"buildings": [], "tunnel_spans": [], "tunnels": [], "lines": [], "water": {"water": [], "land": [], "quays": [], "level": 0.0}}
 
     # --- streaming ---------------------------------------------------------------------
     def subscribe(self) -> queue.Queue:
@@ -347,6 +478,7 @@ class Simulation(Source):
         self.mu = self.agent.initial_params().to(self.device)
         self.theta = self.agent.unpack(self.mu.unsqueeze(0))
         self.generation = 0
+        self.stage = -1
         self.checkpoint_mtime = 0.0
         self.checkpoint_note = "untrained interface"
         self.load_checkpoint()
@@ -372,16 +504,19 @@ class Simulation(Source):
         except (RuntimeError, EOFError):
             return False  # mid-write from the trainer; try again next episode
         self.checkpoint_mtime = mtime
-        if state["mu"].numel() != self.agent.n_params:
-            self.checkpoint_note = (
-                f"checkpoint has {state['mu'].numel()} params, agent {self.agent.n_params}: ignored"
-            )
+        try:
+            mu, _, notes = self.agent.migrate_state(state)
+        except ValueError as exc:
+            self.checkpoint_note = f"{exc}: ignored"
             print(f"[viewer] {self.checkpoint_note}")
             return False
-        self.mu = state["mu"].to(self.device)
+        self.mu = mu.to(self.device)
         self.theta = self.agent.unpack(self.mu.unsqueeze(0))
         self.generation = int(state["generation"])
-        self.checkpoint_note = f"{path.name} generation {self.generation}"
+        self.stage = int(state.get("stage", -1))
+        self.checkpoint_note = f"{path.name} generation {self.generation}" + (f" ({', '.join(notes)})" if notes else "")
+        if notes:
+            print(f"[viewer] {self.checkpoint_note}")
         if self.args.follow_curriculum and "car_cfg" in state:
             hw = float(state["car_cfg"].get("track_halfwidth"))
             if abs(hw - self.car_cfg.track_halfwidth) > 1e-6:
@@ -405,6 +540,8 @@ class Simulation(Source):
         return {
             **self.meta_common(),
             "mode": "live",
+            "stage": self.stage,
+            "road_halfwidth": self.car_cfg.track_halfwidth,
             "params": self.agent.n_params,
             "dt_ms": self.dt_ms,
             "substeps": self.substeps,
@@ -442,6 +579,8 @@ class Simulation(Source):
                 "step": step,
                 "episode": episode,
                 "generation": self.generation,
+                "stage": self.stage,
+                "checkpoint": self.checkpoint_note,
                 "max_speed": self.car_cfg.max_speed,
                 **body,
                 **neural,
@@ -602,6 +741,8 @@ def curve_payload(log: Path, points: int) -> dict:
         "laps": [round(r["laps_best"], 4) for r in sampled],
         "stage": [int(r.get("stage", 0)) for r in sampled],
         "eval": [round(r["eval_fitness"], 2) for r in records if "eval_fitness" in r][-points:],
+        "eval_gen": [int(r["generation"]) for r in records if "eval_fitness" in r][-points:],
+        "eval_laps": [round(r.get("eval_laps", 0.0), 4) for r in records if "eval_fitness" in r][-points:],
         "stride": stride,
     }
 
@@ -662,6 +803,15 @@ def make_handler(sim: Source, args: argparse.Namespace):
             finally:
                 sim.unsubscribe(client)
 
+        def do_HEAD(self) -> None:  # noqa: N802
+            """Existence probe for optional assets (the drive view asks for w11.glb this way)."""
+            route = self.path.split("?")[0]
+            path = (WEB_DIR / route.lstrip("/")).resolve()
+            ok = route.startswith(("/vendor/", "/assets/")) and path.is_file() and WEB_DIR.resolve() in path.parents
+            self.send_response(200 if ok else 404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self) -> None:  # noqa: N802
             route = self.path.split("?")[0]
             if route in ("/", "/index.html"):
@@ -721,7 +871,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--substeps", type=int, default=defaults.SUBSTEPS)
     parser.add_argument("--weight-scale", type=float, default=defaults.WEIGHT_SCALE)
     parser.add_argument("--adapt-mv", type=float, default=defaults.ADAPT_MV)
-    parser.add_argument("--follow-curriculum", action="store_true", help="use the road width of the checkpoint's curriculum stage")
+    parser.add_argument(
+        "--follow-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="drive on the road width of the checkpoint's curriculum stage (default); --no-follow-curriculum for the real 11 m road",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)

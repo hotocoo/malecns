@@ -181,3 +181,36 @@ like passing through a wall.
   `drive.js` at it for the matching body.
 - Water in the harbour: the OSM coastline is fetched but not yet turned into a
   sea polygon; quays and breakwaters are rendered.
+
+
+### Metal kernel (2026-09-14)
+
+`brain.py` on MPS now runs `metal_lif.py`: one fused kernel per step with
+bit-packed spikes (see README "Speed"). Zero spike mismatches against the torch
+reference over 60 steps at batch 40 (`tests/test_metal.py`); |du| <= 6e-5 mV.
+Batch 64, M4 Max, measured with another trainer sharing the GPU: brain step
+7.61 -> 1.99 ms, `agent.act` (8 substeps) 69.5 -> 18.3 ms; batch 1 (viewer)
+0.63 ms per brain step. Long-row threshold 64 chosen by sweep (16: 1.86 ms,
+32: 1.93, 64: 1.36, 128: 1.41, 256: 1.86).
+
+### Checkpoint migration
+
+`ConnectomeAgent.migrate_state` maps a saved `mu`/`momentum` onto the current
+`param_shapes` by block name; checkpoints without `param_shapes` use the known
+141-parameter legacy layout (no `loom_gain`). Trainer, evaluator and viewer all
+load through it, so a layout change keeps every trained block.
+
+### Viewer wiring fixes
+
+* Steer gauge drew positive (left) steer to the right; now grows leftwards with
+  an L/R readout. Minimap, 3D car yaw and lidar were already consistent with
+  `car_env` (steer > 0 = counter-clockwise).
+* Viewer defaults to `--follow-curriculum`: it drove on the 11 m road while the
+  trainer was on the x1.6 stage, so the same policy crashed far more on screen.
+* Checkpoint note and DN ranking refresh when the generation changes; episode
+  end reason (CRASH / REVERSE / STUCK) is shown through the reset; curriculum
+  stage boundaries and deterministic evaluations are drawn on the curve.
+* Harbour water: OSM coastline (water on its right-hand side) rasterised to
+  water/land rectangles (`water_and_land`), quay walls along the coastline,
+  cells within road half-width + 2 m forced to land (nearest water 8 m from
+  the Monaco centerline).

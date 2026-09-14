@@ -416,4 +416,137 @@ export function buildPiers(lines) {
   return group;
 }
 
+/* ------------------------------------------------------------- sea/harbour */
+
+/** Animated ripple normal map drawn once; the material scrolls it. */
+function waterNormalTexture() {
+  const size = 256;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(size, size);
+  const waves = [];
+  for (let k = 0; k < 14; k += 1) {
+    const angle = hash(k * 13 + 1) * Math.PI * 2;
+    const freq = 2 + Math.floor(hash(k * 7 + 3) * 6);
+    waves.push([Math.cos(angle) * freq, Math.sin(angle) * freq, hash(k * 5 + 9) * Math.PI * 2, 0.5 + hash(k * 3 + 2)]);
+  }
+  const heightAt = (x, y) => {
+    let h = 0;
+    for (const [fx, fy, phase, amp] of waves) h += Math.sin(((x * fx + y * fy) / size) * Math.PI * 2 + phase) * amp;
+    return h;
+  };
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const dx = heightAt(x + 1, y) - heightAt(x - 1, y);
+      const dy = heightAt(x, y + 1) - heightAt(x, y - 1);
+      const len = Math.hypot(dx * 0.06, dy * 0.06, 1);
+      const o = (y * size + x) * 4;
+      img.data[o] = 128 + (-dx * 0.06 / len) * 127;
+      img.data[o + 1] = 128 + (-dy * 0.06 / len) * 127;
+      img.data[o + 2] = 128 + (1 / len) * 127;
+      img.data[o + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+/** Axis-aligned rectangles [x0, y0, x1, y1] (sim frame) as one flat mesh at `height`, UV in metres / tile. */
+function rectsGeometry(rects, height, tileMetres) {
+  const positions = new Float32Array(rects.length * 12);
+  const uvs = new Float32Array(rects.length * 8);
+  const indices = new Uint32Array(rects.length * 6);
+  rects.forEach(([x0, y0, x1, y1], i) => {
+    const corners = [
+      [x0, y0],
+      [x1, y0],
+      [x1, y1],
+      [x0, y1],
+    ];
+    corners.forEach(([x, y], k) => {
+      positions.set([x, height, -y], i * 12 + k * 3);
+      uvs.set([x / tileMetres, y / tileMetres], i * 8 + k * 2);
+    });
+    const b = i * 4;
+    // sim y up maps to world -z: wind the quad so its normal faces +y
+    indices.set([b, b + 2, b + 1, b, b + 3, b + 2], i * 6);
+  });
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+  geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+/**
+ * Port Hercule and the sea: water rectangles from the OSM coastline (water on
+ * its right-hand side), quay walls dropping from street level to the water,
+ * and the land that remains as the textured ground. Returns { group, water }
+ * where `water` is the material to animate.
+ */
+export function buildWater(water, groundMaterial) {
+  const group = new THREE.Group();
+  if (!water || !water.water || !water.water.length) return { group, material: null };
+  const normal = waterNormalTexture();
+  normal.repeat.set(1, 1);
+  const material = new THREE.MeshPhysicalMaterial({
+    color: 0x0f3f5a,
+    roughness: 0.06,
+    metalness: 0.0,
+    normalMap: normal,
+    normalScale: new THREE.Vector2(0.45, 0.45),
+    transparent: true,
+    opacity: 0.96,
+    envMapIntensity: 1.2,
+    clearcoat: 0.6,
+    clearcoatRoughness: 0.1,
+  });
+  const sea = new THREE.Mesh(rectsGeometry(water.water, water.level, 18), material);
+  sea.receiveShadow = true;
+  group.add(sea);
+
+  if (water.land && water.land.length) {
+    const land = new THREE.Mesh(rectsGeometry(water.land, -0.03, 6), groundMaterial);
+    land.receiveShadow = true;
+    group.add(land);
+  }
+
+  // quay walls: vertical band along every coastline way, street level down to below the water
+  const concrete = new THREE.MeshStandardMaterial({ map: concreteTexture(), roughness: 0.95, side: THREE.DoubleSide });
+  const walls = [];
+  (water.quays || []).forEach((pts) => {
+    if (pts.length < 2) return;
+    const positions = [];
+    const uvs = [];
+    const indices = [];
+    let s = 0;
+    pts.forEach(([x, y], i) => {
+      if (i > 0) s += Math.hypot(x - pts[i - 1][0], y - pts[i - 1][1]);
+      positions.push(x, water.level - 0.8, -y, x, 0.05, -y);
+      uvs.push(s / 4, 0, s / 4, 1);
+      if (i < pts.length - 1) {
+        const b = i * 2;
+        indices.push(b, b + 2, b + 1, b + 1, b + 2, b + 3);
+      }
+    });
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+    walls.push(geometry);
+  });
+  if (walls.length) {
+    const mesh = new THREE.Mesh(mergeGeometries(walls, false), concrete);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    group.add(mesh);
+  }
+  return { group, material };
+}
+
 export { toWorld };

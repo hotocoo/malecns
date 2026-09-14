@@ -107,3 +107,48 @@ def test_infer_missing_falls_back_to_centroid_for_isolated_cells():
     known = np.array([True, True, False])
     out = infer_missing(pos, known, np.array([0]), np.array([1]), rounds=2)
     assert np.allclose(out[2], [1.0, 1, 1])
+
+
+# --- harbour water -----------------------------------------------------------------
+
+def test_water_side_uses_right_hand_side_of_coastline():
+    from viewer import coast_segments, water_side
+
+    # a coastline running east along y = 0: land (left) is y > 0, water (right) y < 0
+    segments = coast_segments([np.array([[-100.0, 0.0], [0.0, 0.0], [100.0, 0.0]])])
+    pts = np.array([[0.0, 10.0], [0.0, -10.0], [50.0, 3.0], [50.0, -3.0], [500.0, -1.0], [-500.0, 1.0]])
+    assert water_side(pts, segments).tolist() == [False, True, False, True, True, False]
+
+
+def test_water_side_is_consistent_around_a_corner():
+    from viewer import coast_segments, water_side
+
+    # a quay corner: east then north. Land stays on the left of travel, so the
+    # inner (north-west) side is land and the outer wedge (south-east) is water.
+    segments = coast_segments([np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]])])
+    assert water_side(np.array([[12.0, -2.0]]), segments).tolist() == [True]
+    assert water_side(np.array([[8.0, 2.0]]), segments).tolist() == [False]
+
+
+def test_merge_rects_covers_mask_exactly():
+    from viewer import merge_rects
+
+    mask = np.array([[1, 1, 0, 1], [1, 1, 0, 1], [0, 0, 0, 1]], dtype=bool)
+    rects = merge_rects(mask, x0=0.0, y0=0.0, cell=2.0)
+    covered = np.zeros(mask.shape, dtype=int)
+    for x0, y0, x1, y1 in rects:
+        covered[int(y0 / 2) : int(y1 / 2), int(x0 / 2) : int(x1 / 2)] += 1
+    assert (covered == mask.astype(int)).all()  # every cell once, nothing outside
+    assert len(rects) == 2  # two vertical merges: the 2x2 block and the 3x1 column
+
+
+def test_water_never_covers_the_road():
+    from viewer import water_and_land
+
+    centerline = np.stack([np.linspace(-200, 200, 400), np.zeros(400)], axis=1)
+    # coastline right along the road's edge: everything south should be water except the corridor
+    coast = [np.array([[-300.0, -3.0], [300.0, -3.0]])]
+    out = water_and_land(coast, centerline, halfwidth=5.5, ground_half=400.0, fine_m=4.0, coarse_m=80.0)
+    assert out["water"], "the sea south of the coast must be rendered"
+    for x0, y0, x1, y1 in out["water"]:
+        assert y1 <= -5.5 or x0 >= 200 or x1 <= -200, f"water rect {x0, y0, x1, y1} overlaps the road corridor"

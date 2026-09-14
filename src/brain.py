@@ -24,12 +24,15 @@ state as few times as possible (10 passes plus the matmul).
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+
+import metal_lif
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,11 @@ class Brain:
 
     The synaptic matrix is a sparse tensor `W` with W[post, pre] = signed
     synapse count, so one spmm per step delivers all spikes.
+
+    On Apple GPUs the step runs as one fused Metal kernel (`metal_lif.py`)
+    with spikes packed one bit per body; the torch path below is the reference
+    implementation and is used on CPU/CUDA, when a per-neuron `gain` is set,
+    or when `MALECNS_NO_METAL` is in the environment.
     """
 
     def __init__(
@@ -109,6 +117,7 @@ class Brain:
         config: LIFConfig | None = None,
         device: torch.device | None = None,
         weight_scale: float = 1.0,
+        use_metal: bool | None = None,
     ) -> None:
         self.cfg = config or LIFConfig()
         self.device = device or pick_device()
@@ -150,7 +159,40 @@ class Brain:
         self.delay_steps = max(1, int(round(cfg.delay_ms / dt)))
 
         self.gain: torch.Tensor | None = None
+        if use_metal is None:
+            use_metal = metal_lif.available(self.device) and "MALECNS_NO_METAL" not in os.environ
+        self.metal = None
+        if use_metal:
+            self.metal = metal_lif.library()
+            self.words = (batch + 31) // 32
+            coo_cpu = coo.coalesce()
+            self.rowptr, self.col, self.val = metal_lif.csr_by_post(
+                coo_cpu.indices()[0], coo_cpu.indices()[1], coo_cpu.values(), self.n, self.device
+            )
+            self.fparams = torch.tensor(
+                [self.syn_kick, self.decay_s, self.decay_v, self.decay_a, self.adapt_kick,
+                 self.u_thresh, self.u_reset, float(self.ref_steps)],
+                dtype=torch.float32, device=self.device,
+            )
+            self.short_rows, self.long_rows = metal_lif.split_rows(self.rowptr)
+            # one (n, batch, words, read, write, n_short, n_long) tuple per ring position, built once
+            self.iparams = [
+                torch.tensor(
+                    [self.n, batch, self.words, pos, (pos + self.delay_steps) % (self.delay_steps + 1),
+                     self.short_rows.numel(), self.long_rows.numel()],
+                    dtype=torch.int32, device=self.device,
+                )
+                for pos in range(self.delay_steps + 1)
+            ]
+            self._rows_ip_cache: dict[tuple[int, int], torch.Tensor] = {}
+            self.no_ext_slot = torch.full((self.n,), -1, dtype=torch.int32, device=self.device)
+            self.no_ext = torch.zeros(1, batch, dtype=torch.float32, device=self.device)
+            self._slot_cache: tuple[int, torch.Tensor] | None = None
         self.reset()
+
+    @property
+    def uses_metal(self) -> bool:
+        return self.metal is not None and self.gain is None
 
     def reset(self) -> None:
         shape = (self.n, self.batch)
@@ -160,10 +202,16 @@ class Brain:
         self.adapt = torch.zeros(shape, device=self.device)
         self.last_fired = torch.zeros(shape, dtype=torch.bool, device=self.device)
         self.refrac = torch.zeros(shape, device=self.device)
+        self.last_spikes = torch.zeros(shape, device=self.device)
         self.spike_buffer = [
             torch.zeros(shape, device=self.device) for _ in range(self.delay_steps)
         ]
         self.buf_pos = 0
+        if self.metal is not None:
+            self.bits = torch.zeros(
+                (self.delay_steps + 1, self.n, self.words), dtype=torch.int32, device=self.device
+            )
+            self.written_slot = self.delay_steps % (self.delay_steps + 1)
 
     @property
     def v(self) -> torch.Tensor:
@@ -173,23 +221,128 @@ class Brain:
     def set_gain(self, gain: torch.Tensor | None) -> None:
         """Per-neuron presynaptic excitability multiplier, shape (batch, n).
 
-        `None` removes the multiplier and skips its memory pass entirely.
+        `None` removes the multiplier and skips its memory pass entirely. A
+        gain forces the torch path; the Metal kernel reads spikes as bits and
+        has no per-synapse multiplier. Switching paths mid-run carries the
+        state across (spike history is rebuilt densely / re-packed).
         """
+        was_metal = self.uses_metal
         self.gain = None if gain is None else gain.to(self.device).t().contiguous()
+        if self.metal is None or was_metal == self.uses_metal:
+            return
+        d, ring = self.delay_steps, self.delay_steps + 1
+        if was_metal:
+            # Metal slots (written_slot - k) hold steps t-k. The torch path with
+            # buf_pos 0 reads buffer[0] as the oldest (step t+1-d) and buffer[d-1]
+            # as the newest (step t).
+            for k in range(d):
+                self.spike_buffer[d - 1 - k] = self._unpack_all((self.written_slot - k) % ring).t().contiguous()
+            self.last_spikes = self.spike_buffer[d - 1]
+            self.last_fired = self.last_spikes > 0
+            self.buf_pos = 0
+        else:
+            # torch buffer[(buf_pos + k) % d] holds step t+1-d+k; Metal reads slot
+            # buf_pos as step t+1-d, so slot k takes that same entry.
+            p0 = self.buf_pos
+            for k in range(d):
+                self.bits[k] = self._pack(self.spike_buffer[(p0 + k) % d])
+            self.buf_pos = 0
+            self.written_slot = d - 1
+
+    # --- Metal helpers ------------------------------------------------------------------
+    def _pack(self, dense: torch.Tensor) -> torch.Tensor:
+        """(n, batch) float spikes -> (n, words) int32 bit masks."""
+        padded = torch.zeros(self.n, self.words * 32, dtype=torch.int32, device=self.device)
+        padded[:, : self.batch] = (dense > 0).to(torch.int32)
+        shifts = torch.arange(32, dtype=torch.int32, device=self.device)
+        return (padded.view(self.n, self.words, 32) << shifts).sum(dim=-1, dtype=torch.int32)
+
+    def _unpack_all(self, slot: int) -> torch.Tensor:
+        out = torch.empty(self.batch, self.n, dtype=torch.float32, device=self.device)
+        self.metal.unpack_all(out, self.bits[slot], self.iparams[0], threads=self.n * self.batch)
+        return out
+
+    def _ext_slots(self, external_index: torch.Tensor | None) -> torch.Tensor:
+        if external_index is None:
+            return self.no_ext_slot
+        key = (external_index.data_ptr(), external_index.numel())
+        if self._slot_cache is None or self._slot_cache[0] != key:
+            slots = torch.full((self.n,), -1, dtype=torch.int32, device=self.device)
+            slots[external_index.to(self.device)] = torch.arange(
+                external_index.numel(), dtype=torch.int32, device=self.device
+            )
+            self._slot_cache = (key, slots)
+        return self._slot_cache[1]
+
+    def _step_metal(
+        self,
+        external_mv: torch.Tensor | None,
+        external_index: torch.Tensor | None,
+        external_values: torch.Tensor | None,
+    ) -> None:
+        if external_mv is not None:
+            # dense input: every cell gets a slot
+            ext = external_mv.t().contiguous()
+            slots = torch.arange(self.n, dtype=torch.int32, device=self.device)
+            if external_values is not None:
+                ext = ext.clone()
+                ext.index_add_(0, external_index, external_values)
+        elif external_values is not None:
+            ext = external_values if external_values.is_contiguous() else external_values.contiguous()
+            slots = self._ext_slots(external_index)
+        else:
+            ext, slots = self.no_ext, self.no_ext_slot
+        params = self.iparams[self.buf_pos]
+        common = (self.u, self.j_syn, self.adapt, self.refrac, self.bits,
+                  self.rowptr, self.col, self.val, slots, ext, self.fparams, params)
+        if self.short_rows.numel():
+            self.metal.lif_short(*common, self.short_rows, threads=self.short_rows.numel() * self.words, group_size=256)
+        if self.long_rows.numel():
+            self.metal.lif_long(*common, self.long_rows, threads=self.long_rows.numel() * self.words * 32, group_size=256)
+        self.written_slot = (self.buf_pos + self.delay_steps) % (self.delay_steps + 1)
+        self.buf_pos = (self.buf_pos + 1) % (self.delay_steps + 1)
+
+    def spikes_of(self, index: torch.Tensor) -> torch.Tensor:
+        """Spikes of the last step for the neurons in `index`, as (batch, len(index)) float."""
+        if self.uses_metal:
+            rows = index if index.dtype == torch.int32 else index.to(torch.int32)
+            out = torch.empty(self.batch, rows.numel(), dtype=torch.float32, device=self.device)
+            key = (rows.data_ptr(), rows.numel())
+            ip = self._rows_ip_cache.get(key)
+            if ip is None:
+                ip = torch.tensor([rows.numel(), self.batch, self.words], dtype=torch.int32, device=self.device)
+                self._rows_ip_cache[key] = ip
+            self.metal.unpack_rows(out, self.bits[self.written_slot], rows, ip, threads=rows.numel() * self.batch)
+            return out
+        return self.last_spikes[index].t()
+
+    def dense_spikes(self) -> torch.Tensor:
+        """Spikes of the last step as a (batch, n) float tensor."""
+        if self.uses_metal:
+            return self._unpack_all(self.written_slot)
+        return self.last_spikes.t()
 
     def step(
         self,
         external_mv: torch.Tensor | None = None,
         external_index: torch.Tensor | None = None,
         external_values: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        dense: bool = True,
+    ) -> torch.Tensor | None:
         """Advance one dt. Returns the binary spike tensor as a (batch, n) view.
 
         Input current in mV is either dense `external_mv` (batch, n) or, far
         cheaper when only a few thousand sensory cells are driven, the pair
         `external_index` (k,) and `external_values` (k, batch).
+
+        With `dense=False` nothing is returned; read spikes with `spikes_of`
+        or `dense_spikes`. On the Metal path that saves a full-width unpack.
         """
-        delayed = self.spike_buffer[self.buf_pos]
+        if self.uses_metal:
+            self._step_metal(external_mv, external_index, external_values)
+            return self.dense_spikes() if dense else None
+
+        delayed = self.spike_buffer[self.buf_pos % self.delay_steps]
         pre = delayed if self.gain is None else delayed * self.gain
         drive = torch.sparse.mm(self.W, pre)
         # j = decay_s * (j + kick * drive)
@@ -217,12 +370,13 @@ class Brain:
         if self.ref_steps == 1:
             self.last_fired = fired
         else:
-            self.refrac.masked_fill_(fired, float(self.ref_steps))
-            self.refrac.sub_(1.0).clamp_(min=0.0)
+            # a cell that fires is silent for `ref_steps` steps, then free
+            self.refrac = torch.where(fired, torch.full_like(self.refrac, float(self.ref_steps)), (self.refrac - 1.0).clamp_(min=0.0))
 
-        self.spike_buffer[self.buf_pos] = spikes
+        self.spike_buffer[self.buf_pos % self.delay_steps] = spikes
+        self.last_spikes = spikes
         self.buf_pos = (self.buf_pos + 1) % self.delay_steps
-        return spikes.t()
+        return spikes.t() if dense else None
 
     def role_index(self, role: str, limit: int | None = None) -> torch.Tensor:
         idx = self.roles[role]

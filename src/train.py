@@ -302,15 +302,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.checkpoint.exists():
         state = torch.load(args.checkpoint, map_location=device)
         generation = int(state["generation"])
-        if state["mu"].numel() == agent.n_params:
-            mu = state["mu"].to(device)
-            momentum = state["momentum"].to(device)
-            print(f"resumed at generation {generation}")
-        else:
-            print(
-                f"checkpoint has {state['mu'].numel()} params, agent has {agent.n_params}: "
-                f"parameters restart from init, generation counter continues at {generation}"
-            )
+        try:
+            mu_cpu, momentum_cpu, notes = agent.migrate_state(state)
+            mu = agent.clamp_params(mu_cpu.to(device).unsqueeze(0))[0]
+            momentum = momentum_cpu.to(device)
+            print(f"resumed at generation {generation}" + (f"; migrated: {', '.join(notes)}" if notes else ""))
+        except ValueError as exc:
+            print(f"{exc}: parameters restart from init, generation counter continues at {generation}")
         stage = int(state.get("stage", stage)) if not args.no_curriculum else stage
         best_eval = float(state.get("best_eval", best_eval))
         recent_laps = list(state.get("recent_laps", []))

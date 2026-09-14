@@ -130,6 +130,7 @@ class ConnectomeAgent:
 
         dn = np.asarray(brain.roles["descending"], dtype=np.int64)[: self.cfg.max_dn]
         self.dn_index = torch.tensor(dn, dtype=torch.long, device=self.device)
+        self.dn_index32 = self.dn_index.to(torch.int32)
         self.dn_bodies = neurons["bodyId"].to_numpy()[dn]
         self.dn_types = neurons["type"].to_numpy()[dn]
         self.n_dn = len(dn)
@@ -233,6 +234,73 @@ class ConnectomeAgent:
             [init[name](int(np.prod(shape))) for name, shape in self.param_shapes.items()]
         )
 
+    # Layout of checkpoints written before `param_shapes` was saved: the same
+    # blocks in the same order, without the looming channel.
+    LEGACY_SHAPES: dict[int, dict[str, tuple[int, ...]]] = {
+        141: {"ray_gain": (9,), "bias_hz": (1,), "speed_gain": (1,), "w_out": (64, 2), "b_out": (2,)},
+    }
+
+    def migrate_params(
+        self, params: torch.Tensor, shapes: dict[str, list[int] | tuple[int, ...]] | None
+    ) -> tuple[torch.Tensor, list[str]]:
+        """Fit a saved parameter vector to this agent's layout, block by block.
+
+        Blocks present in both with the same shape are copied; blocks this
+        agent has and the checkpoint lacks start from `initial_params`; blocks
+        the checkpoint has and this agent lacks are dropped. Returns the new
+        vector and a note per block that was not a straight copy. `shapes` is
+        the checkpoint's `param_shapes`; when it is missing the legacy layout
+        for that parameter count is assumed.
+        """
+        flat = params.detach().reshape(-1).cpu()
+        if shapes is None:
+            if flat.numel() == self.n_params:
+                return flat.clone(), []
+            shapes = self.LEGACY_SHAPES.get(flat.numel())
+            if shapes is None:
+                raise ValueError(f"checkpoint has {flat.numel()} params, agent {self.n_params}, and no layout to migrate from")
+        shapes = {k: tuple(v) for k, v in shapes.items()}
+        if sum(int(np.prod(s)) for s in shapes.values()) != flat.numel():
+            raise ValueError(f"checkpoint layout {shapes} does not cover its {flat.numel()} params")
+        saved: dict[str, torch.Tensor] = {}
+        offset = 0
+        for name, shape in shapes.items():
+            size = int(np.prod(shape))
+            saved[name] = flat[offset : offset + size].reshape(shape)
+            offset += size
+        init = self.unpack(self.initial_params().unsqueeze(0))
+        notes: list[str] = []
+        blocks: list[torch.Tensor] = []
+        for name, shape in self.param_shapes.items():
+            if name in saved and saved[name].shape == shape:
+                blocks.append(saved[name].reshape(-1))
+            else:
+                blocks.append(init[name][0].reshape(-1).cpu())
+                notes.append(f"{name} from init" + (f" (saved shape {tuple(saved[name].shape)})" if name in saved else ""))
+        for name in saved:
+            if name not in self.param_shapes:
+                notes.append(f"{name} dropped")
+        return torch.cat(blocks), notes
+
+    def migrate_state(self, state: dict) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+        """(mu, momentum, notes) from a checkpoint dict for this agent's layout."""
+        shapes = state.get("param_shapes")
+        mu, notes = self.migrate_params(state["mu"], shapes)
+        if "momentum" in state and state["momentum"].numel() == state["mu"].numel():
+            momentum, _ = self.migrate_params(state["momentum"], shapes)
+            # blocks that came from init carry no momentum
+            if notes:
+                fresh = self.unpack(self.initial_params().unsqueeze(0))
+                offset = 0
+                for name, shape in self.param_shapes.items():
+                    size = int(np.prod(shape))
+                    if any(n.startswith(name + " from init") for n in notes):
+                        momentum[offset : offset + size] = 0.0
+                    offset += size
+        else:
+            momentum = torch.zeros_like(mu)
+        return mu, momentum, notes
+
     def unpack(self, params: torch.Tensor) -> dict[str, torch.Tensor]:
         """params: (batch, n_params) -> dict of (batch, ...) tensors."""
         out: dict[str, torch.Tensor] = {}
@@ -309,10 +377,10 @@ class ConnectomeAgent:
         spikes = torch.zeros(batch, self.n_dn, device=self.device)
         for s in range(cfg.substeps):
             kicks = (draws[s] < prob).to(prob.dtype).mul_(cfg.kick_mv)
-            fired = self.brain.step(external_index=self.input_index, external_values=kicks)
-            spikes = spikes + fired[:, self.dn_index]
+            self.brain.step(external_index=self.input_index, external_values=kicks, dense=False)
+            spikes = spikes + self.brain.spikes_of(self.dn_index32)
             if spike_sink is not None:
-                spike_sink.add_(fired)
+                spike_sink.add_(self.brain.dense_spikes())
 
         rate = spikes / cfg.substeps
         self.motor_state = (1 - cfg.motor_tau) * self.motor_state + cfg.motor_tau * rate

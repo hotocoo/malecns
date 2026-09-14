@@ -156,6 +156,7 @@ body {
 
 .gauge { display: flex; align-items: center; gap: 9px; min-width: 240px; flex: 1; max-width: 340px; }
 .gauge-label { color: var(--muted); font-size: 11px; width: 52px; }
+.gauge-end { color: var(--muted); font-size: 10px; letter-spacing: 0.04em; }
 
 .bar {
   position: relative;

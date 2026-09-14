@@ -262,14 +262,20 @@ def main(argv: list[str] | None = None) -> int:
         weight_scale=args.weight_scale,
     )
     agent = ConnectomeAgent(brain, connectome.neurons, agent_config_from(state, substeps))
-    if state is not None and state["mu"].numel() == agent.n_params:
-        mu = state["mu"].to(device)
-        print(f"checkpoint {state['path']} generation {state['generation']}, control step {dt_s * 1000:.0f} ms")
+    mu = None
+    if state is not None:
+        try:
+            mu_cpu, _, notes = agent.migrate_state(state)
+            mu = mu_cpu.to(device)
+            print(
+                f"checkpoint {state['path']} generation {state['generation']}, control step {dt_s * 1000:.0f} ms"
+                + (f"; migrated: {', '.join(notes)}" if notes else "")
+            )
+        except ValueError as exc:
+            print(f"{exc}; using untrained interface")
     else:
-        if state is not None:
-            print(f"checkpoint has {state['mu'].numel()} params, agent has {agent.n_params}; using untrained interface")
-        else:
-            print("no checkpoint: evaluating untrained interface")
+        print("no checkpoint: evaluating untrained interface")
+    if mu is None:
         mu = agent.initial_params().to(device)
 
     rows = []

@@ -59,6 +59,28 @@ python3 src/evaluate.py --checkpoint checkpoints/best.pt --record logs/run.npz
 python3 src/viewer.py --replay logs/run.npz
 ```
 
+## Speed
+
+On Apple GPUs the brain step is one fused Metal kernel (`src/metal_lif.py`,
+via `torch.mps.compile_shader`): spikes are packed one bit per body, so each
+synapse reads 4 bytes per 32 bodies instead of a 256-byte row, and the
+synaptic sum, current decay, membrane integration, threshold, reset,
+adaptation and refractory bookkeeping run in registers in one pass. Rows
+with more than 64 inputs (56% of synapses; hub neurons take up to 6,660) get
+a 32-lane SIMD group each so they no longer serialise the step. The torch
+path in `brain.py` is the reference and is used on CPU/CUDA, when a per-neuron
+gain is set, or with `MALECNS_NO_METAL=1`; `tests/test_metal.py` checks the two
+produce identical spikes.
+
+Measured on an M4 Max at a population of 64: brain step 7.6 -> 2.0 ms, control
+step (8 substeps + car) 70 -> 18 ms. Training is never paced or rendered;
+only the viewer sleeps to real time (`--speed 0` runs it uncapped too).
+
+Checkpoints from older parameter layouts (141 parameters, before the looming
+channel) are migrated block by block on load: trained blocks are kept, new
+blocks start from their initial values, so a layout change never restarts
+training from scratch.
+
 ## How it works
 
 ```

@@ -20,6 +20,8 @@ const state = {
   sampleSize: 0,
   brain: null,
   frame: null,
+  metaGeneration: null,
+  ended: null,
 };
 
 const el = (id) => document.getElementById(id);
@@ -261,12 +263,37 @@ function drawCurve(curve) {
     ctx.lineWidth = lw;
     ctx.stroke();
   };
+  // curriculum stage boundaries
+  (curve.stage || []).forEach((stage, i) => {
+    if (i === 0 || stage === curve.stage[i - 1]) return;
+    ctx.strokeStyle = "rgba(232, 196, 74, 0.5)";
+    ctx.setLineDash([3, 5]);
+    ctx.beginPath();
+    ctx.moveTo(px(i), pad.top);
+    ctx.lineTo(px(i), pad.top + height);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#e8c44a";
+    ctx.fillText(`stage ${stage}`, px(i) + 4, pad.top + 10);
+  });
   line(curve.best, "rgba(232, 137, 74, 0.4)", 1);
   line(curve.fitness, "#3ddc97", 2);
+  // deterministic evaluations of the mean, at their generation
+  if (curve.eval && curve.eval.length && curve.eval_gen) {
+    const gx = (gen) => pad.left + ((gen - 1) / Math.max(1, curve.generations - 1)) * width;
+    ctx.fillStyle = "#e8894a";
+    curve.eval.forEach((v, i) => {
+      const y = Math.max(pad.top, Math.min(pad.top + height, py(v)));
+      ctx.beginPath();
+      ctx.arc(gx(curve.eval_gen[i]), y, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
 
+  const evalNote = curve.eval && curve.eval.length ? ` · eval ${fmt(curve.eval[curve.eval.length - 1], 1)} (${curve.eval.length} runs)` : "";
   el("curve-meta").textContent =
     `${curve.generations.toLocaleString()} generations · ${curve.hours} h compute · ` +
-    `best lap ${fmt(Math.max(...curve.laps), 3)}`;
+    `best lap ${fmt(Math.max(...curve.laps), 3)}${evalNote}`;
 }
 
 async function refreshCurve() {
@@ -356,12 +383,18 @@ function onFrame(frame) {
   state.trail.push(frame.pos);
   if (state.trail.length > 1200) state.trail.shift();
 
-  el("stage-generation").textContent = `generation ${frame.generation.toLocaleString()}`;
+  const stageNote = frame.stage >= 0 ? ` · stage ${frame.stage}` : "";
+  el("stage-generation").textContent = `generation ${frame.generation.toLocaleString()}${stageNote}`;
+  if (frame.generation !== state.metaGeneration) refreshMeta(frame);
   const pedal = frame.pedal ?? frame.throttle;
   el("pill-speed").textContent = `${fmt(frame.speed * 3.6, 0)} km/h · ${fmt(frame.lat_g ?? 0, 1)} g`;
   const pill = el("pill-state");
-  const crashed = frame.step <= 1;
-  pill.textContent = crashed ? "RESET" : pedal < -0.05 ? "BRAKING" : pedal > 0.05 ? "THROTTLE" : "COASTING";
+  // the last frame of an episode carries why it ended; hold that on screen
+  // through the reset so a crash is not just a car teleporting back
+  if (frame.done_reason > 0) state.ended = { reason: END_REASON[frame.done_reason] || "ENDED", until: performance.now() + 1400 };
+  const showEnd = state.ended && performance.now() < state.ended.until;
+  const crashed = showEnd || frame.step <= 1;
+  pill.textContent = showEnd ? state.ended.reason : crashed ? "RESET" : pedal < -0.05 ? "BRAKING" : pedal > 0.05 ? "THROTTLE" : "COASTING";
   pill.classList.toggle("crashed", crashed);
   pill.classList.toggle("braking", !crashed && pedal < -0.05);
   el("pill-foot").textContent =
@@ -376,10 +409,12 @@ function onFrame(frame) {
   pedalBar.style.width = `${Math.abs(pedal) * 50}%`;
   pedalBar.style.left = pedal >= 0 ? "50%" : `${50 - Math.abs(pedal) * 50}%`;
   pedalBar.style.background = pedal >= 0 ? "" : "#e05c6e";
+  // steer > 0 is a LEFT turn (counter-clockwise, as in car_env.py), so the
+  // bar grows leftwards from centre for positive steer and rightwards for negative
   const steer = el("bar-steer");
   steer.style.width = `${Math.abs(frame.steer) * 50}%`;
-  steer.style.left = frame.steer >= 0 ? "50%" : `${50 - Math.abs(frame.steer) * 50}%`;
-  el("val-steer").textContent = fmt(frame.steer);
+  steer.style.left = frame.steer > 0 ? `${50 - frame.steer * 50}%` : "50%";
+  el("val-steer").textContent = `${frame.steer > 0.02 ? "L " : frame.steer < -0.02 ? "R " : ""}${fmt(Math.abs(frame.steer))}`;
   el("val-throttle").textContent = fmt(pedal);
 
   drawTrack(frame);
@@ -388,10 +423,31 @@ function onFrame(frame) {
   if (state.drive) state.drive.update(frame);
   if (state.brain && frame.mask) state.brain.applySpikes(decodeMask(frame.mask));
 
+  const road = state.meta.road_halfwidth ? ` · road ${fmt(state.meta.road_halfwidth * 2, 1)} m` : "";
   el("footer-meta").textContent =
     `${state.meta.neurons.toLocaleString()} neurons · ${state.meta.edges.toLocaleString()} synapses · ` +
     `${state.meta.device} · ${state.meta.dt_ms} ms x ${state.meta.substeps} substeps · ` +
-    `${state.meta.checkpoint} · start ${state.meta.track} · reward ${fmt(frame.reward)}`;
+    `${frame.checkpoint || state.meta.checkpoint}${road} · start ${state.meta.track} · reward ${fmt(frame.reward)}`;
+}
+
+const END_REASON = { 1: "CRASH", 2: "REVERSE", 3: "STUCK" };
+
+/* The trainer rewrites the checkpoint every generation; the viewer reloads it
+ * between episodes and re-ranks the descending neurons, so the DN list and
+ * checkpoint note are refreshed whenever the generation changes. */
+let metaRefreshing = false;
+async function refreshMeta(frame) {
+  if (metaRefreshing) return;
+  metaRefreshing = true;
+  state.metaGeneration = frame.generation;
+  try {
+    state.meta = await (await fetch("/api/meta")).json();
+    initLists();
+  } catch (err) {
+    console.warn("meta refresh failed", err);
+  } finally {
+    metaRefreshing = false;
+  }
 }
 
 function connect() {
@@ -415,6 +471,7 @@ async function boot() {
   ]);
   state.track = track;
   state.meta = meta;
+  state.metaGeneration = null;
   initRaster();
   initLists();
   drawTrack(null);
