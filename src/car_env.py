@@ -33,8 +33,8 @@ import torch
 EARTH_RADIUS_M = 6_371_000.0
 G = 9.81
 
-DONE_ALIVE, DONE_CRASH, DONE_REVERSE, DONE_STUCK = 0, 1, 2, 3
-DONE_NAMES = {DONE_ALIVE: "alive", DONE_CRASH: "crash", DONE_REVERSE: "reverse", DONE_STUCK: "stuck"}
+DONE_ALIVE, DONE_CRASH, DONE_REVERSE, DONE_STUCK, DONE_FINISH = 0, 1, 2, 3, 4
+DONE_NAMES = {DONE_ALIVE: "alive", DONE_CRASH: "crash", DONE_REVERSE: "reverse", DONE_STUCK: "stuck", DONE_FINISH: "finished"}
 
 
 @dataclass(frozen=True)
@@ -84,14 +84,23 @@ class CarConfig:
     loop_scale: float = 4.0  # procedural loops: 70 m base radius times this
     loop_difficulty: float = 1.0  # harmonic amplitude multiplier
     mirror: bool = False  # drive the circuit the other way round
+    # Real circuits climb: with a survey beside the GeoJSON (`<stem>_dem.json`,
+    # see fetch_terrain.py) gravity along the road acts on the car.
+    road_grade: bool = True
     # --- termination -------------------------------------------------------------
     # Net progress below this ends the episode as a crash. A car that turns
     # round and drives the loop backwards otherwise survives, and evolution
     # finds that before it finds cornering.
     reverse_limit_laps: float = -0.01
-    # Stuck: less than `stuck_min_m` of net progress over `stuck_window_s`.
+    # Stuck: less than `stuck_min_m` of net progress over `stuck_window_s`, a
+    # pace floor of 3 m/s (11 km/h). With no step cap a crawler would otherwise
+    # hold a whole generation open for hours.
     stuck_window_s: float = 4.0
-    stuck_min_m: float = 5.0
+    stuck_min_m: float = 12.0
+    # Finished: `max_laps` completed (0 disables). Episodes have no step cap; a
+    # car drives until it crashes, stalls, reverses or completes the lap, so
+    # the only way to score more is to get round, and, via the time tax, faster.
+    max_laps: float = 1.0
     # --- reward ------------------------------------------------------------------
     # Progress along the track is the only thing paid for, at `progress_per_m`
     # per metre, so different circuits pay the same for the same driving; each
@@ -105,9 +114,21 @@ class CarConfig:
     wall_margin: float = 1.5
     wall_penalty: float = 0.03
     crash_penalty: float = 20.0
-    # Speed penalty: discourages flooring it through corners. Scales with
-    # (speed/max_speed)^2 so low speeds are nearly free but high speeds hurt.
-    speed_penalty: float = 0.05
+    # Speed penalty, (speed/max_speed)^2 per step. Off by default: the goal is
+    # the fastest clean lap, and crashes already cost `crash_penalty` plus the
+    # progress not made. At 0.05 it charged a 60 m/s straight as much as the
+    # time tax and pulled evolution towards slow driving.
+    speed_penalty: float = 0.0
+    speed_free_fraction: float = 0.25
+    # Discourage the degenerate low-speed limit cycle seen in the ES collapse:
+    # the controller holds near-full steering while barely moving, then gets
+    # terminated by the stuck detector. This only activates below `stall_speed`
+    # and above half-lock, so normal cornering and low-speed hairpins retain
+    # their steering authority while a stationary steering attractor becomes
+    # visibly worse than centering and accelerating out.
+    stall_speed_mps: float = 5.0
+    stall_steer_start: float = 0.5
+    stall_steer_penalty: float = 0.12
 
     @property
     def min_turn_radius(self) -> float:
@@ -238,6 +259,14 @@ class GeoProjection:
         y = np.deg2rad(ll[:, 1] - self.lat0) * EARTH_RADIUS_M * self.scale - self.dy
         return np.stack([x, y], axis=1)
 
+    def unproject(self, xy: np.ndarray) -> np.ndarray:
+        """Inverse of `project`: track-frame metres back to (lon, lat) degrees."""
+        p = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+        lat0 = np.deg2rad(self.lat0)
+        lon = self.lon0 + np.rad2deg((p[:, 0] + self.dx) / (EARTH_RADIUS_M * np.cos(lat0) * self.scale))
+        lat = self.lat0 + np.rad2deg((p[:, 1] + self.dy) / (EARTH_RADIUS_M * self.scale))
+        return np.stack([lon, lat], axis=1)
+
     def as_dict(self) -> dict:
         return {"lon0": self.lon0, "lat0": self.lat0, "scale": self.scale, "dx": self.dx, "dy": self.dy}
 
@@ -286,6 +315,16 @@ def build_centerline(cfg: CarConfig, seed: int = 0) -> torch.Tensor:
     raise ValueError(f"unknown layout {cfg.layout!r}; expected 'loop' or 'geojson'")
 
 
+def surveyed_heights(cfg: CarConfig, centerline: np.ndarray) -> np.ndarray | None:
+    """Road heights for `cfg.geojson_path` from the survey beside it, or None without one."""
+    from terrain import road_profile_for_circuit  # lazy: terrain imports this module
+
+    pts, proj = load_geojson_centerline(cfg.geojson_path, cfg.track_scale, cfg.n_points, cfg.smooth_m, cfg.mirror, return_projection=True)
+    if pts.shape[0] != centerline.shape[0] or not np.allclose(pts.numpy(), centerline, atol=1e-3):
+        return None  # not the circuit this config describes
+    return road_profile_for_circuit(cfg.geojson_path, centerline, proj)
+
+
 class Track:
     """Rasterised drivable mask, progress and clearance fields for one centerline."""
 
@@ -316,6 +355,18 @@ class Track:
         self.progress = (nearest_i.float() / self.centerline.shape[0]).reshape(res, res)
         self.cell = 2 * extent / (res - 1)
         self.min_radius_m = float(curvature_radius(self.centerline.cpu().numpy()).min())
+        # Surveyed height and slope per sample (None on a flat world): the
+        # profile the physics drives on is the one the viewer draws.
+        self.height: torch.Tensor | None = None
+        self.grade = torch.zeros(self.centerline.shape[0], device=device)
+        if cfg.layout == "geojson" and cfg.road_grade:
+            heights = surveyed_heights(cfg, self.centerline.cpu().numpy())
+            if heights is not None:
+                from terrain import grade_of  # lazy: terrain imports this module
+
+                self.height = torch.tensor(heights, dtype=torch.float32, device=device)
+                self.grade = torch.tensor(grade_of(heights, self.centerline.cpu().numpy()), dtype=torch.float32, device=device)
+        self.climb_m = float(self.height.max() - self.height.min()) if self.height is not None else 0.0
 
     @property
     def extent(self) -> float:
@@ -413,6 +464,12 @@ class CarEnv:
         self.reset()
 
     @property
+    def start_fraction(self) -> torch.Tensor:
+        """Start fractions for each car, derived from start_index."""
+        n = self.track.centerline.shape[0]
+        return self.start_index.float() / n
+
+    @property
     def obs_dim(self) -> int:
         return self.cfg.n_rays + 1
 
@@ -443,22 +500,54 @@ class CarEnv:
             self.prev_pos = self.pos.clone()
             self.prev_heading = self.heading.clone()
             self.last_terms: dict[str, torch.Tensor] = {}
-        start, heading = self._start_pose(self.start_index[mask])
-        self.pos[mask] = start
-        self.prev_pos[mask] = start
-        self.heading[mask] = heading
-        self.prev_heading[mask] = heading
-        self.speed[mask] = 0.0
-        self.steer[mask] = 0.0
-        self.lat_g[mask] = 0.0
-        self.laps[mask] = 0.0
-        self.best_laps[mask] = 0.0
-        self.last_progress[mask] = self.track.progress_at(start)
-        self.anchor_laps[mask] = 0.0
-        self.anchor_step[mask] = 0
-        self.step_count[mask] = 0
-        self.done_reason[mask] = DONE_ALIVE
+        # Functional (out-of-place) masked reset. The viewer resets single
+        # cars between control steps that ran under `torch.inference_mode()`,
+        # and PyTorch refuses in-place writes into inference tensors outside
+        # that mode ("Inplace update to inference tensor outside InferenceMode
+        # is not allowed"), so every field is rebuilt with `torch.where`.
+        start_all, heading_all = self._start_pose(self.start_index)
+        m1 = mask
+        m2 = mask.unsqueeze(1)
+        zero = torch.zeros_like(self.speed)
+        zero_l = torch.zeros_like(self.step_count)
+        self.pos = torch.where(m2, start_all, self.pos)
+        self.prev_pos = torch.where(m2, start_all, self.prev_pos)
+        self.heading = torch.where(m1, heading_all, self.heading)
+        self.prev_heading = torch.where(m1, heading_all, self.prev_heading)
+        self.speed = torch.where(m1, zero, self.speed)
+        self.steer = torch.where(m1, zero, self.steer)
+        self.lat_g = torch.where(m1, zero, self.lat_g)
+        self.laps = torch.where(m1, zero, self.laps)
+        self.best_laps = torch.where(m1, zero, self.best_laps)
+        self.last_progress = torch.where(m1, self.track.progress_at(start_all), self.last_progress)
+        self.anchor_laps = torch.where(m1, zero, self.anchor_laps)
+        self.anchor_step = torch.where(m1, zero_l, self.anchor_step)
+        self.step_count = torch.where(m1, zero_l, self.step_count)
+        self.done_reason = torch.where(m1, torch.full_like(self.done_reason, DONE_ALIVE), self.done_reason)
         return self.observe()
+
+    def compact(self, keep: torch.Tensor) -> None:
+        """Drop the bodies where `keep` is False; the survivors keep their relative order.
+
+        Used by the trainer once most of a population has finished: a
+        crashed car costs the brain kernel as much as a driving one, so the
+        batch shrinks to the cars that are still on the road. Every per-body
+        tensor on the environment (pose, progress, counters, start index and
+        the last reward terms) is index-selected; the track is shared.
+        """
+        keep = keep.to(self.device, torch.bool)
+        idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
+        if idx.numel() == 0:
+            raise ValueError("compact() needs at least one surviving body")
+        old = self.batch
+        for name, value in list(vars(self).items()):
+            if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] == old and name not in ("ray_angles", "march", "body_offsets"):
+                setattr(self, name, value[idx])
+        self.last_terms = {
+            k: v[idx] if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == old else v
+            for k, v in self.last_terms.items()
+        }
+        self.batch = int(idx.numel())
 
     def body_points(self, pos: torch.Tensor, heading: torch.Tensor) -> torch.Tensor:
         """World coordinates of the body outline samples, (batch, points, 2)."""
@@ -527,7 +616,11 @@ class CarEnv:
         a_drive = pedal.clamp(min=0.0) * torch.minimum(a_power, a_long_cap)
         a_brake = (-pedal).clamp(min=0.0) * a_long_cap
         a_drag = 0.5 * 1.225 * cfg.cda_m2 * v * v / cfg.mass_kg + cfg.roll_decel
-        self.speed = (v + (a_drive - a_brake - a_drag) * dt).clamp(0.0, cfg.max_speed)
+        # Gravity along the road: uphill costs, downhill pays (slope from the survey; zero on a flat world).
+        n = self.track.grade.shape[0]
+        slope = self.track.grade[(self.last_progress * n).long().clamp(0, n - 1)]
+        a_slope = -G * slope / torch.sqrt(1.0 + slope * slope)
+        self.speed = (v + (a_drive - a_brake - a_drag + a_slope) * dt).clamp(0.0, cfg.max_speed)
 
         self.heading = self.heading + yaw * dt
         step_vec = torch.stack([self.heading.cos(), self.heading.sin()], dim=1) * (
@@ -570,7 +663,10 @@ class CarEnv:
         self.anchor_laps = torch.where(window_over, self.laps, self.anchor_laps)
         self.anchor_step = torch.where(window_over, self.step_count, self.anchor_step)
 
+        finished = (self.laps >= cfg.max_laps) if cfg.max_laps > 0 else torch.zeros_like(stuck)
+
         reason = torch.zeros_like(self.done_reason)
+        reason = torch.where(finished, torch.full_like(reason, DONE_FINISH), reason)
         reason = torch.where(stuck, torch.full_like(reason, DONE_STUCK), reason)
         reason = torch.where(reversed_, torch.full_like(reason, DONE_REVERSE), reason)
         reason = torch.where(crashed, torch.full_like(reason, DONE_CRASH), reason)
@@ -582,9 +678,21 @@ class CarEnv:
         bonus_term = new_laps * cfg.lap_bonus
         wall_term = -cfg.wall_penalty * near_wall * near_wall
         speed_norm = self.speed / cfg.max_speed
-        speed_term = -cfg.speed_penalty * speed_norm * speed_norm
-        reward = progress_term + bonus_term + wall_term + speed_term - cfg.time_tax
-        reward = torch.where(alive, reward, torch.full_like(reward, -cfg.crash_penalty))
+        speed_excess = torch.relu(speed_norm - cfg.speed_free_fraction)
+        speed_term = -cfg.speed_penalty * speed_excess * speed_excess
+        low_speed = torch.relu(1.0 - self.speed / cfg.stall_speed_mps)
+        steer_excess = torch.relu(self.steer.abs() / cfg.max_steer_rad - cfg.stall_steer_start)
+        stall_term = -cfg.stall_steer_penalty * low_speed * steer_excess * steer_excess
+        reward = progress_term + bonus_term + wall_term + speed_term + stall_term - cfg.time_tax
+        # Keep the terminal event a fixed cost. Making the crash penalty depend
+        # on impact speed adds a large, orthogonal gradient whose easiest local
+        # solution is to slow down rather than learn the steering response.
+        # That is exactly the behavioral-collapse mode seen around generations
+        # 538-549: speed fell from ~25 km/h to ~17 km/h while steering drifted
+        # upward and progress collapsed. Speed is already shaped continuously
+        # by `speed_penalty`; the terminal event should not double-count it.
+        # Finishing is not a crash: the last step is paid normally.
+        reward = torch.where(alive | finished, reward, torch.full_like(reward, -cfg.crash_penalty))
         # A crashed car stays at its last legal pose: the crash frame shows the
         # body against the barrier, not one step's travel through it.
         self.pos = torch.where(crashed.unsqueeze(1), self.prev_pos, self.pos)
@@ -594,6 +702,7 @@ class CarEnv:
             "progress": progress_term,
             "bonus": bonus_term,
             "wall": wall_term,
+            "stall": stall_term,
             "time_tax": torch.full_like(reward, -cfg.time_tax),
             "delta": delta,
             "raw_delta": raw_delta,
@@ -604,7 +713,7 @@ class CarEnv:
 
     def telemetry(self) -> dict[str, float]:
         """Population summary for logs: speed, steering, lateral load, endings."""
-        counts = torch.bincount(self.done_reason, minlength=4).tolist()
+        counts = torch.bincount(self.done_reason, minlength=5).tolist()
         return {
             "speed_mean": float(self.speed.mean()),
             "speed_max": float(self.speed.max()),
@@ -615,5 +724,6 @@ class CarEnv:
             "crash": counts[DONE_CRASH],
             "reverse": counts[DONE_REVERSE],
             "stuck": counts[DONE_STUCK],
+            "finished": counts[DONE_FINISH],
             "alive": counts[DONE_ALIVE],
         }

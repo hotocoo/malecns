@@ -26,12 +26,16 @@ pip install -r requirements.txt
 python3 src/download.py                          # ~1.15 GB from storage.googleapis.com
 python3 src/build_graph.py --min-weight 5 --out data/graph_w5
 python3 src/fetch_scenery.py                     # optional: OSM buildings/tunnel for the viewer
+python3 src/fetch_terrain.py                     # optional: Copernicus EU-DEM elevation under the circuit (grade + viewer)
+python3 src/fetch_heights.py                     # optional: building heights from Overture Maps + surveyed neighbours
+python3 src/calibrate.py --out checkpoints/es.pt   # fit the motor readout by imitation (first lap)
 ./run_training.sh                                # headless ES training, resumable
-./run_viewer.sh                                  # live view, http://127.0.0.1:8765
+./run_viewer.sh --cars 6                         # live view, all cars + brains, cockpit button; http://127.0.0.1:8765
+python3 src/verify_laps.py                       # lap gate: every start must lap with no crash (logs/laps.jsonl)
 python3 src/evaluate.py --suite --plot run.png   # long-horizon + stress tracks
 python3 src/diagnose.py --plot logs/diag.png     # does vision produce avoidance?
 python3 src/exploits.py --log logs/train.jsonl   # reward-hacking scan of a run
-python3 -m pytest tests -q                       # 58 tests
+python3 -m pytest tests -q                       # 102 tests
 ```
 
 ## Watching it
@@ -129,6 +133,20 @@ parameters a fly would get from development and neuromodulation:
 | `b_out` | 2 | readout bias |
 | `dn_gain` | 1,314 | per-DN excitability, off by default (`learn_dn_gain`) |
 
+**Eyes.** Each ray is read *relative to the distance it would see from the middle of a
+straight 11 m road* (capped at 30 m ahead), on a log scale of 0.4 per octave
+(`eye_encoding="road"`). With the old `1 - d/150` encoding a 4 m vs 7 m offset, the
+normal steering situation, was invisible to the descending neurons (population d' 0.6,
+left/right decoded at R2 0.09); road-relative it is d' 33.
+
+**Readout calibration.** `calibrate.py` lets a linear lidar teacher (`teacher.py`) drive
+while the brain watches, fits ridge regression from the 2,129 output cells to the
+teacher's steering and pedal, and installs the two directions as channels 0/1 of the
+projection (`readout_norm="channel"`, statistics saved in the checkpoint under
+`readout`). Three DAgger rounds let the brain drive itself while the teacher labels.
+The result laps full-scale Monaco from every start with no crash
+(`evaluate.py --steps 16000`), and ES then refines it.
+
 144 parameters against 6.24M fixed synaptic weights. Output-neuron rates
 (descending + motor) are low-pass filtered, the population mean is removed, a
 fixed random projection mixes them into 64 channels, the channel vector is
@@ -161,12 +179,18 @@ grip circle has left, so the car must slow for corners.
 
 ### Episode ends
 
-Leaving the road (body half-width 1.0 m), net reverse progress, or less than
-5 m of progress in 4 s (stuck). The lap bonus is paid once per newly completed
-lap; progress reward is a potential, so nothing is earned by oscillating. An
-exploit detector runs in every generation and flags reward above the distance
-bound, bonus farming, oscillation, teleports, wall phasing, spinning and more
-(see [docs/AUDIT.md](docs/AUDIT.md)).
+There is no step cap. A car drives until it leaves the road (body half-width
+1.0 m, `crash`), makes net reverse progress (`reverse`), covers less than 12 m
+in 4 s (`stuck`, a 3 m/s pace floor) or completes `max_laps` (default one lap,
+`finished`, paid normally). `--episode-steps 0` restores the curriculum's step
+caps, `>0` a fixed cap; `defaults.EPISODE_HARD_CAP` (250,000 steps, 67 min of
+sim time) is a safety ceiling only. Fitness is therefore bounded by driving:
+getting round pays the progress and the lap bonus, and the per-step time tax
+(1.25 per second) makes the faster lap the better one. The lap bonus is paid
+once per newly completed lap; progress reward is a potential, so nothing is
+earned by oscillating. An exploit detector runs in every generation and flags
+reward above the distance bound, bonus farming, oscillation, teleports, wall
+phasing, spinning and more (see [docs/AUDIT.md](docs/AUDIT.md)).
 
 ## Layout
 
@@ -177,16 +201,21 @@ src/build_graph.py     annotations + neurotransmitters + weights -> signed graph
 src/brain.py           batched LIF over the sparse connectome, (n, batch) layout
 src/car_env.py         batched W11 driving environment on rasterised tracks
 src/agent.py           lidar -> visual neurons -> descending neurons -> controls
+src/teacher.py         linear lidar teacher used to calibrate the readout
+src/calibrate.py       imitation + DAgger fit of the readout -> ES checkpoint
 src/train.py           headless ES loop: curriculum, eval, telemetry, checkpoints
 src/evaluate.py        long-horizon runs, all starts, stress suite, recording
 src/diagnose.py        controlled-stimulus neural diagnostics with verdicts
 src/exploits.py        exploit detector: per-car signatures in every rollout
 src/fetch_scenery.py   OpenStreetMap buildings, tunnels, coastline (Overpass)
+src/fetch_terrain.py   Copernicus EU-DEM (25 m) elevation grid around the circuit
+src/fetch_heights.py   unmapped building heights from Overture Maps / surveyed neighbours
+src/terrain.py         road height profile, carved ground heightfield, building bases
 src/build_positions.py soma coordinates -> data/graph_w5/positions.npy
 src/viewer.py          live simulation or replay, SSE stream, static server
-web/                   drive.js (3D circuit), scenery.js (buildings, tunnel,
+web/                   firstperson.js (what the fly sees and feels), drive.js (3D circuit), scenery.js (buildings, tunnel,
                        barriers), brain.js (3D brain), app.js (page)
-data/tracks/           monaco.geojson centerline, monaco_scenery.geojson (OSM)
+data/tracks/           monaco.geojson centerline, monaco_scenery.geojson (OSM), monaco_dem.json (EU-DEM)
 logs/train.jsonl       one JSON record per generation
 ```
 
@@ -194,7 +223,8 @@ logs/train.jsonl       one JSON record per generation
 
 | flag | default | note |
 |---|---|---|
-| `--popsize` | 64 | ES population, also the parallel body count |
+| `--popsize` | 64 | ES population per independent island |
+| `--islands` | 14 | independent ES populations evaluated concurrently in one batched brain |
 | `--starts-per-gen` | 1 | start points per member per generation (batch = popsize x this) |
 | `--episode-steps` | 0 | 0 follows the curriculum (1500 -> 3000) |
 | `--eval-every` | 10 | deterministic evaluation of the mean; writes `best.pt` |
@@ -226,6 +256,22 @@ page load:
   `kloofendal_48d_partly_cloudy_puresky` HDRI from Poly Haven, CC0
 - buildings, tunnel, quays: OpenStreetMap contributors, ODbL 1.0
   (`data/tracks/monaco_scenery.geojson`, regenerate with `src/fetch_scenery.py`)
+- elevation: Copernicus EU-DEM v1.1, 25 m, (c) European Union 2016, via
+  opentopodata.org (`data/tracks/monaco_dem.json`, regenerate with
+  `src/fetch_terrain.py`; Terrarium tiles on AWS Open Data are the fallback).
+  The road follows the surveyed surface smoothed over 30 m (Casino Square
+  52 m, the harbour front 1-5 m; the survey's vertical accuracy is a few
+  metres), the tunnel is a straight grade between its portals, the ground is
+  carved flat under the road and stands on the tunnel's roof above it, and
+  every building is extruded from the ground under its footprint. The same
+  profile drives the physics: gravity along the road acts on the car
+  (`CarConfig.road_grade`), so Beau Rivage costs speed and the drop to Mirabeau
+  gives it back.
+- building heights: OSM `height`/`building:levels` (319 of 1,171), then
+  Overture Maps (OpenStreetMap + Microsoft ML Buildings, 213), then the median
+  of surveyed neighbours within 150 m (639, widened for isolated blocks);
+  `fetch_heights.py` records `height_source` per footprint. No jittered
+  procedural heights remain.
 - Monaco centerline: `data/tracks/monaco.geojson` (circuit id `mc-1929`)
 
 ## Data and licence

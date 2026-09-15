@@ -40,6 +40,11 @@ graph, batch 64.
 | 30 | output population | changed | readout over descending *and* VNC motor neurons (`readout_roles`), completing the brain -> DN -> ventral cord -> muscle path |
 | 31 | where did they die | telemetry | per generation: end-of-episode histogram around the lap, fitness/laps/reasons per start, motor pre-activation, grad/mu norms, timestamps; the viewer logs every episode ending to `logs/viewer_episodes.jsonl` |
 | 32 | viewer hardcoding | removed | every constant the page used (vehicle, scenery, camera, colours, thresholds) lives in `src/viewer_config.py`, served by `/api/config`, and the page builds its panels from the server's frame schema |
+| 33 | flat world, buildings on the track | fixed | real elevation: `fetch_terrain.py` pulls Copernicus EU-DEM (25 m) around any `--geojson` circuit; `terrain.py` derives the road profile (surveyed surface smoothed over 30 m, tunnel as a straight grade between portals probed 40 m outside each mouth, quay floor 1.2 m), a ground heightfield carved under the lowest nearby road and standing on the tunnel roof, building bases from the land under each footprint (over the tunnel: the roof). The Fairmont / Auditorium block no longer sits on the road inside the tunnel; portal headwalls close the hill face |
+| 34 | fixed-horizon episodes | changed | no step cap by default (`--episode-steps -1`): episodes end by crash, reverse, stuck (pace floor 3 m/s) or `finished` (`CarConfig.max_laps`, one lap); `defaults.EPISODE_HARD_CAP` is a safety ceiling; `evaluate.py --steps 0` likewise |
+| 35 | viewer episode list / fly panel | fixed | `/api/training` always carries the viewer's own episode endings whichever trainer log is inspected; the first-person fly panel is drawn every frame (it was only redrawn on resize) |
+| 36 | flat physics on a hill | fixed | `Track.height`/`Track.grade` from the same survey the viewer draws (`terrain.road_profile_for_circuit`); `_drive` adds `-g * sin(grade)` along the road (`CarConfig.road_grade`); Monaco climbs 51 m, steepest 16 % |
+| 37 | invented building heights | fixed | `fetch_heights.py`: OSM -> Overture Maps (OSM + Microsoft ML) -> median of surveyed neighbours, `height_source` recorded; the page no longer jitters storeys per footprint |
 
 ## Details
 
@@ -198,6 +203,17 @@ like passing through a wall.
   sea polygon; quays and breakwaters are rendered.
 
 
+### Throughput vs population (2026-09-15)
+
+Brain-only Metal step on the M4 Max (viewer sharing the GPU), 9,000 driven
+cells, 40 substeps: batch 256: 0.87 ms/substep (36,800 body-steps/s); 1,024:
+2.16 ms (59,300); 3,072: 5.87 ms (65,400); 6,144: 10.2 ms (75,300); 12,288:
+23.1 ms (66,400). The kernel is memory-bound past ~3k bodies: doubling the
+`run_training.sh` default (4 islands x 128 x 6 starts = 3,072) to 6,144 buys
+about 15 %, beyond that nothing. Uncapped episodes make a generation last as
+long as its best car (a clean lap at 60 km/h is ~12,500 steps), which is why
+the pace floor and the one-lap finish exist.
+
 ### Metal kernel (2026-09-14)
 
 `brain.py` on MPS now runs `metal_lif.py`: one fused kernel per step with
@@ -229,3 +245,16 @@ load through it, so a layout change keeps every trained block.
   water/land rectangles (`water_and_land`), quay walls along the coastline,
   cells within road half-width + 2 m forced to land (nearest water 8 m from
   the Monaco centerline).
+33,eye encoding,"lidar was `1 - d/150`: a 4 m vs 7 m wall offset was invisible to the descending neurons (population d' 0.6); now road-relative per ray (`eye_encoding=\"road\"`: log distance against what the ray sees from the middle of an 11 m road, 0.4/octave), same offset d' 33; front distance decoded at R2 0.95 either way",fixed
+34,readout calibration,"`calibrate.py`: a linear lidar teacher (`teacher.py`, `data/teacher_linear_robust.json`, searched with a 6-step actuation delay and filtered command noise) drives while the brain watches; ridge from the 2,129 output cells to steer/pedal becomes projection channels 0/1 (`readout_norm=\"channel\"`, stats stored under `readout` in the checkpoint); 3 DAgger rounds; held-out R2 steer 0.66-0.79, pedal 0.69-0.89",added
+35,first lap,"brain alone on full-scale Monaco, 16000 steps (256 s): 12/12 cars > 1.4 laps, zero crashes, 65 km/h mean (`evaluate.py --steps 16000`); the earlier ES run reached 0.087 laps in 795 generations",done
+36,episode length,"curriculum 2000 -> 3000 -> 6000 steps (a lap takes 9,000-14,000 at learning pace); lap completion is measured by `evaluate.py --steps 16000`",changed
+37,first-person view,"viewer: `web/firstperson.js` draws what each eye group is told (wall column per ray, brightness = road-relative proximity, white = looming), horizon roll from lateral g, pitch from the pedal, barrier glow, and bars for speed sense, output-population rate, motor intent, pedals, reward; frame carries `proximity`, `loom`, `dn_hz`",added
+38,viewer fleet,"`viewer.py --cars N --follow k`: N cars (one brain body each) spread round the lap, car k driven by ES island k mod islands; every car on the 3D circuit and minimap, a per-car brain activity strip (`fleet-canvas`, click a row to follow), `/api/follow?car=k`",added
+39,driver and onboard camera,"`web/flyrig.js`: the fly seated in the followed car (head yaws into the turn, body rolls with lateral g, wings beat with throttle, legs on wheel and pedals, eyes glow with visual drive); `cockpit view` button = roll-hoop camera with the car in view; dims in DriveStyleConfig",added
+40,checkpoint interface safety,"train.py builds the agent from the checkpoint's `agent_cfg` and refuses to run if a calibrated readout would be reset; viewer rebuilds its agent when the checkpoint interface changes (both had silently reset the readout and overwritten/shown a non-driving policy)",fixed
+41,verified-improvement guard,"ES mean evaluated every `--eval-every` generations; a drop of more than `--eval-tolerance` below the last accepted evaluation reverts mu, clears momentum and shrinks sigma; best.pt promoted on lap time once every start completes a lap (`best_lap_steps`)",added
+42,lap proof,"`verify_laps.py` (16,000 steps, every start, exit 0 only if all complete with no crash) appends to logs/laps.jsonl; `run_verify_loop.sh` re-verifies best.pt on change and es.pt periodically",added
+43,exploit veto,"only CRITICAL exploit severity vetoes an ES update; HIGH `idle_reward` (slow crawl after a spin) was discarding whole generations and widening sigma",changed
+44,reward configurability,"`train.py --car FIELD=VALUE` overrides any CarConfig field (reward terms, vehicle, sensing); `speed_penalty` default 0 (it charged a fast straight as much as the time tax); accounting exploit check verifies reward = sum of logged terms every step",changed
+45,map audit,"dataset centerline (f1-circuits, 160 GPS points, 8 m smoothing) vs OSM streets: median offset 0.6 m; deviations only where the F1 layout leaves the streets (Nouvelle Chicane on the quay, Piscine); no self-overlap (13.5 m closest approach at the hairpin legs), raster edge exact at +-5.5 m, progress monotonic; OSM has 2 lanes and no width tags everywhere on the circuit so no per-segment width data exists (`logs/map_check.png`)",verified

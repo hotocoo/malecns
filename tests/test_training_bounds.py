@@ -77,7 +77,29 @@ def test_driving_backwards_ends_the_episode():
             break
     assert bool(done[0]), "reverse driver should be terminated"
     assert float(env.laps[0]) <= env.cfg.reverse_limit_laps
-    assert float(reward[0]) == -env.cfg.crash_penalty
+    assert float(reward[0]) <= -env.cfg.crash_penalty
+
+
+def test_crash_cost_is_independent_of_impact_speed():
+    low = CarEnv(1, CPU, CarConfig(), seed=1)
+    high = CarEnv(1, CPU, CarConfig(), seed=1)
+    low.reset()
+    high.reset()
+    low.speed = torch.tensor([10.0])
+    high.speed = torch.tensor([80.0])
+    # Force the same terminal condition so only impact speed differs. The
+    # terminal event is deliberately a fixed cost; continuous speed shaping
+    # already supplies the speed signal during legal driving.
+    for env in (low, high):
+        # Move well outside the rasterised road so the one control step cannot
+        # turn this into a geometry-dependent assertion.
+        env.pos = env.pos + torch.tensor([[0.0, 50.0]])
+    _, low_reward, low_done = low.step(torch.tensor([[0.0, 0.0]]))
+    _, high_reward, high_done = high.step(torch.tensor([[0.0, 0.0]]))
+    assert bool(low_done[0]) and bool(high_done[0])
+    assert float(low_reward[0]) == pytest.approx(-low.cfg.crash_penalty)
+    assert float(high_reward[0]) == pytest.approx(-high.cfg.crash_penalty)
+    assert float(high_reward[0]) == pytest.approx(float(low_reward[0]))
 
 
 def test_forward_driving_is_not_affected_by_reverse_guard():
@@ -87,3 +109,18 @@ def test_forward_driving_is_not_affected_by_reverse_guard():
         _, _, done = env.step(torch.tensor([[0.0, 1.0]]))
         assert not bool(done[0])
     assert float(env.laps[0]) > 0.0
+
+
+def test_low_speed_full_steer_is_penalised_more_than_centered_stall():
+    cfg = CarConfig(stall_speed_mps=5.0, stall_steer_start=0.5, stall_steer_penalty=0.12)
+    steer = CarEnv(1, CPU, cfg, seed=1)
+    center = CarEnv(1, CPU, cfg, seed=1)
+    steer.reset()
+    center.reset()
+    steer.speed[:] = 1.0
+    center.speed[:] = 1.0
+    steer.steer[:] = cfg.max_steer_rad
+    _, steer_reward, _ = steer.step(torch.tensor([[1.0, 0.0]]))
+    _, center_reward, _ = center.step(torch.tensor([[0.0, 0.0]]))
+    assert float(steer.last_terms["stall"][0]) < float(center.last_terms["stall"][0])
+    assert float(steer_reward[0]) < float(center_reward[0])

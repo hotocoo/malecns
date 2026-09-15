@@ -73,10 +73,28 @@ class AgentConfig:
     # scaling relaxes to linear, so silence is not amplified into a full-scale
     # command); the motor pre-activation is then g_out * cos(pattern, w_out)
     # and lies in [-g_out, g_out]. "none": raw projected rates.
+    # "channel": every projected channel is standardised with a calibrated
+    # mean and std (`set_readout`, stored in the checkpoint), which is what a
+    # readout fitted by `calibrate.py` needs to reproduce its fit exactly.
     readout_norm: str = "layer"
     readout_floor_hz: float = 5.0
     readout_eps: float = 1e-6
     common_mode: bool = True
+    # Eye encoding. "road": every ray is read relative to the distance that
+    # ray would see from the middle of a straight road of half-width
+    # `eye_halfwidth_m` (capped at `eye_front_ref_m` for the forward rays), on
+    # a log scale of `eye_octave_gain` per octave: a wall at half the expected
+    # distance saturates the group, one at twice the expected distance
+    # silences it. This is where the steering information lives. The old
+    # "linear" encoding (1 - d / range) put a 4 m and a 12 m wall 0.05 apart
+    # on a 0..1 scale and the descending neurons could not tell left from
+    # right at all (population d' 0.6 for a 4 m / 7 m offset; 33 with "road").
+    eye_encoding: str = "road"
+    eye_range_m: float = 150.0
+    eye_fov_deg: float = 180.0
+    eye_halfwidth_m: float = 5.5
+    eye_front_ref_m: float = 60.0
+    eye_octave_gain: float = 0.4
     # Looming: positive change in proximity per control step, scaled so a wall
     # approached at speed gives values of order 0.1-1.
     loom: bool = True
@@ -153,6 +171,12 @@ class ConnectomeAgent:
         self.speed_index = torch.tensor(
             brain.roles[self.cfg.speed_role], dtype=torch.long, device=self.device
         )
+        fov = float(np.deg2rad(self.cfg.eye_fov_deg))
+        ray_angles = torch.linspace(fov / 2, -fov / 2, self.cfg.n_rays)
+        self.ray_ref_m = torch.minimum(
+            self.cfg.eye_halfwidth_m / ray_angles.sin().abs().clamp(min=1e-3),
+            torch.full_like(ray_angles, self.cfg.eye_front_ref_m),
+        ).to(self.device)
 
         dn = np.asarray(brain.roles["descending"], dtype=np.int64)[: self.cfg.max_dn]
         self.dn_index = torch.tensor(dn, dtype=torch.long, device=self.device)
@@ -182,6 +206,8 @@ class ConnectomeAgent:
         self.dn_in_readout = torch.tensor([position.get(int(c), -1) for c in dn], dtype=torch.long, device=self.device)
         self.motor_state = torch.zeros(brain.batch, self.n_readout, device=self.device)
         self.prev_proximity: torch.Tensor | None = None
+        self.last_proximity = torch.zeros(brain.batch, self.cfg.n_rays, device=self.device)
+        self.last_loom = torch.zeros(brain.batch, self.cfg.n_rays, device=self.device)
         self.last_motor = torch.zeros(brain.batch, 2, device=self.device)
         brain.set_dn_index(self.readout_index)
         brain.set_kick_mv(self.cfg.kick_mv)
@@ -201,6 +227,10 @@ class ConnectomeAgent:
             torch.randn(self.n_readout, self.cfg.readout_dim, generator=generator)
             / np.sqrt(self.n_readout)
         ).to(self.device)
+        # Channel statistics for readout_norm="channel"; identity until calibrated.
+        self.readout_mean = torch.zeros(self.cfg.readout_dim, device=self.device)
+        self.readout_std = torch.ones(self.cfg.readout_dim, device=self.device)
+        self.readout_calibrated = False
         self.noise_seed = 0
         self.step_counter = 0
         self.seed(0)
@@ -249,7 +279,9 @@ class ConnectomeAgent:
         "w_out": (-2.5, 2.5),
         # |motor| <= g_out (reached only by a pattern aligned with w_out);
         # a random pattern gives ~g_out / sqrt(readout_dim).
-        "g_out": (0.5, 8.0),
+        # Lower bound 0.1: the readout calibrated by imitation lands at ~0.35
+        # (`calibrate.py`); a 0.5 floor made the brain steer 1.5x too hard.
+        "g_out": (0.1, 8.0),
         "b_out": (-1.5, 2.5),
     }
 
@@ -359,6 +391,8 @@ class ConnectomeAgent:
         saved = state.get("agent_cfg")
         if not saved:
             return True
+        if bool(state.get("readout")) != self.readout_calibrated:
+            return False
         return all(
             saved.get(key) == getattr(self.cfg, key)
             for key in ("readout_norm", "readout_roles", "readout_dim", "projection_seed", "common_mode", "motor_tau")
@@ -388,6 +422,29 @@ class ConnectomeAgent:
         never recorded): those weights only mean something at the scale they
         were evolved at.
         """
+        # ES checkpoints store one parameter vector per island as (islands,
+        # n_params).  The block layout, however, describes one vector.  The
+        # old implementation flattened the whole population before validating
+        # the layout, so a 4-island checkpoint with 144 parameters/island was
+        # interpreted as a 576-parameter single genome and rejected.  Migrate
+        # each island independently and retain the population dimension.
+        saved_mu = state["mu"]
+        if saved_mu.ndim > 1:
+            saved_momentum = state.get("momentum")
+            mus: list[torch.Tensor] = []
+            momenta: list[torch.Tensor] = []
+            notes: list[str] = []
+            for island in range(saved_mu.shape[0]):
+                island_state = dict(state)
+                island_state["mu"] = saved_mu[island]
+                if saved_momentum is not None and saved_momentum.ndim > 1:
+                    island_state["momentum"] = saved_momentum[island]
+                mu_i, momentum_i, notes_i = self.migrate_state(island_state, reset=reset)
+                mus.append(mu_i)
+                momenta.append(momentum_i)
+                notes.extend(f"island {island}: {n}" for n in notes_i)
+            return torch.stack(mus), torch.stack(momenta), notes
+
         shapes = state.get("param_shapes")
         reset = tuple(reset)
         if not self.readout_matches(state):
@@ -443,6 +500,59 @@ class ConnectomeAgent:
         self.last_motor = torch.zeros(self.brain.batch, 2, device=self.device)
         self.step_counter = 0
 
+    def compact(self, keep: torch.Tensor) -> None:
+        """Drop finished bodies from the brain and from the per-body agent state (see `Brain.compact`).
+
+        Call `env.compact(keep)` with the same mask; `unpack()`ed parameters
+        must be index-selected by the caller (`theta[k][keep]`).
+        """
+        keep = keep.to(self.device, torch.bool)
+        idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
+        batch = self.brain.batch
+        for name in ("motor_state", "prev_proximity", "last_proximity", "last_loom", "last_motor", "last_rates_hz"):
+            value = getattr(self, name, None)
+            if isinstance(value, torch.Tensor) and value.dim() >= 1 and value.shape[0] == batch:
+                setattr(self, name, value[idx])
+        self.brain.compact(keep)
+
+    def channels(self, signal: torch.Tensor) -> torch.Tensor:
+        """Projected, normalised readout channels (batch, readout_dim) from common-mode-free rates."""
+        cfg = self.cfg
+        mixed = signal @ self.projection
+        if cfg.readout_norm == "layer":
+            floor = cfg.readout_floor_hz * self.brain.cfg.dt_ms / 1000.0  # spikes per substep
+            return mixed * torch.rsqrt(mixed.square().sum(dim=1, keepdim=True) + cfg.readout_dim * floor * floor)
+        if cfg.readout_norm == "channel":
+            return (mixed - self.readout_mean) / self.readout_std
+        return mixed
+
+    def set_readout(self, projection: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Install a calibrated projection and channel statistics (see `calibrate.py`)."""
+        if projection.shape != (self.n_readout, self.cfg.readout_dim):
+            raise ValueError(f"projection {tuple(projection.shape)} does not match ({self.n_readout}, {self.cfg.readout_dim})")
+        self.projection = projection.to(self.device, torch.float32)
+        self.readout_mean = mean.to(self.device, torch.float32).reshape(-1)
+        self.readout_std = std.to(self.device, torch.float32).reshape(-1).clamp(min=1e-6)
+        self.readout_calibrated = True
+
+    def readout_state(self) -> dict | None:
+        """Calibrated readout for a checkpoint, or None when the projection is the seeded random one."""
+        if not self.readout_calibrated:
+            return None
+        return {
+            "projection": self.projection.detach().cpu(),
+            "mean": self.readout_mean.detach().cpu(),
+            "std": self.readout_std.detach().cpu(),
+        }
+
+    def load_readout(self, state: dict | None) -> bool:
+        """Install the checkpoint's calibrated readout if it carries one. Returns True when it did."""
+        saved = (state or {}).get("readout")
+        if not saved:
+            return False
+        self.set_readout(saved["projection"], saved["mean"], saved["std"])
+        return True
+
     def steer_weight(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
         """Effective steering weight per output neuron: the fixed projection folded into `w_out`'s direction and gain."""
         w = theta["w_out"][0, :, 0]
@@ -466,19 +576,34 @@ class ConnectomeAgent:
         picked = rates[:, self.dn_in_readout.clamp(min=0)]
         return torch.where((self.dn_in_readout >= 0).unsqueeze(0), picked, torch.zeros_like(picked))
 
+    def proximity(self, lidar: torch.Tensor) -> torch.Tensor:
+        """Per-ray drive in [0, 1] from normalised lidar (batch, n_rays): near wall -> high."""
+        cfg = self.cfg
+        if cfg.eye_encoding == "linear":
+            return (1.0 - lidar).clamp(0.0, 1.0)
+        if cfg.eye_encoding != "road":
+            raise ValueError(f"unknown eye_encoding {cfg.eye_encoding!r}; expected 'road' or 'linear'")
+        metres = (lidar * cfg.eye_range_m).clamp(min=0.1)
+        octaves = torch.log2(self.ray_ref_m / metres)
+        return (cfg.eye_octave_gain * octaves + 0.5).clamp(0.0, 1.0)
+
     def sensory_rates(self, obs: torch.Tensor, theta: dict[str, torch.Tensor]) -> torch.Tensor:
         """Poisson rates (batch, n_rays + 1) in Hz for the ray groups and speed."""
         cfg = self.cfg
         lidar = obs[:, : cfg.n_rays]
         speed = obs[:, cfg.n_rays : cfg.n_rays + 1]
-        # Near wall -> high rate, mirroring an expanding edge on the retina.
-        proximity = (1.0 - lidar).clamp(0.0, 1.0)
+        proximity = self.proximity(lidar)
         drive = proximity * theta["ray_gain"] + theta["bias_hz"]
+        loom = torch.zeros_like(proximity)
         if cfg.loom:
             prev = proximity if self.prev_proximity is None else self.prev_proximity
             loom = ((proximity - prev) * cfg.loom_scale).clamp(min=0.0)
             drive = drive + loom * theta["loom_gain"]
             self.prev_proximity = proximity
+        # Kept for telemetry (the viewer's first-person view): what each eye
+        # group is being told, before the rate nonlinearity.
+        self.last_proximity = proximity
+        self.last_loom = loom
         # Soft saturation: a hard clamp made every ray read the same once the
         # gains grew, erasing the left/right difference the steering needs.
         vis_hz = (1.0 - torch.exp(-drive.clamp(min=0.0))) * cfg.max_input_hz
@@ -535,10 +660,7 @@ class ConnectomeAgent:
         signal = self.motor_state
         if cfg.common_mode:
             signal = signal - signal.mean(dim=1, keepdim=True)
-        mixed = signal @ self.projection
-        if cfg.readout_norm == "layer":
-            floor = cfg.readout_floor_hz * self.brain.cfg.dt_ms / 1000.0  # spikes per substep
-            mixed = mixed * torch.rsqrt(mixed.square().sum(dim=1, keepdim=True) + cfg.readout_dim * floor * floor)
+        mixed = self.channels(signal)
         w_hat = theta["w_out"] * torch.rsqrt(theta["w_out"].square().sum(dim=1, keepdim=True) + cfg.readout_eps)
         motor = theta["g_out"] * torch.einsum("bd,bdk->bk", mixed, w_hat) + theta["b_out"]
         self.last_motor = motor

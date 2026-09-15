@@ -150,17 +150,11 @@ function polygonArea(ring) {
 }
 
 function buildingHeight(b, i, style) {
+  // Heights come from the survey (OSM, Overture, or the median of surveyed
+  // neighbours: fetch_heights.py). A footprint with none left is drawn at the
+  // configured minimum, flat, so nothing is invented per building.
   if (b.height > 0) return b.height;
-  // unmapped height: storeys grow with footprint area, jittered per building
-  const area = polygonArea(b.rings[0]);
-  const storeys = Math.max(
-    style.default_storeys_min,
-    Math.min(
-      style.default_storeys_max,
-      Math.round(style.default_storeys_base + Math.sqrt(area) * style.default_storeys_per_sqrt_m2 + hash(i) * style.default_storeys_jitter),
-    ),
-  );
-  return storeys * style.storey_m;
+  return style.default_storeys_min * style.storey_m;
 }
 
 /** Vertex range [start, start+count) of a non-indexed geometry as its own geometry. */
@@ -193,6 +187,9 @@ export function buildBuildings(buildings, style) {
     const height = buildingHeight(b, i, style);
     const geometry = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false, steps: 1 });
     geometry.rotateX(-Math.PI / 2); // extrusion +z -> up, shape y -> world -z
+    // the footprint stands on the surveyed ground (server: terrain.building_bases); the
+    // extrusion starts a little below it so a sloping plot never shows a gap under the wall
+    if (b.base) geometry.translate(0, b.base - 0.3, 0);
     // ExtrudeGeometry is non-indexed with two groups: [0] caps, [1] side walls.
     const [caps, sides] = geometry.groups;
     const f = facades[Math.floor(hash(i * 31 + 7) * facades.length)];
@@ -233,7 +230,7 @@ function sweep(frames, i0, i1, profile, closedLoop = false, uScale = 1) {
     const f = frames[fi];
     const s = closedLoop && k === n ? frames[n - 1].s + 2 : f.s;
     profile.forEach(([lat, hgt], j) => {
-      positions.push(f.p[0] + f.normal[0] * lat, hgt, -(f.p[1] + f.normal[1] * lat));
+      positions.push(f.p[0] + f.normal[0] * lat, f.h + hgt, -(f.p[1] + f.normal[1] * lat));
       uvs.push(s / uScale, j / (m - 1));
     });
     if (k < count - 1) {
@@ -307,7 +304,7 @@ export function buildBarriers(frames, offset, style) {
     const heading = Math.atan2(-f.normal[0], f.normal[1]); // tangent (tx, ty) = (n[1], -n[0])
     [-1, 1].forEach((side) => {
       const lat = side * (offset + style.post_setback_m); // just behind the rail, away from the road
-      dummy.position.set(f.p[0] + f.normal[0] * lat, style.post_height_m, -(f.p[1] + f.normal[1] * lat));
+      dummy.position.set(f.p[0] + f.normal[0] * lat, f.h + style.post_height_m, -(f.p[1] + f.normal[1] * lat));
       dummy.rotation.set(0, heading, 0);
       dummy.updateMatrix();
       posts.setMatrixAt(placed, dummy.matrix);
@@ -323,7 +320,39 @@ export function buildBarriers(frames, offset, style) {
 
 /* ------------------------------------------------------------------ tunnel */
 
-export function buildTunnel(frames, spans, halfwidth, style) {
+/**
+ * Portal headwall: the hill face the tunnel enters, a wall across the road
+ * with the arch cut out, at the mouth frame. Spans the carved shoulder so the
+ * raised ground behind it never shows a raw edge.
+ */
+function headwall(frame, profile, halfwidthOut, heightOut, material) {
+  const shape = new THREE.Shape();
+  shape.moveTo(-halfwidthOut, -0.6);
+  shape.lineTo(halfwidthOut, -0.6);
+  shape.lineTo(halfwidthOut, heightOut);
+  shape.lineTo(-halfwidthOut, heightOut);
+  shape.closePath();
+  const opening = new THREE.Path();
+  const arch = profile.filter(([, y]) => y >= 0).map(([x, y]) => [x * 1.06, y + 0.6]);
+  opening.moveTo(arch[0][0], -0.6);
+  arch.forEach(([x, y]) => opening.lineTo(x, y));
+  opening.lineTo(arch[arch.length - 1][0], -0.6);
+  opening.closePath();
+  shape.holes.push(opening);
+  const geometry = new THREE.ShapeGeometry(shape);
+  // local x = lateral (the frame normal), local y = up, local z = along the road
+  const eu = new THREE.Vector3(frame.normal[0], 0, -frame.normal[1]);
+  const ev = new THREE.Vector3(0, 1, 0);
+  const ew = new THREE.Vector3().crossVectors(eu, ev);
+  const m = new THREE.Matrix4().makeBasis(eu, ev, ew).setPosition(frame.p[0], frame.h, -frame.p[1]);
+  geometry.applyMatrix4(m);
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.receiveShadow = true;
+  mesh.castShadow = true;
+  return mesh;
+}
+
+export function buildTunnel(frames, spans, halfwidth, style, terrain = null) {
   const group = new THREE.Group();
   if (!spans || !spans.length) return group;
   const concrete = new THREE.MeshStandardMaterial({ map: concreteTexture(), roughness: 0.95, side: THREE.DoubleSide });
@@ -353,12 +382,15 @@ export function buildTunnel(frames, spans, halfwidth, style) {
     inner.receiveShadow = true;
     group.add(inner);
     group.add(new THREE.Mesh(sweep(frames, a, b, outer, false, 4), shell));
-    // portal frames at both ends
+    // portal frames at both ends, and the hill face they pierce
+    const faceHalf = terrain ? terrain.carve_reach_m + terrain.carve_blend_m * 0.6 : wall + 3;
+    const faceHeight = terrain ? terrain.tunnel_cover_min_m + 1.0 : apex + 2.0;
     [a, b].forEach((end) => {
       const e0 = Math.max(a, end - 1);
       const e1 = Math.min(b, end + 1);
       const ring = profile.map(([x, y]) => [x * 1.12, y + 0.9]);
       group.add(new THREE.Mesh(sweep(frames, e0, e1, ring, false, 4), shell));
+      group.add(headwall(frames[end], profile, faceHalf, faceHeight, concrete));
     });
     // sodium lamps along the crown every ~8 m, plus a continuous light rail
     const lampGeos = [];
@@ -369,7 +401,7 @@ export function buildTunnel(frames, spans, halfwidth, style) {
       if (bay === lastBay) continue;
       lastBay = bay;
       const g = new THREE.BoxGeometry(1.2, 0.18, 0.5);
-      g.translate(f.p[0], apex - 0.35, -f.p[1]);
+      g.translate(f.p[0], f.h + apex - 0.35, -f.p[1]);
       lampGeos.push(g);
     }
     if (lampGeos.length) group.add(new THREE.Mesh(mergeGeometries(lampGeos, false), lamp));
@@ -386,7 +418,7 @@ export function buildTunnel(frames, spans, halfwidth, style) {
 
 /* ------------------------------------------------------------- quays/piers */
 
-export function buildPiers(lines) {
+export function buildPiers(lines, seaLevel = 0) {
   const group = new THREE.Group();
   const concrete = new THREE.MeshStandardMaterial({ color: 0x9aa0a6, roughness: 0.9 });
   lines
@@ -400,7 +432,7 @@ export function buildPiers(lines) {
         if (len < 0.5) continue;
         const geometry = new THREE.BoxGeometry(len, 1.2, l.kind === "breakwater" ? 8 : 4);
         const mesh = new THREE.Mesh(geometry, concrete);
-        mesh.position.copy(toWorld((x0 + x1) / 2, (y0 + y1) / 2, 0.3));
+        mesh.position.copy(toWorld((x0 + x1) / 2, (y0 + y1) / 2, seaLevel + 0.3));
         mesh.rotation.y = Math.atan2(-(y1 - y0), x1 - x0);
         mesh.receiveShadow = true;
         mesh.castShadow = true;
@@ -408,6 +440,74 @@ export function buildPiers(lines) {
       }
     });
   return group;
+}
+
+/* ------------------------------------------------------------------ ground */
+
+/** Bilinear ground height from the server's heightfield at a sim point (clamped to its edge). */
+export function groundHeightAt(terrain, x, y) {
+  if (!terrain) return 0;
+  const { x0, y0, cell, cols, rows, z } = terrain;
+  const fx = Math.min(Math.max((x - x0) / cell, 0), cols - 1.000001);
+  const fy = Math.min(Math.max((y - y0) / cell, 0), rows - 1.000001);
+  const j0 = Math.floor(fx);
+  const i0 = Math.floor(fy);
+  const tx = fx - j0;
+  const ty = fy - i0;
+  const j1 = Math.min(j0 + 1, cols - 1);
+  const i1 = Math.min(i0 + 1, rows - 1);
+  // nodes over the tunnel corridor carry no ground (null): weigh the rest
+  const corners = [
+    [z[i0 * cols + j0], (1 - tx) * (1 - ty)],
+    [z[i0 * cols + j1], tx * (1 - ty)],
+    [z[i1 * cols + j0], (1 - tx) * ty],
+    [z[i1 * cols + j1], tx * ty],
+  ].filter(([v]) => v !== null && v !== undefined);
+  const weight = corners.reduce((acc, [, w]) => acc + w, 0);
+  if (!corners.length || weight <= 0) return 0;
+  return corners.reduce((acc, [v, w]) => acc + v * w, 0) / weight;
+}
+
+/**
+ * The surveyed ground as one mesh: a regular grid in the track frame with the
+ * server's heights (already carved flat under the open road and dropped under
+ * the water), textured like the flat ground it replaces.
+ */
+export function buildGround(terrain, material) {
+  const { x0, y0, cell, cols, rows, z } = terrain;
+  const positions = new Float32Array(cols * rows * 3);
+  const uvs = new Float32Array(cols * rows * 2);
+  const tile = material.map ? cell * 2 : cell;
+  for (let i = 0; i < rows; i += 1) {
+    for (let j = 0; j < cols; j += 1) {
+      const k = i * cols + j;
+      const x = x0 + j * cell;
+      const y = y0 + i * cell;
+      positions.set([x, z[k] === null ? 0 : z[k], -y], k * 3);
+      uvs.set([x / tile, y / tile], k * 2);
+    }
+  }
+  const indices = [];
+  for (let i = 0; i + 1 < rows; i += 1) {
+    for (let j = 0; j + 1 < cols; j += 1) {
+      const a = i * cols + j;
+      const b = a + 1;
+      const c = a + cols;
+      const d = c + 1;
+      // no ground over the tunnel corridor: the tunnel shell is the structure there
+      if (z[a] === null || z[b] === null || z[c] === null || z[d] === null) continue;
+      // sim y up maps to world -z: wind so the normal faces +y
+      indices.push(a, b, c, b, d, c);
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+  geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+  geometry.computeVertexNormals();
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.receiveShadow = true;
+  return mesh;
 }
 
 /* ------------------------------------------------------------- sea/harbour */
@@ -482,7 +582,7 @@ function rectsGeometry(rects, height, tileMetres) {
  * and the land that remains as the textured ground. Returns { group, water }
  * where `water` is the material to animate.
  */
-export function buildWater(water, groundMaterial, style) {
+export function buildWater(water, groundMaterial, style, terrain = null) {
   const group = new THREE.Group();
   if (!water || !water.water || !water.water.length) return { group, material: null };
   const normal = waterNormalTexture();
@@ -503,7 +603,7 @@ export function buildWater(water, groundMaterial, style) {
   sea.receiveShadow = true;
   group.add(sea);
 
-  if (water.land && water.land.length) {
+  if (!terrain && water.land && water.land.length) {
     const land = new THREE.Mesh(rectsGeometry(water.land, -0.03, style.land_tile_m), groundMaterial);
     land.receiveShadow = true;
     group.add(land);
@@ -520,7 +620,8 @@ export function buildWater(water, groundMaterial, style) {
     let s = 0;
     pts.forEach(([x, y], i) => {
       if (i > 0) s += Math.hypot(x - pts[i - 1][0], y - pts[i - 1][1]);
-      positions.push(x, water.level - 0.8, -y, x, 0.05, -y);
+      const top = terrain ? groundHeightAt(terrain, x, y) + 0.05 : 0.05;
+      positions.push(x, water.level - 0.8, -y, x, top, -y);
       uvs.push(s / 4, 0, s / 4, 1);
       if (i < pts.length - 1) {
         const b = i * 2;

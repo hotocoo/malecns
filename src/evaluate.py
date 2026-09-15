@@ -105,7 +105,7 @@ def run_episode(
     frames = record is not None
     watch = ExploitMonitor(env)
     with torch.inference_mode():
-        for step in range(steps):
+        for step in defaults.step_range(steps):
             sink = torch.zeros(batch, agent.brain.n, device=env.device) if frames else None
             action = agent.act(obs, theta, spike_sink=sink)
             obs, reward, done = env.step(action)
@@ -233,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--geojson", default="data/tracks/monaco.geojson")
     parser.add_argument("--start", type=int, default=None, help="one start point (monaco) or loop seed; default all")
     parser.add_argument("--starts", type=int, default=defaults.MONACO_STARTS)
-    parser.add_argument("--steps", type=int, default=defaults.EVAL_STEPS, help="long-horizon cap; a W11 lap is ~4,600 steps")
+    parser.add_argument("--steps", type=int, default=defaults.EVAL_STEPS, help="0 (default): no cap, cars drive until they crash, stall, reverse or finish max_laps; >0: a step cap")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--suite", action="store_true", help="add stress tracks: narrow, mirrored, hard loops")
     parser.add_argument("--dt-ms", type=float, default=defaults.DT_MS)
@@ -264,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     agent = ConnectomeAgent(brain, connectome.neurons, agent_config_from(state, substeps))
     mu = None
     if state is not None:
+        agent.load_readout(state)
         try:
             mu_cpu, _, notes = agent.migrate_state(state)
             mu = mu_cpu.to(device)
@@ -277,6 +278,10 @@ def main(argv: list[str] | None = None) -> int:
         print("no checkpoint: evaluating untrained interface")
     if mu is None:
         mu = agent.initial_params().to(device)
+    # If the checkpoint has multiple islands, use the first one for evaluation
+    if mu.ndim == 2:
+        print(f"checkpoint has {mu.shape[0]} islands; evaluating island 0")
+        mu = mu[0]
 
     rows = []
     traces_for_plot: list[np.ndarray] = []

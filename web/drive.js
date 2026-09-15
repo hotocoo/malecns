@@ -19,7 +19,8 @@ import * as THREE from "three";
 import { GLTFLoader } from "/vendor/three/loaders/GLTFLoader.js";
 import { DRACOLoader } from "/vendor/three/loaders/DRACOLoader.js";
 import { RGBELoader } from "/vendor/three/loaders/RGBELoader.js";
-import { buildBarriers, buildBuildings, buildPiers, buildTunnel, buildWater } from "/scenery.js";
+import { buildBarriers, buildBuildings, buildGround, buildPiers, buildTunnel, buildWater } from "/scenery.js";
+import { FlyRig } from "/flyrig.js";
 
 /* All dimensions, camera figures, asset URLs and colours come from the
  * server's DriveStyleConfig (track.style) and CarConfig (track.car): nothing
@@ -28,7 +29,10 @@ import { buildBarriers, buildBuildings, buildPiers, buildTunnel, buildWater } fr
  * the physics footprint (track.car.length x track.car.width) from its own
  * bounding box, so what you see is exactly what can hit the barrier. */
 
-/* Sim frame -> world frame: sim x is world x, sim y is world -z, up is +y. */
+/* Sim frame -> world frame: sim x is world x, sim y is world -z, up is +y.
+ * The physics is planar; heights come from the surveyed terrain the server
+ * attaches to the track (track.centerline_z, scenery.terrain) and are added
+ * here so the car, the road and the buildings stand where the ground is. */
 const toWorld = (x, y, h = 0) => new THREE.Vector3(x, h, -y);
 
 function loadTexture(loader, url, repeat, colorSpace) {
@@ -42,7 +46,7 @@ function loadTexture(loader, url, repeat, colorSpace) {
 
 /* ------------------------------------------------------------- track meshes */
 
-function centerlineFrames(centerline) {
+function centerlineFrames(centerline, heights) {
   const n = centerline.length;
   let length = 0;
   return centerline.map((p, i) => {
@@ -52,8 +56,103 @@ function centerlineFrames(centerline) {
     const ty = next[1] - prev[1];
     const len = Math.hypot(tx, ty) || 1;
     if (i > 0) length += Math.hypot(p[0] - prev[0], p[1] - prev[1]);
-    return { p, normal: [-ty / len, tx / len], s: length };
+    return { p, normal: [-ty / len, tx / len], s: length, h: heights ? heights[i] : 0 };
   });
+}
+
+/* Nearest centreline frame through a coarse spatial grid (GRID_M metre cells),
+ * so the per-frame lookups for every car, ray end and camera point stay O(1)
+ * instead of scanning all 2,048 frames each time. */
+const GRID_M = 25;
+
+function buildFrameGrid(frames) {
+  const grid = new Map();
+  frames.forEach((f, i) => {
+    const key = `${Math.floor(f.p[0] / GRID_M)},${Math.floor(f.p[1] / GRID_M)}`;
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key).push(i);
+  });
+  return grid;
+}
+
+function nearestFrame(frames, x, y) {
+  let best = -1;
+  let bestD = Infinity;
+  const grid = frames.grid;
+  if (grid) {
+    const cx = Math.floor(x / GRID_M);
+    const cy = Math.floor(y / GRID_M);
+    for (let r = 1; r <= 3 && best < 0; r += 1) {
+      for (let dx = -r; dx <= r; dx += 1) {
+        for (let dy = -r; dy <= r; dy += 1) {
+          const cell = grid.get(`${cx + dx},${cy + dy}`);
+          if (!cell) continue;
+          for (const i of cell) {
+            const p = frames[i].p;
+            const d = (p[0] - x) * (p[0] - x) + (p[1] - y) * (p[1] - y);
+            if (d < bestD) {
+              bestD = d;
+              best = i;
+            }
+          }
+        }
+      }
+    }
+    if (best >= 0) return best;
+  }
+  for (let i = 0; i < frames.length; i += 1) {
+    const p = frames[i].p;
+    const d = (p[0] - x) * (p[0] - x) + (p[1] - y) * (p[1] - y);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/** Road height at a sim point: surveyed heights interpolated along the
+ * centreline segment the point projects onto. Snapping to the nearest frame
+ * made the car and camera step up and down by the height difference between
+ * neighbouring frames forty times a second (the "bouncing" car). */
+function roadHeightAt(frames, x, y) {
+  if (!frames || !frames.length) return 0;
+  const n = frames.length;
+  const i = nearestFrame(frames, x, y);
+  const p = frames[i].p;
+  let best = frames[i].h;
+  let bestD = Infinity;
+  for (const j of [(i + 1) % n, (i - 1 + n) % n]) {
+    const q = frames[j].p;
+    const ex = q[0] - p[0];
+    const ey = q[1] - p[1];
+    const len2 = ex * ex + ey * ey || 1;
+    const t = Math.max(0, Math.min(1, ((x - p[0]) * ex + (y - p[1]) * ey) / len2));
+    const dx = p[0] + ex * t - x;
+    const dy = p[1] + ey * t - y;
+    const d = dx * dx + dy * dy;
+    if (d < bestD) {
+      bestD = d;
+      best = frames[i].h + (frames[j].h - frames[i].h) * t;
+    }
+  }
+  return best;
+}
+
+/** Road pitch (rad, nose up positive) under a car of length `span` at heading. */
+function roadPitchAt(frames, x, y, heading, span) {
+  if (!frames || !frames.length || !span) return 0;
+  const hx = (Math.cos(heading) * span) / 2;
+  const hy = (Math.sin(heading) * span) / 2;
+  return Math.atan2(roadHeightAt(frames, x + hx, y + hy) - roadHeightAt(frames, x - hx, y - hy), span);
+}
+
+/** Pose a car mesh on the road: position, heading and grade pitch (Euler YZX: yaw, then pitch about the lateral axis). */
+function poseCar(mesh, frames, x, y, heading, length) {
+  mesh.position.copy(toWorld(x, y, roadHeightAt(frames, x, y)));
+  mesh.rotation.order = "YZX";
+  mesh.rotation.y = heading;
+  mesh.rotation.z = roadPitchAt(frames, x, y, heading, length);
 }
 
 /** Closed ribbon between offsets [a, b] from the centerline, UV v along length. */
@@ -66,7 +165,7 @@ function ribbon(frames, a, b, height, vScale) {
     const f = frames[i % n];
     const s = i === n ? frames[n - 1].s + Math.hypot(f.p[0] - frames[n - 1].p[0], f.p[1] - frames[n - 1].p[1]) : f.s;
     [a, b].forEach((offset, k) => {
-      positions.push(f.p[0] + f.normal[0] * offset, height, -(f.p[1] + f.normal[1] * offset));
+      positions.push(f.p[0] + f.normal[0] * offset, f.h + height, -(f.p[1] + f.normal[1] * offset));
       uvs.push(k, s / vScale);
     });
     if (i < n) {
@@ -92,7 +191,7 @@ function verticalRibbon(frames, offset, y0, y1) {
     const f = frames[i % n];
     const x = f.p[0] + f.normal[0] * offset;
     const z = -(f.p[1] + f.normal[1] * offset);
-    positions.push(x, y0, z, x, y1, z);
+    positions.push(x, f.h + y0, z, x, f.h + y1, z);
     uvs.push(f.s / 4, 0, f.s / 4, 1);
     if (i < n) {
       const b = i * 2;
@@ -144,6 +243,13 @@ export class DriveView {
     this.frame = null;
     this.wheels = [];
     this.wheelSpin = 0;
+    // fleet: one mesh per simulated car (car k at fleet[k]); the camera follows frame.follow
+    this.fleet = [];
+    this.fleetSize = 1;
+    this.mode = "chase";
+    this.roll = 0;
+    this.rig = new FlyRig(style); // the driver, seated in the followed car (see _seatDriver)
+    this.rigParent = null;
     this.lastTime = performance.now();
     this.textures = new THREE.TextureLoader();
     this._initLights();
@@ -180,7 +286,8 @@ export class DriveView {
 
   load(track) {
     this.track = track;
-    const frames = centerlineFrames(track.centerline);
+    const frames = centerlineFrames(track.centerline, track.centerline_z);
+    frames.grid = buildFrameGrid(frames);
     const hw = track.halfwidth;
 
     const asphalt = new THREE.MeshStandardMaterial({
@@ -216,6 +323,18 @@ export class DriveView {
       this.scene.add(line);
     });
 
+    // Road-edge skirt: on a grade the carved ground beside the road sits under
+    // the lowest nearby stretch (so it never pokes through the asphalt); this
+    // face closes the gap between the road edge and that ground.
+    if (track.has_terrain) {
+      const skirtMaterial = new THREE.MeshStandardMaterial({ color: 0x5a5a5c, roughness: 1.0, side: THREE.DoubleSide });
+      [-1, 1].forEach((side) => {
+        const skirt = new THREE.Mesh(verticalRibbon(frames, side * hw, -3.0, 0.0), skirtMaterial);
+        skirt.receiveShadow = true;
+        this.scene.add(skirt);
+      });
+    }
+
     // Armco with posts along both edges; the rail face stands where the
     // physics puts the wall (the road edge) plus the configured offset.
     this.sceneryStyle = null;
@@ -232,7 +351,7 @@ export class DriveView {
       color: urban ? 0x7d7f82 : 0x8b9a6a,
     });
     this.groundMaterial = groundMaterial;
-    if (!track.has_water) {
+    if (!track.has_water && !track.has_terrain) {
       const extent = track.extent * st.ground_extent_factor;
       const ground = new THREE.Mesh(new THREE.PlaneGeometry(extent, extent), groundMaterial);
       ground.rotation.x = -Math.PI / 2;
@@ -254,17 +373,23 @@ export class DriveView {
       const t0 = performance.now();
       const sty = scenery.style;
       this.scene.add(buildBarriers(frames, track.halfwidth + sty.rail_offset_m, sty));
+      if (scenery.terrain) {
+        // surveyed ground: the hill the circuit climbs, carved flat under the road
+        const ground = buildGround(scenery.terrain, this.groundMaterial);
+        this.scene.add(ground);
+        this.terrain = scenery.terrain;
+      }
       if (!track.has_scenery) return;
       this.scene.add(buildBuildings(scenery.buildings, sty));
-      this.scene.add(buildTunnel(frames, scenery.tunnel_spans, track.halfwidth, sty));
-      this.scene.add(buildPiers(scenery.lines || []));
-      const water = buildWater(scenery.water, this.groundMaterial, sty);
+      this.scene.add(buildTunnel(frames, scenery.tunnel_spans, track.halfwidth, sty, scenery.terrain || null));
+      this.scene.add(buildPiers(scenery.lines || [], scenery.water ? scenery.water.level : 0));
+      const water = buildWater(scenery.water, this.groundMaterial, sty, scenery.terrain);
       this.scene.add(water.group);
       this.waterMaterial = water.material;
       // the tunnel needs a longer shadow reach and a slightly darker fog inside
       console.info(
         `scenery: ${scenery.buildings.length} buildings, tunnel spans ${JSON.stringify(scenery.tunnel_spans)}, ` +
-          `${scenery.water ? scenery.water.water.length : 0} water rects in ${Math.round(performance.now() - t0)} ms`,
+          `${scenery.water ? scenery.water.water.length : 0} water rects, terrain ${scenery.terrain ? `${scenery.terrain.rows}x${scenery.terrain.cols} (${scenery.terrain.source})` : "flat"} in ${Math.round(performance.now() - t0)} ms`,
       );
       this.tunnelSpans = scenery.tunnel_spans;
     } catch (err) {
@@ -322,6 +447,7 @@ export class DriveView {
     const yaw = { "-z": -Math.PI / 2, z: Math.PI / 2, x: 0, "-x": Math.PI }[this.style.car_model_forward] ?? -Math.PI / 2;
     rig.rotation.y = yaw;
     this.car.add(rig);
+    this._spawnFleet();
     console.info(`vehicle model mounted: ${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)} native, fitted to ${car.length} x ${car.width} m, ${this.wheels.length} wheel nodes`);
   }
 
@@ -388,8 +514,45 @@ export class DriveView {
       const kW = car.width / Math.max(size.x, 1e-3);
       rig.scale.set(kW, kW, kL);
       this.car.add(rig);
+      this._spawnFleet();
       console.info(`stand-in body ${size.x.toFixed(2)} x ${size.z.toFixed(2)} m native, fitted to ${car.length} x ${car.width} m`);
     });
+  }
+
+  /** Number of cars to draw; clones of the vehicle mesh are made once the model is mounted. */
+  setFleetSize(n) {
+    this.fleetSize = Math.max(1, n | 0);
+    this._spawnFleet();
+  }
+
+  _spawnFleet() {
+    if (!this.car || this.car.children.length === 0) return;
+    if (this.fleet.length === 0) this.fleet.push(this.car);
+    while (this.fleet.length < this.fleetSize) {
+      const clone = this.car.clone(true);
+      this.scene.add(clone);
+      this.fleet.push(clone);
+    }
+    this.fleet.forEach((mesh, k) => {
+      mesh.visible = k < this.fleetSize;
+    });
+  }
+
+  /** "chase" (default) or "cockpit": the fly's eye point inside the followed car with the fly rig in view. */
+  setMode(mode) {
+    if (mode === this.mode) return;
+    this.mode = mode;
+    const st = this.style;
+    this.camera.fov = mode === "cockpit" ? st.cockpit_fov_deg : st.camera_fov_deg;
+    this.camera.updateProjectionMatrix();
+  }
+
+  /** Put the fly in the followed car's seat (moves with the follow selection). */
+  _seatDriver(mesh) {
+    if (!mesh || this.rigParent === mesh) return;
+    if (this.rigParent) this.rigParent.remove(this.rig.group);
+    mesh.add(this.rig.group);
+    this.rigParent = mesh;
   }
 
   _initRays(nRays) {
@@ -406,17 +569,30 @@ export class DriveView {
 
   update(frame) {
     this.frame = frame;
+    if (frame.fleet && frame.fleet.length !== this.fleetSize) this.setFleetSize(frame.fleet.length);
+    if (frame.fleet) {
+      frame.fleet.forEach((car, k) => {
+        const mesh = this.fleet[k];
+        if (!mesh) return;
+        poseCar(mesh, this.frames, car.pos[0], car.pos[1], car.heading, this.track.car.length);
+        mesh.visible = true;
+      });
+      this._seatDriver(this.fleet[frame.follow]);
+    } else {
+      this._seatDriver(this.car);
+    }
     const { n_rays, fov_deg, max_range } = this.track;
     const fov = (fov_deg * Math.PI) / 180;
     const pos = this.rays.geometry.getAttribute("position");
     const color = this.rays.geometry.getAttribute("color");
-    const eye = toWorld(frame.pos[0], frame.pos[1], this.style.lidar_height_m);
+    const roadH = roadHeightAt(this.frames, frame.pos[0], frame.pos[1]);
+    const eye = toWorld(frame.pos[0], frame.pos[1], roadH + this.style.lidar_height_m);
     frame.lidar.forEach((norm, i) => {
       // ray 0 looks left (+fov/2), the last ray right, as in car_env.py
       const offset = n_rays === 1 ? 0 : fov / 2 - (fov * i) / (n_rays - 1);
       const angle = frame.heading + offset;
       const reach = norm * max_range;
-      const hit = toWorld(frame.pos[0] + Math.cos(angle) * reach, frame.pos[1] + Math.sin(angle) * reach, this.style.lidar_height_m);
+      const hit = toWorld(frame.pos[0] + Math.cos(angle) * reach, frame.pos[1] + Math.sin(angle) * reach, roadH + this.style.lidar_height_m);
       pos.setXYZ(i * 2, eye.x, eye.y, eye.z);
       pos.setXYZ(i * 2 + 1, hit.x, hit.y, hit.z);
       const hot = 1 - norm;
@@ -450,9 +626,10 @@ export class DriveView {
     const f = this.frame;
     const heading = f ? f.heading : 0;
     const [sx, sy] = f ? f.pos : [this.track.centerline[0][0], this.track.centerline[0][1]];
-    const carPos = toWorld(sx, sy, 0);
-    this.car.position.copy(carPos);
-    this.car.rotation.y = heading;
+    const roadH = roadHeightAt(this.frames, sx, sy);
+    const carPos = toWorld(sx, sy, roadH);
+    const followed = (f && this.fleet[f.follow]) || this.car;
+    if (!f || !f.fleet) poseCar(followed, this.frames, sx, sy, heading, this.track.car.length);
 
     if (f) {
       // wheel spin from the simulated speed and the configured tyre radius
@@ -464,11 +641,31 @@ export class DriveView {
 
     const speed = f ? f.speed : 0;
     const st = this.style;
+    this.rig.update(f, dt, this.maxInputHz || 300, this.track.car.grip_max_g);
+    if (this.mode === "cockpit") {
+      // onboard camera on the roll hoop: the fly at the wheel in the foreground, the nose and the road ahead
+      const eye = toWorld(sx - Math.cos(heading) * st.cockpit_back_m, sy - Math.sin(heading) * st.cockpit_back_m, roadH + st.cockpit_height_m);
+      const lookX = sx + Math.cos(heading) * st.cockpit_ahead_m;
+      const lookY = sy + Math.sin(heading) * st.cockpit_ahead_m;
+      const look = toWorld(lookX, lookY, roadHeightAt(this.frames, lookX, lookY) + st.cockpit_height_m * 0.5);
+      this.camera.position.copy(eye);
+      this.camera.up.set(0, 1, 0);
+      this.camera.lookAt(look);
+      // roll with lateral load: the outside of the corner rises
+      const rollTarget = f ? -Math.sign(f.steer_actual || 0) * Math.min(1, (f.lat_g || 0) / (this.track.car.grip_max_g || 4.5)) * st.cockpit_roll_per_g * 4.5 : 0;
+      this.roll += (rollTarget - this.roll) * Math.min(1, dt * 6);
+      this.camera.rotateZ(this.roll);
+      this.lookGoal.copy(look);
+      this.renderer.render(this.scene, this.camera);
+      return;
+    }
     const back = st.camera_back_m + Math.min(st.camera_back_max_extra_m, speed * st.camera_back_per_mps);
     const ahead = st.camera_ahead_m + Math.min(st.camera_ahead_max_extra_m, speed * st.camera_ahead_per_mps);
     const height = st.camera_height_m + Math.min(st.camera_height_max_extra_m, speed * st.camera_height_per_mps);
-    const goal = toWorld(sx - Math.cos(heading) * back, sy - Math.sin(heading) * back, height);
-    const look = toWorld(sx + Math.cos(heading) * ahead, sy + Math.sin(heading) * ahead, st.lidar_height_m);
+    const goal = toWorld(sx - Math.cos(heading) * back, sy - Math.sin(heading) * back, roadH + height);
+    const aheadX = sx + Math.cos(heading) * ahead;
+    const aheadY = sy + Math.sin(heading) * ahead;
+    const look = toWorld(aheadX, aheadY, roadHeightAt(this.frames, aheadX, aheadY) + st.lidar_height_m);
     const ease = f && f.step <= 1 ? 1 : 1 - Math.exp(-dt * st.camera_ease);
     this.camera.position.lerp(goal, ease);
     this.lookGoal.lerp(look, ease);

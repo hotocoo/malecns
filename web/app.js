@@ -8,6 +8,7 @@
 
 import { BrainView } from "/brain.js";
 import { DriveView } from "/drive.js";
+import { drawFirstPerson } from "/firstperson.js";
 
 const state = {
   track: null,
@@ -24,6 +25,11 @@ const state = {
   ended: null,
   curveKeys: [],
   training: null,
+  curve: null,
+  trainers: [],
+  trainerId: null,
+  compareTrainerIds: [],
+  chartView: { xScale: 1, xOffset: 0, yScale: 1, yOffset: 0 },
 };
 
 const el = (id) => document.getElementById(id);
@@ -61,15 +67,21 @@ function trackTransform(canvas, extent) {
   return { x: (wx) => canvas.width / 2 + wx * scale, y: (wy) => canvas.height / 2 - wy * scale, scale };
 }
 
-function drawTrack(frame) {
-  const canvas = el("track-canvas");
-  fitCanvas(canvas);
-  const ctx = canvas.getContext("2d");
-  const { centerline, halfwidth, extent, n_rays, fov_deg, max_range } = state.track;
+/* The road ribbon and its dashed centreline are 2,048-point paths; stroking
+ * them (dashes especially) every frame was the single most expensive draw on
+ * the page, so they are rendered once per canvas size and blitted. */
+const minimap = { base: null, width: 0, height: 0 };
+
+function trackBase(canvas) {
+  if (minimap.base && minimap.width === canvas.width && minimap.height === canvas.height) return minimap.base;
+  const base = document.createElement("canvas");
+  base.width = canvas.width;
+  base.height = canvas.height;
+  const ctx = base.getContext("2d");
+  const { centerline, halfwidth, extent } = state.track;
   const t = trackTransform(canvas, extent);
   ctx.fillStyle = cssVar("--canvas");
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-
   ctx.beginPath();
   centerline.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(t.x(x), t.y(y)) : ctx.lineTo(t.x(x), t.y(y))));
   ctx.closePath();
@@ -82,6 +94,19 @@ function drawTrack(frame) {
   ctx.setLineDash([6, 12]);
   ctx.stroke();
   ctx.setLineDash([]);
+  minimap.base = base;
+  minimap.width = canvas.width;
+  minimap.height = canvas.height;
+  return base;
+}
+
+function drawTrack(frame) {
+  const canvas = el("track-canvas");
+  fitCanvas(canvas);
+  const ctx = canvas.getContext("2d");
+  const { extent, n_rays, fov_deg, max_range } = state.track;
+  const t = trackTransform(canvas, extent);
+  ctx.drawImage(trackBase(canvas), 0, 0);
   if (!frame) return;
 
   if (state.trail.length > 1) {
@@ -111,6 +136,18 @@ function drawTrack(frame) {
     ctx.stroke();
   });
 
+  // every car in the fleet as a dot coloured by its ES island; the followed car keeps the footprint below
+  if (frame.fleet) {
+    frame.fleet.forEach((c, k) => {
+      if (k === frame.follow) return;
+      ctx.beginPath();
+      ctx.arc(t.x(c.pos[0]), t.y(c.pos[1]), 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = islandColour(c.island);
+      ctx.globalAlpha = c.done_reason ? 0.35 : 0.95;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    });
+  }
   // car footprint at true scale, oriented
   const car = state.track.car;
   ctx.save();
@@ -133,6 +170,7 @@ function drawTrack(frame) {
 const raster = { ctx: null, buffer: null };
 
 function initRaster() {
+  initFleet();
   const canvas = el("raster-canvas");
   fitCanvas(canvas);
   raster.ctx = canvas.getContext("2d");
@@ -175,6 +213,92 @@ function drawRaster(frame) {
   frame.fired.forEach((i) => {
     ctx.fillStyle = roleColour(state.bandOf[i]);
     ctx.fillRect(canvas.width - step, i * rowHeight, step, Math.max(1, rowHeight));
+  });
+}
+
+/* ------------------------------------------------------------------ fleet */
+
+const ISLAND_COLOURS = ["#3ddc97", "#e8c44a", "#4aa3e8", "#e05c6e", "#b58ce0", "#e8894a", "#8494a4", "#f2f2f2"];
+const islandColour = (i) => ISLAND_COLOURS[(i || 0) % ISLAND_COLOURS.length];
+const fleet = { ctx: null, buffer: null, rows: 0 };
+
+function initFleet() {
+  const canvas = el("fleet-canvas");
+  if (!canvas) return;
+  fitCanvas(canvas);
+  fleet.ctx = canvas.getContext("2d");
+  fleet.buffer = document.createElement("canvas");
+  fleet.buffer.width = canvas.width;
+  fleet.buffer.height = canvas.height;
+  fleet.ctx.fillStyle = cssVar("--canvas");
+  fleet.ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const m = state.meta;
+  el("fleet-label").textContent = `all ${m.cars || 1} cars · brains side by side · ${m.islands || 1} ES island${(m.islands || 1) > 1 ? "s" : ""} · click a row to follow`;
+  canvas.onclick = (ev) => {
+    if (!state.frame || !state.frame.fleet) return;
+    const rowH = canvas.clientHeight / state.frame.fleet.length;
+    const k = Math.min(state.frame.fleet.length - 1, Math.floor(ev.offsetY / rowH));
+    fetch(`/api/follow?car=${k}`).catch(() => {});
+  };
+}
+
+/** One row per car: label on the left, that car's sampled-neuron activity scrolling on the right. */
+function drawFleet(frame) {
+  const ctx = fleet.ctx;
+  if (!ctx || !frame.fleet) return;
+  const canvas = ctx.canvas;
+  if (fitCanvas(canvas)) {
+    fleet.buffer.width = canvas.width;
+    fleet.buffer.height = canvas.height;
+  }
+  const W = canvas.width;
+  const H = canvas.height;
+  const n = frame.fleet.length;
+  const rowH = H / n;
+  const labelW = Math.min(W * 0.42, 260 * (window.devicePixelRatio || 1));
+  const step = state.cfg.raster.column_px;
+  // scroll the raster area left by one column
+  fleet.buffer.getContext("2d").drawImage(canvas, 0, 0);
+  ctx.fillStyle = cssVar("--canvas");
+  ctx.fillRect(0, 0, W, H);
+  ctx.drawImage(fleet.buffer, labelW, 0, W - labelW, H, labelW - step, 0, W - labelW, H);
+  ctx.fillStyle = cssVar("--canvas");
+  ctx.fillRect(W - step, 0, step, H);
+  const font = `${Math.max(9, Math.min(13, rowH * 0.28))}px ${cssVar("--mono")}`;
+  frame.fleet.forEach((c, k) => {
+    const y = k * rowH;
+    // newest column of this car's brain: 96 sampled neurons in 8 density bands
+    const bytes = decodeMask(c.raster); // numpy packbits: big-endian bit order
+    const nBits = bytes.length * 8;
+    const bitAt = (i) => (bytes[i >> 3] >> (7 - (i & 7))) & 1;
+    const bands = 8;
+    const per = Math.max(1, Math.floor(nBits / bands));
+    const colour = hexToRgb(islandColour(c.island)).map((v) => Math.round(v * 255));
+    for (let b = 0; b < bands; b++) {
+      let hits = 0;
+      for (let i = b * per; i < Math.min(nBits, (b + 1) * per); i++) hits += bitAt(i);
+      const level = hits / per;
+      if (level > 0) {
+        ctx.fillStyle = `rgba(${colour.join(",")}, ${0.25 + 0.75 * Math.min(1, level * 3)})`;
+        ctx.fillRect(W - step, y + (b * rowH) / bands, step, Math.max(1, rowH / bands - 1));
+      }
+    }
+    // label block
+    ctx.fillStyle = k === frame.follow ? "rgba(255,255,255,0.08)" : cssVar("--canvas");
+    ctx.fillRect(0, y, labelW, rowH);
+    ctx.fillStyle = islandColour(c.island);
+    ctx.fillRect(0, y + 2, 4, rowH - 4);
+    ctx.fillStyle = k === frame.follow ? cssVar("--text") : cssVar("--muted");
+    ctx.font = font;
+    ctx.textAlign = "left";
+    const ended = c.done_reason ? (state.meta.done_names[String(c.done_reason)] || "ended").toUpperCase() : "";
+    ctx.fillText(`${k === frame.follow ? "▶" : " "} car ${k} · island ${c.island} · start ${fmt(c.start_fraction, 2)}`, 10, y + rowH * 0.42);
+    ctx.fillText(`${fmt(c.laps, 3)} laps · ${fmt(c.speed * state.ui.kmh_per_mps, 0)} km/h · ${c.spiking.toLocaleString()} spk · DN ${fmt(c.dn_hz, 1)} Hz ${ended}`, 10, y + rowH * 0.8);
+    ctx.strokeStyle = cssVar("--line");
+    ctx.beginPath();
+    ctx.moveTo(0, y + rowH);
+    ctx.lineTo(W, y + rowH);
+    ctx.stroke();
   });
 }
 
@@ -369,7 +493,15 @@ function initFly() {
   const rays = state.track.n_rays;
   el("fly-heading").textContent = `what the fly is doing · ${m.roles.visual_projection?.toLocaleString() || "?"} visual projection neurons in ${rays} groups (one per lidar ray) drive the ${m.neurons.toLocaleString()}-neuron connectome; ${(m.readout?.neurons || 0).toLocaleString()} ${label(m.readout?.roles || "output")} neurons are read out as steering and pedal`;
   el("eyes-caption").textContent = `eyes: Poisson drive per ray group (Hz); ray 0 is the leftmost of ${rays} across ${state.track.fov_deg}° of view, ${state.track.max_range} m reach`;
+  el("fp-caption").textContent = `first person: one wall column per eye group (ray 0 left), height = true distance, brightness = proximity the group is driven with (road-relative), white = looming; horizon rolls with lateral load, pitches with the pedal, edges glow as the body nears the barrier; bars = what the fly feels and intends`;
   el("controls-caption").textContent = `commands: steering wheel = steer command (${fmt(state.track.car_cfg.max_steer_rad, 2)} rad lock), pedals = throttle / brake`;
+}
+
+function drawFly(frame) {
+  const canvas = el("fp-canvas");
+  if (!canvas) return;
+  fitCanvas(canvas);
+  drawFirstPerson(canvas, frame, { track: state.track, meta: state.meta, ui: state.ui, cssVar, roleColour, fmt });
 }
 
 function drawEyes(frame) {
@@ -516,10 +648,22 @@ function updateFlyTelemetry(frame) {
 
 function initCurveControls(keys) {
   const box = el("curve-controls");
-  if (box.dataset.built) return;
-  box.dataset.built = "1";
   const defaults = new Set([...state.ui.curve_default_keys, ...state.ui.curve_secondary_keys]);
-  state.curveKeys = state.ui.curve_default_keys.filter((k) => keys.includes(k));
+  // A fleet comparison is primarily a like-for-like comparison. Starting with
+  // one metric prevents N trainers × M metrics from turning the graph into an
+  // unreadable bundle of traces; additional metrics remain one checkbox away.
+  const preferred = state.compareTrainerIds.length > 1 && keys.includes("fitness_best")
+    ? ["fitness_best"]
+    : state.ui.curve_default_keys;
+  const existingKeys = [...box.querySelectorAll("input")].map((input) => input.value);
+  const keySet = new Set(keys);
+  const needsRebuild = existingKeys.length !== keys.length || existingKeys.some((key) => !keySet.has(key));
+  if (!needsRebuild && box.dataset.built) return;
+  const previous = new Set(state.curveKeys);
+  state.curveKeys = (previous.size ? keys.filter((key) => previous.has(key)) : preferred.filter((k) => keys.includes(k)));
+  if (!state.curveKeys.length) state.curveKeys = preferred.filter((k) => keys.includes(k));
+  box.innerHTML = "";
+  box.dataset.built = "1";
   keys.forEach((key) => {
     const lab = document.createElement("label");
     const cb = document.createElement("input");
@@ -536,27 +680,180 @@ function initCurveControls(keys) {
   });
 }
 
-const SERIES_COLOURS = ["--accent", "--warn", "--blue", "--purple", "--yellow", "--bad", "--text"];
+function trainerColour(trainerId, trainers) {
+  const index = Math.max(0, (trainers || []).indexOf(trainerId));
+  const count = Math.max(1, (trainers || []).length);
+  const hue = Math.round((index * 360) / count + 205) % 360;
+  return `hsl(${hue} 72% 64%)`;
+}
+
+function trainerDash(trainerId, trainers) {
+  const index = Math.max(0, (trainers || []).indexOf(trainerId));
+  return [[], [7, 4], [2, 4], [10, 3, 2, 3], [4, 3, 1, 3]][index % 5];
+}
+
+function resetChartView() {
+  state.chartView = { xScale: 1, xOffset: 0, yScale: 1, yOffset: 0 };
+  if (state.curve) drawCurve(state.curve);
+}
+
+function fitChartView() {
+  resetChartView();
+}
+
+function chartPointBudget() {
+  const canvas = el("curve-canvas");
+  if (!canvas) return state.cfg?.curve_points || 400;
+  // Request enough samples to preserve visible detail at the current canvas
+  // width without making huge historical logs expensive to transfer.
+  const width = Math.max(320, Math.round(canvas.clientWidth || 0));
+  return Math.min(10000, Math.max(state.cfg?.curve_points || 400, width * 4));
+}
+
+function updateChartDataNote(curve) {
+  const note = el("chart-data-note");
+  if (!note) return;
+  const seriesCount = Object.keys(curve.series || {}).length;
+  const trainerCount = (curve.trainers || []).length;
+  const points = Math.max(0, ...Object.values(curve.series || {}).map((v) => Array.isArray(v) ? v.length : 0));
+  note.textContent = `${points.toLocaleString()} samples · ${seriesCount.toLocaleString()} series${trainerCount ? ` · ${trainerCount.toLocaleString()} trainers` : ""}`;
+}
+
+function initChartInteractions() {
+  const shell = el("chart-shell");
+  const canvas = el("curve-canvas");
+  const toolbar = document.querySelector(".chart-toolbar");
+  if (!shell || !canvas || !toolbar || shell.dataset.bound) return;
+  shell.dataset.bound = "1";
+  toolbar.querySelectorAll("[data-chart-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.chartAction;
+      if (action === "fit" || action === "reset") fitChartView();
+      if (action === "zoom-in") {
+        state.chartView.xScale = Math.min(12, state.chartView.xScale * 1.25);
+        if (state.curve) drawCurve(state.curve);
+      }
+      if (action === "zoom-out") {
+        state.chartView.xScale = Math.max(1, state.chartView.xScale / 1.25);
+        if (state.curve) drawCurve(state.curve);
+      }
+      if (action === "fullscreen") {
+        if (shell.requestFullscreen) shell.requestFullscreen();
+        else shell.classList.toggle("expanded");
+      }
+    });
+  });
+  canvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    state.chartView.xScale = Math.max(1, Math.min(12, state.chartView.xScale * (event.deltaY < 0 ? 1.15 : 0.87)));
+    if (state.curve) drawCurve(state.curve);
+  }, { passive: false });
+  let drag = null;
+  canvas.addEventListener("pointerdown", (event) => {
+    canvas.setPointerCapture(event.pointerId);
+    drag = { x: event.clientX, offset: state.chartView.xOffset };
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (!drag) return;
+    const generationSets = state.curve?.multi
+      ? Object.values(state.curve.generation || {})
+      : [state.curve?.generation || []];
+    const generations = generationSets.flat().map(Number).filter(Number.isFinite);
+    const span = generations.length > 1
+      ? Math.max(1, Math.max(...generations) - Math.min(...generations))
+      : 1;
+    state.chartView.xOffset = Math.max(-span, Math.min(span, drag.offset - (event.clientX - drag.x) * span / Math.max(1, canvas.clientWidth)));
+    if (state.curve) drawCurve(state.curve);
+  });
+  canvas.addEventListener("pointerup", () => { drag = null; });
+  canvas.addEventListener("pointercancel", () => { drag = null; });
+}
 
 function drawCurve(curve) {
   const canvas = el("curve-canvas");
   fitCanvas(canvas);
   const ctx = canvas.getContext("2d");
-  const pad = { left: 56, right: 14, top: 14, bottom: 22 };
+  const pad = { left: 62, right: 18, top: 18, bottom: 34 };
   ctx.fillStyle = cssVar("--canvas");
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  const series = Object.entries(curve.series || {}).filter(([, v]) => v.some((x) => x !== null));
-  if (!series.length) return;
-  const width = canvas.width - pad.left - pad.right;
-  const height = canvas.height - pad.top - pad.bottom;
-  const n = Math.max(...series.map(([, v]) => v.length));
-  const values = series.flatMap(([, v]) => v.filter((x) => x !== null));
-  const lo = Math.min(...values);
-  const hi = Math.max(...values);
-  const span = hi - lo || 1;
-  const px = (i) => pad.left + (i / (n - 1 || 1)) * width;
-  const py = (v) => pad.top + height - ((v - lo) / span) * height;
+  const series = Object.entries(curve.series || {})
+    .map(([key, values]) => [key, values.map((value) => Number.isFinite(value) ? value : null)])
+    .filter(([, v]) => v.some((x) => x !== null));
+  const legend = el("chart-legend");
+  legend.innerHTML = "";
+  if (!series.length) {
+    el("chart-overlay").textContent = "no numeric data";
+    return;
+  }
   ctx.font = `11px ${cssVar("--mono")}`;
+  const width = Math.max(1, canvas.width - pad.left - pad.right);
+  const height = Math.max(1, canvas.height - pad.top - pad.bottom);
+  // Scale each metric from its own distribution. A corrupt scalar in one
+  // trace (seen in long historical logs) must never flatten the useful traces
+  // from the other metrics/trainers. Keep the actual extrema only when they
+  // are plausible; otherwise clip the display at a robust 1st/99th percentile
+  // and report how many points were clipped.
+  const bounds = new Map();
+  const metricGroups = new Map();
+  let clipped = 0;
+  series.forEach(([key, vals]) => {
+    const metric = curve.multi ? key.split(": ").slice(1).join(": ") : key;
+    if (!metricGroups.has(metric)) metricGroups.set(metric, []);
+    metricGroups.get(metric).push(...vals.filter((x) => Number.isFinite(x)));
+  });
+  metricGroups.forEach((groupValues, metric) => {
+    const values = groupValues.sort((a, b) => a - b);
+    const rawLo = values[0];
+    const rawHi = values[values.length - 1];
+    const q = (fraction) => values[Math.min(values.length - 1, Math.floor((values.length - 1) * fraction))];
+    const robustLo = q(0.01);
+    const robustHi = q(0.99);
+    const robustSpan = robustHi - robustLo;
+    let lo = rawLo;
+    let hi = rawHi;
+    if (robustSpan > 0 && (rawHi - rawLo) > Math.max(100 * robustSpan, 1e6)) {
+      lo = robustLo;
+      hi = robustHi;
+      series.forEach(([key, vals]) => {
+        const keyMetric = curve.multi ? key.split(": ").slice(1).join(": ") : key;
+        if (keyMetric !== metric) return;
+        vals.forEach((v) => { if (v !== null && (v < lo || v > hi)) clipped += 1; });
+      });
+    }
+    series.forEach(([key]) => {
+      const keyMetric = curve.multi ? key.split(": ").slice(1).join(": ") : key;
+      if (keyMetric === metric) bounds.set(key, [lo, hi]);
+    });
+  });
+  const allBounds = [...metricGroups.keys()].map((metric) => {
+    const firstKey = series.find(([key]) => (curve.multi ? key.split(": ").slice(1).join(": ") : key) === metric)?.[0];
+    return bounds.get(firstKey);
+  }).filter(Boolean);
+  const singleMetric = metricGroups.size === 1;
+  const globalLo = singleMetric ? Math.min(...allBounds.map(([lo]) => lo)) : 0;
+  const globalHi = singleMetric ? Math.max(...allBounds.map(([, hi]) => hi)) : 1;
+  const generationFor = (key, i) => {
+    const trainer = curve.multi ? key.split(": ")[0] : null;
+    const g = curve.series_axis?.[key]
+      || curve.series_generation?.[key]
+      || (curve.multi ? (curve.generation?.[trainer] || []) : (curve.generation || []));
+    return Number.isFinite(Number(g[i])) ? Number(g[i]) : i;
+  };
+  const allGenerations = series.flatMap(([key, vals]) => vals.map((v, i) => v === null ? null : generationFor(key, i)).filter((v) => v !== null));
+  const minGeneration = Math.min(...allGenerations);
+  const maxGeneration = Math.max(...allGenerations);
+  const generationSpan = maxGeneration - minGeneration || 1;
+  const view = state.chartView;
+  const visibleSpan = generationSpan / view.xScale;
+  const center = (minGeneration + maxGeneration) / 2 + view.xOffset;
+  const visibleMin = center - visibleSpan / 2;
+  const visibleMax = center + visibleSpan / 2;
+  const px = (key, i) => pad.left + ((generationFor(key, i) - visibleMin) / Math.max(1, visibleMax - visibleMin)) * width;
+  const py = (key, v) => {
+    const [rawLo, rawHi] = bounds.get(key);
+    const span = rawHi - rawLo || 1;
+    return Math.max(pad.top, Math.min(pad.top + height, pad.top + height - ((v - rawLo) / span) * height));
+  };
   ctx.lineWidth = 1;
   [0, 0.5, 1].forEach((f) => {
     const y = pad.top + height * f;
@@ -565,68 +862,275 @@ function drawCurve(curve) {
     ctx.moveTo(pad.left, y);
     ctx.lineTo(canvas.width - pad.right, y);
     ctx.stroke();
-    ctx.fillStyle = cssVar("--muted");
-    ctx.fillText(fmt(hi - span * f, 1), 8, y + 4);
+    if (singleMetric) {
+      ctx.fillStyle = cssVar("--muted");
+      ctx.fillText(fmt(globalHi - (globalHi - globalLo) * f, 1), 8, y + 4);
+    }
   });
-  (curve.stage || []).forEach((stage, i) => {
-    if (i === 0 || stage === curve.stage[i - 1]) return;
+  const stageGenerations = Array.isArray(curve.stage)
+    ? curve.stage.map((stage, i) => [stage, generationFor(series[0]?.[0] || "", i)])
+    : [];
+  stageGenerations.forEach(([stage, generation], i) => {
+    if (i === 0 || stage === stageGenerations[i - 1][0]) return;
     ctx.strokeStyle = cssVar("--yellow");
     ctx.setLineDash([3, 5]);
     ctx.beginPath();
-    ctx.moveTo(px(i), pad.top);
-    ctx.lineTo(px(i), pad.top + height);
+    const sx = pad.left + ((generation - minGeneration) / generationSpan) * width;
+    ctx.moveTo(sx, pad.top);
+    ctx.lineTo(sx, pad.top + height);
     ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle = cssVar("--yellow");
-    ctx.fillText(`stage ${stage}`, px(i) + 4, pad.top + 10);
+    ctx.fillText(`stage ${stage}`, sx + 4, pad.top + 10);
   });
+  if (Array.isArray(curve.run_boundaries_axis) && curve.run_boundaries_axis.length) {
+    curve.run_boundaries_axis.forEach((generationValue) => {
+      const generation = Number(generationValue);
+      if (!Number.isFinite(generation)) return;
+      const rx = pad.left + ((generation - visibleMin) / Math.max(1, visibleMax - visibleMin)) * width;
+      if (rx < pad.left || rx > pad.left + width) return;
+      ctx.strokeStyle = cssVar("--muted");
+      ctx.setLineDash([2, 4]);
+      ctx.beginPath();
+      ctx.moveTo(rx, pad.top);
+      ctx.lineTo(rx, pad.top + height);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = cssVar("--muted");
+      ctx.fillText("run restart", rx + 4, pad.top + height - 8);
+    });
+  }
   series.forEach(([key, vals], k) => {
-    const colour = cssVar(SERIES_COLOURS[k % SERIES_COLOURS.length]);
+    // In fleet mode colour identifies the trainer; line width identifies the
+    // first selected metric. This keeps six parallel trainers visually
+    // separable instead of cycling colours across trainer/metric combinations.
+    const trainerIndex = curve.multi
+      ? Math.max(0, (curve.trainers || []).indexOf(key.split(": ")[0]))
+      : 0;
+    const colour = trainerColour(curve.multi ? key.split(": ")[0] : null, curve.trainers);
     const isEval = key.startsWith("eval_");
     ctx.strokeStyle = colour;
     ctx.fillStyle = colour;
+    ctx.setLineDash(trainerDash(curve.multi ? key.split(": ")[0] : null, curve.trainers));
     if (isEval) {
       vals.forEach((v, i) => {
         if (v === null) return;
         ctx.beginPath();
-        ctx.arc(px(i), py(v), 3, 0, Math.PI * 2);
+        ctx.arc(px(key, i), py(key, v), 3, 0, Math.PI * 2);
         ctx.fill();
       });
     } else {
-      ctx.lineWidth = k === 0 ? 2 : 1;
+      ctx.lineWidth = curve.multi ? 2 : (k === 0 ? 2 : 1);
       ctx.beginPath();
       let started = false;
       vals.forEach((v, i) => {
-        if (v === null) return;
-        if (!started) ctx.moveTo(px(i), py(v));
-        else ctx.lineTo(px(i), py(v));
+        if (v === null) {
+          started = false;
+          return;
+        }
+        if (!started) ctx.moveTo(px(key, i), py(key, v));
+        else ctx.lineTo(px(key, i), py(key, v));
         started = true;
       });
       ctx.stroke();
     }
-    ctx.fillText(label(key), pad.left + 8 + k * 150, canvas.height - 6);
+    ctx.setLineDash([]);
   });
-  const gens = curve.generation || [];
+  const gens = Array.isArray(curve.axis_generation)
+    ? curve.axis_generation
+    : Array.isArray(curve.generation)
+      ? curve.generation
+      : Object.values(curve.generation || {}).flat();
   if (gens.length) {
     ctx.fillStyle = cssVar("--muted");
     ctx.textAlign = "right";
-    ctx.fillText(`generation ${gens[gens.length - 1]}`, canvas.width - pad.right, pad.top + 10);
+    ctx.fillText(`generation ${maxGeneration.toLocaleString()}`, canvas.width - pad.right, pad.top + 10);
     ctx.textAlign = "left";
   }
+
+  // Keep the graph readable without requiring the user to guess what the
+  // horizontal coordinate means. Labels are anchored inside the canvas, so
+  // they can never be clipped by the page edge.
+  ctx.fillStyle = cssVar("--muted");
+  ctx.textAlign = "left";
+  ctx.fillText(`generation ${minGeneration.toLocaleString()}`, pad.left, canvas.height - 8);
+  ctx.textAlign = "right";
+  ctx.fillText(`generation ${maxGeneration.toLocaleString()}`, canvas.width - pad.right, canvas.height - 8);
+  ctx.textAlign = "left";
+
+  series.forEach(([key]) => {
+    const item = document.createElement("span");
+    item.className = "chart-legend-item";
+    const swatch = document.createElement("i");
+    swatch.style.background = trainerColour(curve.multi ? key.split(": ")[0] : null, curve.trainers);
+    const text = document.createElement("span");
+    text.textContent = label(key);
+    text.title = key;
+    item.append(swatch, text);
+    legend.append(item);
+  });
+  updateChartDataNote(curve);
+  const scaleNote = singleMetric ? "" : "multiple metrics · each metric uses its own display scale";
+  el("chart-overlay").textContent = clipped
+    ? `${clipped.toLocaleString()} extreme historical point${clipped === 1 ? "" : "s"} clipped from display scale${scaleNote ? ` · ${scaleNote}` : ""}`
+    : scaleNote;
+}
+
+function trainerStatus(trainer) {
+  if (trainer.alive) return "LIVE";
+  return trainer.age_s < 3600 ? "IDLE" : "STALE";
+}
+
+function trainerMetric(v, digits = 2) {
+  return v === null || v === undefined ? "-" : fmt(v, digits);
+}
+
+function renderTrainerFleet(payload) {
+  state.trainers = payload.trainers || [];
+  if (!state.trainerId || !state.trainers.some((t) => t.id === state.trainerId)) {
+    state.trainerId = payload.primary || state.trainers[0]?.id || null;
+  }
+  const available = new Set(state.trainers.map((t) => t.id));
+  state.compareTrainerIds = state.compareTrainerIds.filter((id) => available.has(id));
+  if (!state.compareTrainerIds.length && state.trainers.length) {
+    // If the active log exposes independent ES islands, those are the actual
+    // parallel trainers and are the most useful default comparison. Fall back
+    // to the discovered log files when running an older log without island
+    // telemetry.
+    const islands = state.trainers.filter((t) => Number.isInteger(t.island));
+    state.compareTrainerIds = islands.length > 1
+      ? islands.map((t) => t.id)
+      : state.trainers.map((t) => t.id);
+  }
+  const select = el("trainer-select");
+  select.innerHTML = "";
+  state.trainers.forEach((trainer) => {
+    const option = document.createElement("option");
+    option.value = trainer.id;
+    option.textContent = `${trainer.name} · g${trainer.generation}`;
+    option.selected = trainer.id === state.trainerId;
+    select.append(option);
+  });
+
+  const quick = el("trainer-quick-actions");
+  quick.querySelectorAll("button").forEach((button) => {
+    button.onclick = () => {
+      const mode = button.dataset.trainers;
+      if (mode === "all") state.compareTrainerIds = state.trainers.map((t) => t.id);
+      else if (mode === "best2") {
+        state.compareTrainerIds = [...state.trainers]
+          .sort((a, b) => Number(b.best ?? -Infinity) - Number(a.best ?? -Infinity))
+          .slice(0, 2).map((t) => t.id);
+      } else state.compareTrainerIds = [];
+      renderTrainerFleet({ primary: state.trainerId, trainers: state.trainers });
+      refreshCurve();
+    };
+  });
+  el("trainer-fleet-note").textContent = `${state.trainers.length} logs · select any trainer to inspect its curve/status`;
+
+  const fleet = el("trainer-fleet");
+  fleet.innerHTML = "";
+  state.trainers.forEach((trainer) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `trainer-card${trainer.id === state.trainerId ? " selected" : ""}`;
+    button.addEventListener("click", () => selectTrainer(trainer.id));
+    const top = document.createElement("div");
+    top.className = "trainer-card-top";
+    top.innerHTML = `<strong>${trainer.name}</strong><span class="trainer-state ${trainer.alive ? "live" : ""}">${trainerStatus(trainer)}</span>`;
+    const stats = document.createElement("div");
+    stats.className = "trainer-card-stats";
+    stats.innerHTML = `<span>gen <b>${Number(trainer.generation).toLocaleString()}</b></span><span>best <b>${trainerMetric(trainer.best)}</b></span><span>lap <b>${trainerMetric(trainer.laps, 3)}</b></span><span>eval <b>${trainerMetric(trainer.eval)}</b></span>`;
+    button.append(top, stats);
+    fleet.append(button);
+  });
+
+  const compare = el("trainer-compare");
+  compare.innerHTML = "";
+  state.trainers.forEach((trainer) => {
+    const lab = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = state.compareTrainerIds.includes(trainer.id);
+    cb.addEventListener("change", () => {
+      if (cb.checked) state.compareTrainerIds.push(trainer.id);
+      else state.compareTrainerIds = state.compareTrainerIds.filter((id) => id !== trainer.id);
+      refreshCurve();
+    });
+    lab.append(cb, trainer.name);
+    compare.append(lab);
+  });
+}
+
+async function refreshTrainers() {
+  try {
+    const payload = await (await fetch("/api/trainers", { cache: "no-store" })).json();
+    const previous = state.trainerId;
+    renderTrainerFleet(payload);
+    return previous !== state.trainerId;
+  } catch (err) {
+    console.warn("trainer fleet refresh failed", err);
+    return false;
+  }
+}
+
+async function selectTrainer(id) {
+  if (!id || id === state.trainerId) return;
+  state.trainerId = id;
+  // Selecting a trainer means inspect that trainer. Comparison is an explicit
+  // separate action through the checkboxes/shortcuts; otherwise a previous
+  // island selection can make the graph appear unrelated to the selected log.
+  state.compareTrainerIds = [id];
+  resetChartView();
+  renderTrainerFleet({ primary: state.trainers[0]?.id, trainers: state.trainers });
+  await Promise.all([refreshCurve(), refreshTraining()]);
 }
 
 async function refreshCurve() {
   try {
     const keys = state.curveKeys.length ? state.curveKeys : state.ui.curve_default_keys;
-    const curve = await (await fetch(`/api/curve?keys=${encodeURIComponent(keys.join(","))}`)).json();
+    if (!state.trainerId && !state.compareTrainerIds.length) return;
+    el("curve-status").textContent = "loading…";
+    const selected = state.compareTrainerIds.length ? state.compareTrainerIds : [state.trainerId];
+    const query = selected.length > 1
+      ? `trainers=${encodeURIComponent(selected.join(","))}`
+      : `trainer=${encodeURIComponent(selected[0])}`;
+    const points = chartPointBudget();
+    const curve = await (await fetch(`/api/curve?${query}&points=${points}&keys=${encodeURIComponent(keys.join(","))}`, { cache: "no-store" })).json();
+    state.curve = curve;
     initCurveControls(curve.keys || []);
+    initChartInteractions();
     drawCurve(curve);
-    const runs = curve.runs > 1 ? ` · run ${curve.runs} of ${curve.runs} in the log (${curve.run_sizes.join("+")} generations)` : "";
+    const runs = !curve.multi && curve.runs > 1
+      ? ` · ${curve.runs} runs in the log (${curve.run_sizes.join("+")} generations)`
+      : "";
+    const compared = curve.multi ? ` · ${curve.trainers.length} trainers compared` : "";
     el("curve-heading").textContent =
-      `training · ${curve.generations.toLocaleString()} generations · ${curve.hours} h compute${runs}`;
+      `training · ${curve.generations.toLocaleString()} generations · ${curve.hours} h compute${compared}${runs}`;
+    el("curve-status").textContent = curve.generations ? "" : "no numeric training data";
   } catch (err) {
+    el("curve-status").textContent = "graph unavailable — retrying";
     console.warn("curve refresh failed", err);
   }
+}
+
+function redrawResponsiveCanvases() {
+  if (state.curve) drawCurve(state.curve);
+  if (state.training?.present) drawEndings(state.training.last);
+  if (state.frame) {
+    drawTrack(state.frame);
+    drawFly(state.frame);
+    drawEyes(state.frame);
+    drawControls(state.frame);
+  }
+}
+
+function watchCanvasResize() {
+  const observer = new ResizeObserver(() => redrawResponsiveCanvases());
+  ["curve-canvas", "ending-canvas", "eyes-canvas", "controls-canvas", "track-canvas", "raster-canvas"].forEach((id) => {
+    const canvas = el(id);
+    if (canvas) observer.observe(canvas);
+  });
 }
 
 /* ---------------------------------------------------------------- training */
@@ -747,7 +1251,8 @@ function renderTraining(t) {
 
 async function refreshTraining() {
   try {
-    renderTraining(await (await fetch("/api/training")).json());
+    if (!state.trainerId) return;
+    renderTraining(await (await fetch(`/api/training?trainer=${encodeURIComponent(state.trainerId)}`, { cache: "no-store" })).json());
   } catch (err) {
     console.warn("training refresh failed", err);
   }
@@ -799,6 +1304,14 @@ function initDrive() {
   }
   drive.load(state.track);
   state.drive = drive;
+  const toggle = el("camera-toggle");
+  if (toggle) {
+    toggle.onclick = () => {
+      const next = drive.mode === "cockpit" ? "chase" : "cockpit";
+      drive.setMode(next);
+      toggle.textContent = next === "cockpit" ? "chase view" : "cockpit view";
+    };
+  }
   const loop = () => {
     drive.render();
     requestAnimationFrame(loop);
@@ -879,12 +1392,17 @@ function onFrame(frame) {
 
   drawTrack(frame);
   drawRaster(frame);
+  drawFleet(frame);
   updateLists(frame);
   updateTelemetry(frame);
+  drawFly(frame);
   drawEyes(frame);
   drawControls(frame);
   updateFlyTelemetry(frame);
-  if (state.drive) state.drive.update(frame);
+  if (state.drive) {
+    state.drive.maxInputHz = state.meta.agent_cfg?.max_input_hz || 300;
+    state.drive.update(frame);
+  }
   if (state.brain && frame.mask) state.brain.applySpikes(decodeMask(frame.mask));
 
   const m = state.meta;
@@ -922,7 +1440,24 @@ function connect() {
     link().textContent = "live";
     link().className = "good";
   };
-  source.onmessage = (event) => onFrame(JSON.parse(event.data));
+  // The simulation streams every 16 ms control step. EventSource has no
+  // backpressure: when a frame takes longer to draw than the next takes to
+  // arrive, the backlog grows without bound and the page falls seconds behind
+  // (the "laggy map"). Keep only the newest frame and draw it on the next
+  // animation frame; each frame still carries the full state.
+  let pending = null;
+  let scheduled = false;
+  source.onmessage = (event) => {
+    pending = event.data;
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      const data = pending;
+      pending = null;
+      if (data) onFrame(JSON.parse(data));
+    });
+  };
   source.onerror = () => {
     link().textContent = "reconnecting";
     link().className = "bad";
@@ -947,13 +1482,22 @@ async function boot() {
   initFly();
   renderParams();
   drawTrack(null);
+  await refreshTrainers();
   await refreshCurve();
   await refreshTraining();
+  watchCanvasResize();
   setInterval(refreshCurve, state.ui.curve_refresh_ms);
   setInterval(refreshTraining, state.ui.training_refresh_ms);
+  setInterval(refreshTrainers, state.ui.training_refresh_ms);
+  el("trainer-select").addEventListener("change", (event) => selectTrainer(event.target.value));
+  el("trainer-refresh").addEventListener("click", async () => {
+    await refreshTrainers();
+    await Promise.all([refreshCurve(), refreshTraining()]);
+  });
   initDrive();
   initBrain();
   connect();
 }
 
+window.__malecns = state; // read-only diagnostics handle for the browser console
 boot();

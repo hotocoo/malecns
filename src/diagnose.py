@@ -150,8 +150,10 @@ def main(argv: list[str] | None = None) -> int:
 
     brain = Brain(connectome, batch=n_scn, config=LIFConfig(dt_ms=dt_ms, adapt_mv=args.adapt_mv), device=device, weight_scale=args.weight_scale)
     agent = ConnectomeAgent(brain, connectome.neurons, agent_config_from(state, substeps))
-    if state is not None and state["mu"].numel() == agent.n_params:
-        mu = state["mu"].to(device)
+    agent.load_readout(state)
+    if state is not None and state["mu"].reshape(-1, agent.n_params).shape[1] == agent.n_params and state["mu"].numel() % agent.n_params == 0:
+        # ES checkpoints hold one mean per island; diagnose island 0
+        mu = state["mu"].reshape(-1, agent.n_params)[0].to(device)
         source = f"{state['path']} generation {state['generation']}"
     else:
         mu = agent.initial_params().to(device)

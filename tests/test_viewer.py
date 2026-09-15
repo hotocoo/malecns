@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from build_positions import infer_missing  # noqa: E402
-from viewer import RASTER_QUOTA, curve_payload, stratified_sample  # noqa: E402
+from viewer import RASTER_QUOTA, curve_fleet_payload, curve_island_payload, curve_payload, json_safe, stratified_sample  # noqa: E402
 
 
 def test_stratified_sample_respects_quota_and_bands():
@@ -64,8 +64,30 @@ def test_curve_payload_downsamples_and_totals(tmp_path):
     assert curve["hours"] == 10.0
     assert curve["stride"] == 10
     assert len(curve["fitness"]) == 100
-    assert curve["fitness"][0] == 1.0 and curve["best"][-1] == 992.0
-    assert max(curve["laps"]) == 0.991
+    assert curve["fitness"][0] == 1.0 and curve["fitness"][-1] == 1000.0
+    assert curve["best"][-1] == 1001.0
+    assert max(curve["laps"]) == 1.0
+
+
+def test_curve_payload_keeps_all_runs_instead_of_only_latest(tmp_path):
+    log = tmp_path / "train.jsonl"
+    records = [
+        {"generation": 1, "fitness_best": 10.0, "seconds": 2.0},
+        {"generation": 2, "fitness_best": 20.0, "seconds": 2.0},
+        # Generation reset represents a trainer restart/resume.
+        {"generation": 1, "fitness_best": 30.0, "seconds": 3.0},
+        {"generation": 2, "fitness_best": 40.0, "seconds": 3.0},
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+    curve = curve_payload(log, points=20, keys=["fitness_best"])
+
+    assert curve["generations"] == 4
+    assert curve["runs"] == 2
+    assert curve["series"]["fitness_best"] == [10.0, 20.0, 30.0, 40.0]
+    assert curve["series_generation"]["fitness_best"] == [1, 2, 1, 2]
+    assert curve["series_axis"]["fitness_best"] == [1, 2, 4, 5]
+    assert curve["run_boundaries_axis"] == [4]
 
 
 def test_curve_payload_handles_missing_or_empty_log(tmp_path):
@@ -74,6 +96,159 @@ def test_curve_payload_handles_missing_or_empty_log(tmp_path):
     empty = tmp_path / "empty.jsonl"
     empty.write_text("\n\n")
     assert curve_payload(empty, 10)["generations"] == 0
+
+
+def test_curve_fleet_payload_combines_trainers(tmp_path):
+    logs = []
+    for name, offset in (("trainer_a.jsonl", 0.0), ("trainer_b.jsonl", 100.0)):
+        log = tmp_path / name
+        records = [
+            {"generation": g, "fitness_mean": g + offset, "fitness_best": g + offset + 1.0, "seconds": 2.0}
+            for g in range(1, 6)
+        ]
+        log.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        logs.append(log)
+
+    curve = curve_fleet_payload(logs, points=10, keys=["fitness_best"])
+
+    assert curve["multi"] is True
+    assert curve["trainers"] == ["trainer_a.jsonl", "trainer_b.jsonl"]
+    assert curve["series"]["trainer_a.jsonl: fitness_best"][-1] == 6.0
+    assert curve["series"]["trainer_b.jsonl: fitness_best"][-1] == 106.0
+    assert curve["series_generation"]["trainer_a.jsonl: fitness_best"] == [1, 2, 3, 4, 5]
+    assert curve["series_generation"]["trainer_b.jsonl: fitness_best"] == [1, 2, 3, 4, 5]
+
+
+def test_curve_island_payload_exposes_parallel_trainers(tmp_path):
+    log = tmp_path / "train.jsonl"
+    records = [
+        {
+            "generation": g,
+            "fitness_mean": float(g),
+            "fitness_best": float(g + 10),
+            "island_fitness_mean": [g, g + 100, g + 200],
+            "island_fitness_best": [g + 1, g + 101, g + 201],
+            "island_laps_best": [0.1 * g, 0.2 * g, 0.3 * g],
+            "seconds": 3.0,
+        }
+        for g in range(1, 6)
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+    curve = curve_island_payload(log, island=1, points=10, keys=["fitness_best"])
+
+    assert curve["generations"] == 5
+    assert curve["generation"] == [1, 2, 3, 4, 5]
+    assert curve["series"]["fitness_best"] == [102, 103, 104, 105, 106]
+
+
+def test_curve_island_payload_keeps_shared_scalar_telemetry(tmp_path):
+    log = tmp_path / "train.jsonl"
+    records = [
+        {
+            "generation": g,
+            "fitness_best": float(g + 10),
+            "island_fitness_mean": [g, g + 100],
+            "island_fitness_best": [g + 1, g + 101],
+            "sigma": 0.05 + g * 0.001,
+            "lr": 0.01,
+            "seconds": 2.0,
+        }
+        for g in range(1, 4)
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+    curve = curve_island_payload(log, island=1, points=10, keys=["fitness_best", "sigma", "lr"])
+
+    assert curve["series"]["fitness_best"] == [102, 103, 104]
+    assert curve["series"]["sigma"] == [0.051, 0.052, 0.053]
+    assert curve["series"]["lr"] == [0.01, 0.01, 0.01]
+    assert curve["series_generation"]["sigma"] == [1, 2, 3]
+
+
+def test_curve_island_payload_rejects_missing_island(tmp_path):
+    log = tmp_path / "train.jsonl"
+    log.write_text(json.dumps({"generation": 1, "island_fitness_mean": [1.0]}) + "\n")
+    curve = curve_island_payload(log, island=2, points=10)
+    assert curve["generations"] == 0
+
+
+def test_curve_island_payload_ignores_legacy_records_before_island_telemetry(tmp_path):
+    log = tmp_path / "train.jsonl"
+    records = [
+        {"generation": 1, "fitness_best": 1.0, "seconds": 2.0},
+        {"generation": 2, "fitness_best": 2.0, "seconds": 2.0},
+        {
+            "generation": 3,
+            "fitness_best": 3.0,
+            "island_fitness_mean": [3.0, 13.0],
+            "island_fitness_best": [4.0, 14.0],
+            "seconds": 2.0,
+        },
+        {
+            "generation": 4,
+            "fitness_best": 4.0,
+            "island_fitness_mean": [4.0, 14.0],
+            "island_fitness_best": [5.0, 15.0],
+            "seconds": 2.0,
+        },
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+    curve = curve_island_payload(log, island=1, points=10, keys=["fitness_best"])
+
+    assert curve["generations"] == 2
+    assert curve["generation"] == [3, 4]
+    assert curve["series"]["fitness_best"] == [14.0, 15.0]
+
+
+def test_curve_payload_preserves_nonfinite_values_as_json_null(tmp_path):
+    log = tmp_path / "train.jsonl"
+    records = [
+        {"generation": 1, "fitness_mean": float("nan"), "fitness_best": float("inf")},
+        {"generation": 2, "fitness_mean": 2.0, "fitness_best": 3.0},
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+    curve = curve_payload(log, points=10, keys=["fitness_mean", "fitness_best"])
+    decoded = json.loads(json.dumps(json_safe(curve), allow_nan=False))
+    assert decoded["series"]["fitness_mean"] == [None, 2.0]
+    assert decoded["series"]["fitness_best"] == [None, 3.0]
+
+
+def test_curve_payload_keeps_sparse_evaluations_on_their_generation_axis(tmp_path):
+    log = tmp_path / "train.jsonl"
+    records = []
+    for generation in range(1, 101):
+        record = {"generation": generation, "fitness_best": float(generation), "seconds": 1.0}
+        if generation in (10, 50, 100):
+            record["eval_fitness"] = generation + 0.5
+        records.append(record)
+    log.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+    curve = curve_payload(log, points=10, keys=["fitness_best", "eval_fitness"])
+
+    assert curve["series"]["eval_fitness"] == [10.5, 50.5, 100.5]
+    assert curve["series_generation"]["eval_fitness"] == [10, 50, 100]
+
+
+def test_curve_payload_caps_sparse_evaluations_to_point_budget(tmp_path):
+    log = tmp_path / "train.jsonl"
+    records = [
+        {"generation": generation, "fitness_best": float(generation), "eval_fitness": generation + 0.5, "seconds": 1.0}
+        for generation in range(1, 21)
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+    curve = curve_payload(log, points=5, keys=["eval_fitness"])
+
+    assert curve["series"]["eval_fitness"] == [16.5, 17.5, 18.5, 19.5, 20.5]
+    assert curve["series_generation"]["eval_fitness"] == [16, 17, 18, 19, 20]
+
+
+def test_json_safe_recurses_and_nulls_nonfinite_numbers():
+    payload = {"nan": float("nan"), "nested": [1.0, float("inf"), {"x": float("-inf")}]}
+    assert json_safe(payload) == {"nan": None, "nested": [1.0, None, {"x": None}]}
 
 
 def test_spike_mask_roundtrip_matches_browser_decoding():

@@ -250,7 +250,7 @@ def test_curriculum_stages_tighten():
     widths = [s[0] for s in CURRICULUM]
     steps = [s[1] for s in CURRICULUM]
     assert widths == sorted(widths, reverse=True) and widths[-1] == 1.0
-    assert steps == sorted(steps) and 1500 <= steps[0] and steps[-1] <= 3000
+    assert steps == sorted(steps) and 2000 <= steps[0] and steps[-1] <= 6000
 
 
 def test_track_bank_builds_wider_roads_for_early_stages():
@@ -329,8 +329,9 @@ def test_agent_loom_channel_responds_to_approach():
     params = agent.initial_params()
     theta = agent.unpack(params.unsqueeze(0))
     theta["loom_gain"] = torch.ones_like(theta["loom_gain"])
+    # road-relative eyes: 150 m reads as open road, 7.5 m as a wall closer than expected on every ray
     far = torch.cat([torch.ones(1, 9), torch.tensor([[0.5]])], dim=1)
-    near = torch.cat([torch.full((1, 9), 0.9), torch.tensor([[0.5]])], dim=1)
+    near = torch.cat([torch.full((1, 9), 0.05), torch.tensor([[0.5]])], dim=1)
     agent.reset()
     agent.sensory_rates(far, theta)
     approaching = agent.sensory_rates(near, theta)[0, :9]
@@ -353,3 +354,48 @@ def test_readout_keeps_a_steady_signal_and_is_not_saturated_at_init():
     steers = [float(agent.act(obs, theta)[0, 0]) for _ in range(12)]
     assert max(abs(s) for s in steers) < 0.95, "initial readout must not pin tanh"
     assert agent.fraction_at_bounds(agent.initial_params()) < 0.5
+
+
+# --- uncapped episodes -------------------------------------------------------------
+def test_episode_ends_as_finished_after_max_laps(loop_track):
+    from car_env import DONE_FINISH
+
+    cfg = replace_cfg(loop_track.cfg, max_laps=0.02)
+    env = CarEnv(1, CPU, cfg, track=loop_track)
+    env.reset()
+    done = drive(env, 0.0, 1.0, 400)
+    assert bool(done.all())
+    assert int(env.done_reason[0]) == DONE_FINISH
+    assert float(env.last_terms["alive"][0]) == 0.0
+    assert env.telemetry()["finished"] == 1
+
+
+def test_finishing_is_not_penalised_like_a_crash(loop_track):
+    cfg = replace_cfg(loop_track.cfg, max_laps=0.02)
+    env = CarEnv(1, CPU, cfg, track=loop_track)
+    env.reset()
+    reward = None
+    for _ in range(400):
+        _, reward, done = env.step(torch.tensor([[0.0, 1.0]]))
+        if bool(done.all()):
+            break
+    assert reward is not None and float(reward[0]) > -cfg.crash_penalty / 2
+
+
+def test_step_range_is_uncapped_by_default():
+    import defaults
+
+    assert len(defaults.step_range(0)) == defaults.EPISODE_HARD_CAP
+    assert len(defaults.step_range(-1)) == defaults.EPISODE_HARD_CAP
+    assert len(defaults.step_range(120)) == 120
+    from train import episode_cap
+
+    assert episode_cap(-1, 0) == 0, "-1 is the uncapped default"
+    assert episode_cap(0, 0) == CURRICULUM[0][1], "0 keeps the curriculum's caps"
+    assert episode_cap(777, 2) == 777
+
+
+def replace_cfg(cfg, **kw):
+    from dataclasses import replace
+
+    return replace(cfg, **kw)

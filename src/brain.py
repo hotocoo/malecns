@@ -134,6 +134,7 @@ class Brain:
         self.device = device or pick_device()
         self.n = connectome.n
         self.batch = batch
+        self.full_batch = batch  # `compact()` shrinks `batch`; `reset()` restores this
         self.roles = connectome.roles
         self.precision = precision or default_precision()
         if self.precision not in metal_lif.STATE_DTYPES:
@@ -210,19 +211,29 @@ class Brain:
         return self.metal is not None and self.gain is None
 
     def reset(self) -> None:
+        if self.batch != self.full_batch:
+            self._set_batch(self.full_batch)
         shape = (self.n, self.batch)
         # u = V - V_rest, so rest is zero and the leak is a plain multiply.
         self.u = torch.zeros(shape, device=self.device, dtype=self.state_dtype)
         self.j_syn = torch.zeros(shape, device=self.device, dtype=self.state_dtype)
         self.adapt = torch.zeros(shape, device=self.device, dtype=self.state_dtype)
-        self.last_fired = torch.zeros(shape, dtype=torch.bool, device=self.device)
         # The refractory counter is only stored when the period spans more than
         # one step; at one step the previous spike itself is the flag.
         self.refrac = torch.zeros(shape if self.ref_steps > 1 else (1, 1), device=self.device)
-        self.last_spikes = torch.zeros(shape, device=self.device)
-        self.spike_buffer = [
-            torch.zeros(shape, device=self.device) for _ in range(self.delay_steps)
-        ]
+        if self.uses_metal:
+            # Spikes live as bit masks on the Metal path; the dense float
+            # history is only built if `set_gain` switches to the torch path.
+            # At 3,072 bodies these three arrays alone were 4.6 GB per reset.
+            self.last_fired = None
+            self.last_spikes = None
+            self.spike_buffer = []
+        else:
+            self.last_fired = torch.zeros(shape, dtype=torch.bool, device=self.device)
+            self.last_spikes = torch.zeros(shape, device=self.device)
+            self.spike_buffer = [
+                torch.zeros(shape, device=self.device) for _ in range(self.delay_steps)
+            ]
         self.buf_pos = 0
         self.dn_acc = torch.zeros(self.batch, self.dn_index.numel() if self.dn_index is not None else 0, device=self.device)
         if self.metal is not None:
@@ -234,6 +245,69 @@ class Brain:
             # one byte per (neuron, word): every body at exactly zero state
             self.quiet = torch.ones(self.n * self.words, dtype=torch.uint8, device=self.device)
             self.written_slot = self.delay_steps % (self.delay_steps + 1)
+
+    def _set_batch(self, batch: int) -> None:
+        """Resize the per-body bookkeeping (word count, input scratch, kernel parameter caches)."""
+        self.batch = int(batch)
+        if self.metal is not None:
+            self.words = (self.batch + 31) // 32
+            self.no_ext = torch.zeros(1, self.batch, dtype=torch.float32, device=self.device)
+            self._ip_cache.clear()
+            self._rows_ip_cache.clear()
+            self._unpack_ip_cache.clear()
+
+    def compact(self, keep: torch.Tensor) -> None:
+        """Keep only the bodies where `keep` is True, in their current order.
+
+        The kernel's cost is proportional to the number of 32-body words, so
+        once most of a population has finished its episode the trainer packs
+        the survivors into the leading words and the rest of the episode runs
+        on a fraction of the state. Membrane, current and adaptation are
+        gathered per body; the spike ring is re-packed bit by bit; the
+        "any body spiked" prefilter stays as a superset and the quiet-word
+        flags are cleared (the kernel recomputes both on the next step).
+        `reset()` restores the full batch. With `shared_noise` the Poisson
+        draws do not depend on the body index, so a compacted body sees the
+        same input stream as before.
+        """
+        keep = keep.to(self.device, torch.bool)
+        if keep.numel() != self.batch:
+            raise ValueError(f"keep has {keep.numel()} entries for {self.batch} bodies")
+        idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
+        new_batch = int(idx.numel())
+        if new_batch == 0:
+            raise ValueError("compact() needs at least one surviving body")
+        if new_batch == self.batch:
+            return
+        self.u = self.u[:, idx]
+        self.j_syn = self.j_syn[:, idx]
+        self.adapt = self.adapt[:, idx]
+        if self.refrac.shape == (self.n, self.batch):
+            self.refrac = self.refrac[:, idx]
+        self.dn_acc = self.dn_acc[idx] if self.dn_acc.shape[1] else torch.zeros(new_batch, 0, device=self.device)
+        if self.gain is not None:
+            self.gain = self.gain[:, idx]
+        if self.uses_metal:
+            self.bits = self._gather_bits(self.bits, idx)
+            self.quiet = torch.zeros(self.n * ((new_batch + 31) // 32), dtype=torch.uint8, device=self.device)
+        else:
+            self.last_fired = self.last_fired[:, idx]
+            self.last_spikes = self.last_spikes[:, idx]
+            self.spike_buffer = [b[:, idx] for b in self.spike_buffer]
+        self._set_batch(new_batch)
+
+    def _gather_bits(self, bits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """(slots, n, words) bit masks -> the same for the bodies in `idx`, packed into consecutive bits."""
+        slots = bits.shape[0]
+        new_words = (idx.numel() + 31) // 32
+        out = torch.zeros((slots, self.n, new_words), dtype=torch.int32, device=self.device)
+        for w in range(new_words):
+            sel = idx[w * 32 : (w + 1) * 32]
+            src = bits[:, :, torch.div(sel, 32, rounding_mode="floor")]
+            bit = (src >> (sel % 32).to(torch.int32)) & 1
+            lanes = torch.arange(sel.numel(), dtype=torch.int32, device=self.device)
+            out[:, :, w] = (bit << lanes).sum(dim=-1, dtype=torch.int32)
+        return out
 
     @property
     def v(self) -> torch.Tensor:
@@ -278,6 +352,7 @@ class Brain:
             # Metal slots (written_slot - k) hold steps t-k. The torch path with
             # buf_pos 0 reads buffer[0] as the oldest (step t+1-d) and buffer[d-1]
             # as the newest (step t).
+            self.spike_buffer = [None] * d
             for k in range(d):
                 self.spike_buffer[d - 1 - k] = self._unpack_all((self.written_slot - k) % ring).t().contiguous()
             self.last_spikes = self.spike_buffer[d - 1]

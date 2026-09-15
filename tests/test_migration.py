@@ -98,7 +98,7 @@ def test_readout_from_another_configuration_is_reset(agent):
         assert torch.equal(theta["ray_gain"][0], torch.full((9,), 2.0))
         # w_out is drawn fresh (small random), b_out is the fixed init: neither is the saved 2.0
         assert float(theta["w_out"][0].abs().mean()) < 0.3 and not (theta["w_out"][0] == 2.0).any()
-        assert torch.equal(theta["b_out"][0], torch.tensor([0.0, 0.5]))
+        assert torch.equal(theta["b_out"][0], torch.tensor([0.0, 0.3]))
         assert any("w_out" in n and "reset" in n for n in notes)
         assert float(momentum.abs().sum()) == 0.0
 

@@ -13,6 +13,7 @@
   <section class="stage" aria-label="Live simulation">
     <div class="stage-bar">
       <span class="tag" id="stage-title">loading</span>
+      <button class="tag button" id="camera-toggle" type="button" title="switch between chase camera and the fly's cockpit">cockpit view</button>
       <span class="tag right" id="stage-generation"></span>
     </div>
     <div class="stage-grid">
@@ -31,6 +32,10 @@
           <canvas id="brain-canvas"></canvas>
           <figcaption class="hint" id="brain-meta"></figcaption>
         </figure>
+        <figure class="view fleet-view">
+          <span class="view-label" id="fleet-label"></span>
+          <canvas id="fleet-canvas" title="click a row to follow that car"></canvas>
+        </figure>
         <figure class="view spike-view">
           <span class="view-label" id="raster-label"></span>
           <canvas id="raster-canvas"></canvas>
@@ -48,6 +53,10 @@
     <section class="panel fly-panel" aria-labelledby="fly-heading">
       <h2 id="fly-heading"></h2>
       <div class="fly-grid">
+          <figure class="fly-cell fp-cell">
+            <canvas id="fp-canvas"></canvas>
+            <figcaption id="fp-caption"></figcaption>
+          </figure>
         <figure class="fly-cell">
           <canvas id="eyes-canvas"></canvas>
           <figcaption id="eyes-caption"></figcaption>
@@ -76,10 +85,42 @@
       </div>
     </section>
 
-    <section class="panel" aria-labelledby="curve-heading">
+    <section class="panel curve" aria-labelledby="curve-heading">
       <h2 id="curve-heading"></h2>
+      <div class="trainer-toolbar">
+        <div>
+          <span class="toolbar-label">trainer fleet</span>
+          <span class="toolbar-note" id="trainer-fleet-note"></span>
+        </div>
+        <div class="trainer-actions">
+          <select id="trainer-select" aria-label="Select trainer"></select>
+          <button id="trainer-refresh" type="button">refresh</button>
+        </div>
+      </div>
+      <div class="trainer-fleet" id="trainer-fleet"></div>
+      <div class="trainer-quick-actions" id="trainer-quick-actions" aria-label="Trainer selection shortcuts">
+        <button type="button" data-trainers="all">all</button>
+        <button type="button" data-trainers="best2">best 2</button>
+        <button type="button" data-trainers="none">none</button>
+      </div>
+      <div class="trainer-compare" id="trainer-compare" aria-label="Trainer comparison"></div>
       <div class="curve-controls" id="curve-controls"></div>
-      <canvas id="curve-canvas"></canvas>
+      <div class="chart-toolbar" aria-label="Graph controls">
+        <span class="chart-data-note" id="chart-data-note"></span>
+        <div class="chart-actions">
+          <button type="button" data-chart-action="fit">fit all</button>
+          <button type="button" data-chart-action="zoom-out">−</button>
+          <button type="button" data-chart-action="zoom-in">+</button>
+          <button type="button" data-chart-action="reset">reset</button>
+          <button type="button" data-chart-action="fullscreen">expand</button>
+        </div>
+      </div>
+      <div class="chart-shell">
+        <canvas id="curve-canvas"></canvas>
+        <div class="chart-overlay" id="chart-overlay" aria-live="polite"></div>
+        <div class="chart-status" id="curve-status" aria-live="polite"></div>
+      </div>
+      <div class="chart-legend" id="chart-legend" aria-label="Graph legend"></div>
       <div class="training-grid">
         <div>
           <h3 id="training-status-heading"></h3>

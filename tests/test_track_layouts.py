@@ -114,3 +114,32 @@ def test_completing_a_lap_pays_the_bonus():
     assert float(env.laps[0]) >= 1.0
     assert float(reward[0]) > cfg.lap_bonus * 0.9
     assert n > 0
+
+
+@needs_monaco
+def test_monaco_track_carries_the_surveyed_grade_and_gravity_acts_on_the_car():
+    """With `monaco_dem.json` beside the circuit the track climbs and a coasting car rolls downhill."""
+    from pathlib import Path as _P
+
+    if not _P("data/tracks/monaco_dem.json").exists():
+        pytest.skip("run src/fetch_terrain.py first")
+    cfg = monaco_config(0.016)
+    track = Track(build_centerline(cfg), cfg, CPU)
+    assert track.height is not None and 35.0 <= track.climb_m <= 65.0
+    grade = track.grade
+    assert 0.05 < float(grade.abs().max()) < 0.2, "Monaco's steepest stretch is a real hill, not a cliff"
+    # the same car coasting from the same speed: downhill it gains on the flat-world twin
+    steep = int(grade.argmin())  # most downhill sample (grade < 0 means descending along the lap)
+    flat_cfg = CarConfig(**{**cfg.__dict__, "road_grade": False})
+    flat = Track(build_centerline(flat_cfg), flat_cfg, CPU)
+    assert float(flat.grade.abs().max()) == 0.0
+    speeds = []
+    for tr, c in ((track, cfg), (flat, flat_cfg)):
+        env = CarEnv(1, CPU, c, track=tr, start_fraction=[steep / tr.centerline.shape[0]])
+        env.reset()
+        env.speed[:] = 15.0
+        for _ in range(25):  # 0.4 s of coasting
+            env.step(torch.tensor([[0.0, 0.0]]))
+        speeds.append(float(env.speed[0]))
+    # g * grade * t at a ~15 % grade over 0.4 s is ~0.6 m/s
+    assert speeds[0] > speeds[1] + 0.3, f"downhill {speeds[0]:.2f} m/s should beat flat {speeds[1]:.2f} m/s"
