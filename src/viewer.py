@@ -75,6 +75,11 @@ FRAME_SCHEMA: list[dict] = [
     {"key": "reward_bonus", "label": "lap bonus", "unit": "", "group": "reward", "digits": 1},
     {"key": "reward_wall", "label": "wall term", "unit": "", "group": "reward", "digits": 3, "bipolar": True},
     {"key": "reward_time", "label": "time tax", "unit": "", "group": "reward", "digits": 3, "bipolar": True},
+    {"key": "reward_pace", "label": "pace term (below road's reference speed)", "unit": "", "group": "reward", "digits": 3, "bipolar": True},
+    {"key": "reward_align", "label": "alignment term (heading vs road ahead)", "unit": "", "group": "reward", "digits": 3, "bipolar": True},
+    {"key": "pace", "label": "pace: speed / reference speed here", "unit": "x", "group": "body", "digits": 2},
+    {"key": "align_deg", "label": "heading error to road ahead", "unit": "deg", "group": "body", "digits": 1, "bipolar": True},
+    {"key": "speed_ref", "label": "reference speed here", "unit": "km/h", "group": "body", "digits": 0, "scale": "kmh"},
     {"key": "episode_return", "label": "episode return", "unit": "", "group": "reward", "digits": 2, "bipolar": True},
     {"key": "spiking", "label": "neurons spiking this step", "unit": "", "group": "brain", "digits": 0},
     {"key": "brain_ms", "label": "brain solve", "unit": "ms/step", "group": "sim", "digits": 1},
@@ -362,7 +367,7 @@ class Source:
         return ids
 
     # --- track and scenery -------------------------------------------------------------
-    def build_track(self, layout: str, geojson: str, start_fraction: float, dt_s: float, halfwidth: float | None = None) -> None:
+    def build_track(self, layout: str, geojson: str, start_fraction: float, dt_s: float, halfwidth: float | None = None, episode_steps: int = 0) -> None:
         if layout == "monaco":
             self.car_cfg = replace(monaco_config(dt_s, halfwidth=halfwidth), geojson_path=geojson)
             centerline, self.projection = load_geojson_centerline(
@@ -376,10 +381,18 @@ class Source:
             centerline = build_centerline(self.car_cfg, self.args.track)
             self.track_name = f"procedural loop {self.args.track}"
             self.track_props = {"seed": self.args.track}
+        # The trainer's step budget (from the checkpoint's `car_cfg`): the crash
+        # cost shown here then matches what training charged for the same ending.
+        self.car_cfg = replace(self.car_cfg, episode_steps=max(0, int(episode_steps)))
         self.track = Track(centerline, self.car_cfg, self.device)
         cars = getattr(self, "cars", 1)
         fractions = [(start_fraction + k / cars) % 1.0 for k in range(cars)]
         self.env = CarEnv(cars, self.device, self.car_cfg, track=self.track, start_fraction=fractions)
+        # Read once here, on the thread that owns the GPU: /api/track is served
+        # from HTTP threads and a device->host read there ran Metal from two
+        # threads at once (command-buffer assertion, viewer down).
+        self.start_index0 = int(self.env.start_index[0])
+        self.centerline_np = self.track.centerline.cpu().numpy()
         self.layout = layout
         scenery_path = Path(self.args.scenery) if self.args.scenery else Path(geojson).with_name(Path(geojson).stem + "_scenery.geojson")
         if layout == "monaco" and self.projection is not None and scenery_path.exists():
@@ -444,7 +457,7 @@ class Source:
         )
 
     def track_payload(self) -> dict:
-        centerline = self.track.centerline.cpu().numpy()
+        centerline = self.centerline_np  # host copy: no GPU read on the HTTP thread
         cfg = self.car_cfg
         stride = self.config.track_stride
         return {
@@ -458,8 +471,8 @@ class Source:
             "urban": self.layout == "monaco",
             "length_m": round(self.track.length_m, 1),
             "min_radius_m": round(self.track.min_radius_m, 1),
-            "start_index": int(self.env.start_index[0]) // stride,
-            "start_fraction": float(self.env.start_index[0]) / centerline.shape[0],
+            "start_index": self.start_index0 // stride,
+            "start_fraction": self.start_index0 / centerline.shape[0],
             "n_rays": cfg.n_rays,
             "fov_deg": cfg.fov_deg,
             "max_range": cfg.max_range,
@@ -600,7 +613,8 @@ class Simulation(Source):
         halfwidth = None
         if state and "car_cfg" in state and args.follow_curriculum:
             halfwidth = float(state["car_cfg"].get("track_halfwidth"))
-        self.build_track(args.layout, args.geojson, args.track / args.starts, dt_s, halfwidth)
+        budget = int(state["car_cfg"].get("episode_steps", 0)) if state and "car_cfg" in state else 0
+        self.build_track(args.layout, args.geojson, args.track / args.starts, dt_s, halfwidth, budget)
         self.sample = torch.tensor(self.sample_np, dtype=torch.long, device=self.device)
 
         self.mu = self.agent.initial_params().to(self.device)
@@ -670,9 +684,10 @@ class Simulation(Source):
             print(f"[viewer] {self.checkpoint_note}")
         if self.args.follow_curriculum and "car_cfg" in state:
             hw = float(state["car_cfg"].get("track_halfwidth"))
-            if abs(hw - self.car_cfg.track_halfwidth) > 1e-6:
+            budget = int(state["car_cfg"].get("episode_steps", 0))
+            if abs(hw - self.car_cfg.track_halfwidth) > 1e-6 or budget != self.car_cfg.episode_steps:
                 dt_s = defaults.control_dt_s(self.dt_ms, self.substeps)
-                self.build_track(self.args.layout, self.args.geojson, self.args.track / self.args.starts, dt_s, hw)
+                self.build_track(self.args.layout, self.args.geojson, self.args.track / self.args.starts, dt_s, hw, budget)
                 print(f"[viewer] curriculum road half-width now {hw:.2f} m; reload the page for the new track mesh")
         return True
 
@@ -903,6 +918,11 @@ class Simulation(Source):
                 terms["bonus"][k : k + 1],
                 terms["wall"][k : k + 1],
                 terms["time_tax"][k : k + 1],
+                terms["pace"][k : k + 1],
+                env.speed[k : k + 1] / terms["speed_ref"][k : k + 1].clamp(min=1.0),
+                terms["speed_ref"][k : k + 1],
+                terms["align"][k : k + 1],
+                terms["align_err"][k : k + 1] * (180.0 / math.pi),
                 terms["clearance"][k : k + 1],
                 self.agent.last_motor[k],
                 self.agent.dn_rate_hz[k].mean().reshape(1),
@@ -913,7 +933,7 @@ class Simulation(Source):
             ]
         )
         v = packed.to("cpu").numpy().round(4).tolist()
-        k = 19  # fixed scalars above, then lidar, sensory rates (rays + speed channel), eye proximity, looming
+        k = 24  # fixed scalars above, then lidar, sensory rates (rays + speed channel), eye proximity, looming
         lidar = v[k : k + n_rays]
         rates = v[k + n_rays : k + 2 * n_rays + 1]
         proximity = v[k + 2 * n_rays + 1 : k + 3 * n_rays + 1]
@@ -935,10 +955,15 @@ class Simulation(Source):
             "reward_bonus": v[12],
             "reward_wall": v[13],
             "reward_time": v[14],
-            "clearance": v[15],
-            "motor_steer": v[16],
-            "motor_pedal": v[17],
-            "dn_hz": v[18],
+            "reward_pace": v[15],
+            "pace": v[16],
+            "speed_ref": v[17],
+            "reward_align": v[18],
+            "align_deg": v[19],
+            "clearance": v[20],
+            "motor_steer": v[21],
+            "motor_pedal": v[22],
+            "dn_hz": v[23],
             "lidar": lidar,
             "sensory_hz": rates[:n_rays],
             "speed_hz": rates[n_rays] if len(rates) > n_rays else 0.0,

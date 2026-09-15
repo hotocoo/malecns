@@ -246,6 +246,12 @@ export class DriveView {
     // fleet: one mesh per simulated car (car k at fleet[k]); the camera follows frame.follow
     this.fleet = [];
     this.fleetSize = 1;
+    // displayed pose per car: eased towards the latest simulated pose and
+    // dead-reckoned between frames (see _smoothPose)
+    this.smooth = [];
+    this.frameTime = performance.now();
+    this.lastStep = null;
+    this.simRate = 1.0; // simulated seconds per wall second, measured from frame arrivals
     this.mode = "chase";
     this.roll = 0;
     this.rig = new FlyRig(style); // the driver, seated in the followed car (see _seatDriver)
@@ -570,15 +576,26 @@ export class DriveView {
   update(frame) {
     this.frame = frame;
     if (frame.fleet && frame.fleet.length !== this.fleetSize) this.setFleetSize(frame.fleet.length);
+    const now = performance.now();
+    if (this.lastStep !== null && frame.step > this.lastStep && now > this.frameTime) {
+      // With the GPU shared with the trainer the simulation runs well below
+      // real time; dead reckoning at the simulated speed must use this rate
+      // or the car runs ahead of every frame and is pulled back by the next.
+      const rate = ((frame.step - this.lastStep) * (frame.control_dt_s || 0.016)) / ((now - this.frameTime) / 1000);
+      this.simRate += (Math.min(1.5, rate) - this.simRate) * 0.2;
+    }
+    this.lastStep = frame.step;
+    this.frameTime = now;
     if (frame.fleet) {
       frame.fleet.forEach((car, k) => {
         const mesh = this.fleet[k];
         if (!mesh) return;
-        poseCar(mesh, this.frames, car.pos[0], car.pos[1], car.heading, this.track.car.length);
+        this._setTarget(k, car.pos[0], car.pos[1], car.heading, car.speed || 0, car.done_reason || 0);
         mesh.visible = true;
       });
       this._seatDriver(this.fleet[frame.follow]);
     } else {
+      this._setTarget(0, frame.pos[0], frame.pos[1], frame.heading, frame.speed || 0, frame.done_reason || 0);
       this._seatDriver(this.car);
     }
     const { n_rays, fov_deg, max_range } = this.track;
@@ -603,6 +620,43 @@ export class DriveView {
     color.needsUpdate = true;
   }
 
+  _setTarget(k, x, y, heading, speed, done) {
+    const prev = this.smooth[k];
+    const snapM = this.style.pose_snap_m || 8;
+    const jump = !prev || Math.hypot(prev.tx - x, prev.ty - y) > snapM;
+    if (!prev || jump) {
+      // first frame or a reset: snap, no glide across the map
+      this.smooth[k] = { x, y, heading, tx: x, ty: y, th: heading, speed, done, t: this.frameTime };
+      return;
+    }
+    prev.tx = x;
+    prev.ty = y;
+    prev.th = heading;
+    prev.speed = done ? 0 : speed;
+    prev.done = done;
+    prev.t = this.frameTime;
+  }
+
+  /* Frames arrive at the simulation's pace (well below the display rate when the
+   * GPU is shared with the trainer) and unevenly. Snapping the car to each new
+   * pose while the camera eased made it look as if it shifted forward and back.
+   * The displayed pose dead-reckons from the last simulated pose at the
+   * simulated speed and heading, and eases towards it. */
+  _smoothPose(k, now, dt) {
+    const s = this.smooth[k];
+    if (!s) return null;
+    const ahead = Math.min(0.25, Math.max(0, ((now - s.t) / 1000) * this.simRate));
+    const gx = s.tx + Math.cos(s.th) * s.speed * ahead;
+    const gy = s.ty + Math.sin(s.th) * s.speed * ahead;
+    const ease = 1 - Math.exp(-dt * 18);
+    s.x += (gx - s.x) * ease;
+    s.y += (gy - s.y) * ease;
+    let dh = s.th - s.heading;
+    dh = Math.atan2(Math.sin(dh), Math.cos(dh));
+    s.heading += dh * ease;
+    return s;
+  }
+
   resize() {
     const canvas = this.canvas;
     const ratio = Math.min(window.devicePixelRatio || 1, 2);
@@ -624,12 +678,19 @@ export class DriveView {
     this.lastTime = now;
 
     const f = this.frame;
-    const heading = f ? f.heading : 0;
-    const [sx, sy] = f ? f.pos : [this.track.centerline[0][0], this.track.centerline[0][1]];
+    const followIndex = f && f.fleet ? f.follow : 0;
+    this.fleet.forEach((mesh, k) => {
+      const sp = this._smoothPose(k, now, dt);
+      if (sp && mesh.visible) poseCar(mesh, this.frames, sp.x, sp.y, sp.heading, this.track.car.length);
+    });
+    if (this.fleet.length === 0) this._smoothPose(0, now, dt);
+    const sp = this.smooth[followIndex];
+    const heading = sp ? sp.heading : f ? f.heading : 0;
+    const [sx, sy] = sp ? [sp.x, sp.y] : f ? f.pos : [this.track.centerline[0][0], this.track.centerline[0][1]];
     const roadH = roadHeightAt(this.frames, sx, sy);
     const carPos = toWorld(sx, sy, roadH);
     const followed = (f && this.fleet[f.follow]) || this.car;
-    if (!f || !f.fleet) poseCar(followed, this.frames, sx, sy, heading, this.track.car.length);
+    if (this.fleet.length === 0 && sp) poseCar(followed, this.frames, sx, sy, heading, this.track.car.length);
 
     if (f) {
       // wheel spin from the simulated speed and the configured tyre radius

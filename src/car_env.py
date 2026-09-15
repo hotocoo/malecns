@@ -111,9 +111,22 @@ class CarConfig:
     progress_per_m: float = 0.10
     lap_bonus: float = 100.0
     time_tax: float = 0.02
-    wall_margin: float = 1.5
+    # 0.75 m from the body's edge: an 11 m road leaves 4.5 m of clearance at
+    # the centre, and a Monaco line clips barriers at arm's length. The old
+    # 1.5 m margin taxed the outer 3 m of usable road and kept the apex out of
+    # reach; 0.75 m still gives the search a gradient before the crash cliff.
+    wall_margin: float = 0.75
     wall_penalty: float = 0.03
     crash_penalty: float = 20.0
+    # Step budget the caller runs the episode for (0 = uncapped). With a budget
+    # a car that ends early (crash, reverse, stuck) is treated as standing still
+    # for the steps it did not drive: it is charged the time tax plus the full
+    # pace penalty for each of them (`crash_cost` in `last_terms`). No survivor
+    # pays more per step than that, so dying never scores above driving on;
+    # only finishing the lap early saves any of the budget. Before this a car
+    # holding 36 km/h for 12,000 steps scored -75 while one crashing on step
+    # 400 scored -28, and evolution was paid for the crash.
+    episode_steps: int = 0
     # Speed penalty, (speed/max_speed)^2 per step. Off by default: the goal is
     # the fastest clean lap, and crashes already cost `crash_penalty` plus the
     # progress not made. At 0.05 it charged a 60 m/s straight as much as the
@@ -126,6 +139,25 @@ class CarConfig:
     # and above half-lock, so normal cornering and low-speed hairpins retain
     # their steering authority while a stationary steering attractor becomes
     # visibly worse than centering and accelerating out.
+    # Pace: below `pace_margin` of the reference speed the road allows at the
+    # car's position (`Track.speed_ref`: the fastest this vehicle's grip circle,
+    # power, drag and brakes can pass each centerline sample, see
+    # `speed_profile`) a quadratic deficit is charged per step. Progress pays
+    # for speed everywhere alike; this charges slowness only where there is
+    # room to go faster (straights, corner exits), where a 56 km/h cruise on a
+    # 250 km/h straight used to cost nothing beyond the flat time tax. A car
+    # standing still pays `pace_penalty` per step, the most any survivor pays.
+    pace_penalty: float = 0.04
+    pace_margin: float = 0.9
+    # Alignment: heading error to a look-ahead point on the centerline,
+    # max(`align_lookahead_m`, `align_lookahead_s` of travel) ahead. Graded, not
+    # a fixed fee: 0 when pointed at it, one `align_penalty` at 90 degrees off,
+    # twice that facing backwards, so steering 0.8 of what a corner needs is
+    # paid between steering it fully and not at all. The look-ahead grows with
+    # speed, so an apex a few metres off the centerline costs a few degrees.
+    align_penalty: float = 0.03
+    align_lookahead_m: float = 15.0
+    align_lookahead_s: float = 1.0
     stall_speed_mps: float = 5.0
     stall_steer_start: float = 0.5
     stall_steer_penalty: float = 0.12
@@ -236,6 +268,56 @@ def curvature_radius(points: np.ndarray, span_m: float = 6.0) -> np.ndarray:
     cross = np.abs(ab[:, 0] * bc[:, 1] - ab[:, 1] * bc[:, 0])
     lengths = np.linalg.norm(ab, axis=1) * np.linalg.norm(bc, axis=1) * np.linalg.norm(ac, axis=1)
     return lengths / np.maximum(2 * cross, 1e-9)
+
+
+def speed_profile(centerline: np.ndarray, cfg: CarConfig, grade: np.ndarray | None = None) -> np.ndarray:
+    """Quasi-steady reference speed (m/s) at every centerline sample.
+
+    The fastest a car with `cfg`'s grip circle, power, drag and brakes can pass
+    each point of the *centerline*: cornering speed from the speed-dependent
+    grip envelope, a backward pass for braking zones and a forward pass for
+    traction-limited acceleration, each run twice round the loop so the lap
+    closes. The racing line is wider than the centerline, so this is a little
+    conservative; `lap_time_ref_s` from it is the model's own pole-lap estimate.
+    """
+    p = np.asarray(centerline, dtype=np.float64)
+    n = len(p)
+    seg = np.hypot(*(np.roll(p, -1, axis=0) - p).T)
+    radius = np.clip(curvature_radius(p), 1.0, 1e5)
+    slope = np.zeros(n) if grade is None else np.asarray(grade, dtype=np.float64)
+    a_slope = -G * slope / np.sqrt(1.0 + slope * slope)  # along the road, downhill positive
+    m, a, vr, gmax = cfg.grip_mech_g, cfg.grip_aero_g, cfg.grip_v_ref, cfg.grip_max_g
+    # v^2 = grip(v) g R with grip = m + a (v / vr)^2 has the closed form below while k R < 1.
+    k = a * G / vr**2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        corner = np.where(k * radius < 1.0, np.sqrt(m * G * radius / np.maximum(1.0 - k * radius, 1e-9)), np.inf)
+    v = np.minimum(np.minimum(corner, np.sqrt(gmax * G * radius)), cfg.max_speed)
+
+    def grip(speed: float) -> float:
+        return min(m + a * (speed / vr) ** 2, gmax) * G
+
+    def drag(speed: float) -> float:
+        return 0.5 * 1.225 * cfg.cda_m2 * speed * speed / cfg.mass_kg + cfg.roll_decel
+
+    for _ in range(2):  # braking: v[i] must be able to slow to v[i+1] over seg[i]
+        for i in range(n - 1, -1, -1):
+            j = (i + 1) % n
+            vj = v[j]
+            g_total = grip(vj)
+            a_lat = vj * vj / radius[j]
+            a_brake = np.sqrt(max(g_total**2 - a_lat**2, 0.0)) + drag(vj) - a_slope[j]
+            v[i] = min(v[i], np.sqrt(max(vj * vj + 2.0 * max(a_brake, 0.5) * seg[i], 0.0)))
+    for _ in range(2):  # traction: v[i+1] cannot exceed what v[i] can accelerate to over seg[i]
+        for i in range(n):
+            j = (i + 1) % n
+            vi = max(v[i], 1.0)
+            g_total = grip(vi)
+            traction = cfg.traction_g * G * (g_total / (cfg.grip_mech_g * G))
+            a_power = min(cfg.power_w / (cfg.mass_kg * vi), traction)
+            a_long_cap = np.sqrt(max(g_total**2 - (vi * vi / radius[i]) ** 2, 0.0))
+            a_acc = min(a_power, a_long_cap) - drag(vi) + a_slope[i]
+            v[j] = min(v[j], np.sqrt(max(vi * vi + 2.0 * max(a_acc, 0.0) * seg[i], 1.0)))
+    return np.clip(v, 1.0, cfg.max_speed)
 
 
 @dataclass(frozen=True)
@@ -353,6 +435,15 @@ class Track:
         self.clearance = (cfg.track_halfwidth - nearest_d).reshape(res, res)
         self.drivable = self.clearance > 0
         self.progress = (nearest_i.float() / self.centerline.shape[0]).reshape(res, res)
+        # Sub-sample progress: nearest sample per cell plus the unit tangent per
+        # sample, so `progress_at` projects a point onto the local centerline
+        # direction. Paying by nearest sample alone paid in 1.6 m steps (one
+        # sample spacing on Monaco): most control steps paid nothing, then one
+        # paid 0.16, which also read as "reward while stationary" to the monitor.
+        self.nearest = nearest_i.to(torch.int32).reshape(res, res)
+        tangent = self.centerline.roll(-1, dims=0) - self.centerline.roll(1, dims=0)
+        self.tangent = tangent / tangent.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        self.spacing_m = float((self.centerline.roll(-1, dims=0) - self.centerline).norm(dim=1).mean())
         self.cell = 2 * extent / (res - 1)
         self.min_radius_m = float(curvature_radius(self.centerline.cpu().numpy()).min())
         # Surveyed height and slope per sample (None on a flat world): the
@@ -367,6 +458,11 @@ class Track:
                 self.height = torch.tensor(heights, dtype=torch.float32, device=device)
                 self.grade = torch.tensor(grade_of(heights, self.centerline.cpu().numpy()), dtype=torch.float32, device=device)
         self.climb_m = float(self.height.max() - self.height.min()) if self.height is not None else 0.0
+        # Reference speed per sample (`speed_profile`) and the lap time it implies:
+        # what the pace term measures the car against, and the model's own pole lap.
+        profile = speed_profile(self.centerline.cpu().numpy(), cfg, self.grade.cpu().numpy())
+        self.speed_ref = torch.tensor(profile, dtype=torch.float32, device=device)
+        self.lap_time_ref_s = float(np.sum(np.hypot(*(np.roll(self.centerline.cpu().numpy(), -1, axis=0) - self.centerline.cpu().numpy()).T) / profile))
 
     @property
     def extent(self) -> float:
@@ -413,8 +509,15 @@ class Track:
         return self.clearance_at(xy) > margin
 
     def progress_at(self, xy: torch.Tensor) -> torch.Tensor:
+        """Lap fraction in [0, 1): nearest centerline sample plus the signed offset along its tangent."""
         row, col = self._cell_index(xy)
-        return self.progress[row, col]
+        index = self.nearest[row, col].long()
+        along = ((xy - self.centerline[index]) * self.tangent[index]).sum(dim=-1) / self.spacing_m
+        n = self.centerline.shape[0]
+        # The nearest sample is looked up per grid cell, so a point can sit up to a
+        # cell's half-diagonal past the sample's midline; allow the offset to run
+        # past the neighbouring samples and only bound it for points far off road.
+        return torch.remainder(index.float() + along.clamp(-2.0, 2.0), n) / n
 
 
 class CarEnv:
@@ -631,6 +734,18 @@ class CarEnv:
     def step(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """action: (batch, 2) = steer in [-1,1], pedal in [-1,1]. Returns (obs, reward, done)."""
         cfg = self.cfg
+        # Cars that already ended are frozen: pose, speed and lap count stay at
+        # the ending step (a crashed car does not slide on; its lap count read
+        # at any later poll equals the one read at death), reward is 0 and done
+        # stays set. `reset(mask)` is the only way back.
+        was_done = self.done_reason != DONE_ALIVE
+        frozen = {
+            name: getattr(self, name)
+            for name in (
+                "pos", "heading", "speed", "steer", "lat_g", "laps", "best_laps", "last_progress",
+                "anchor_laps", "anchor_step", "step_count", "done_reason", "prev_pos", "prev_heading",
+            )
+        }
         self.prev_pos = self.pos
         self.prev_heading = self.heading
         self._drive(action)
@@ -683,7 +798,18 @@ class CarEnv:
         low_speed = torch.relu(1.0 - self.speed / cfg.stall_speed_mps)
         steer_excess = torch.relu(self.steer.abs() / cfg.max_steer_rad - cfg.stall_steer_start)
         stall_term = -cfg.stall_steer_penalty * low_speed * steer_excess * steer_excess
-        reward = progress_term + bonus_term + wall_term + speed_term + stall_term - cfg.time_tax
+        n_ref = self.track.speed_ref.shape[0]
+        speed_ref = self.track.speed_ref[(self.last_progress * n_ref).long().clamp(0, n_ref - 1)]
+        pace_deficit = torch.relu(1.0 - self.speed / (cfg.pace_margin * speed_ref).clamp(min=1.0))
+        pace_term = -cfg.pace_penalty * pace_deficit * pace_deficit
+        ref_index = (self.last_progress * n_ref).long().clamp(0, n_ref - 1)
+        lookahead_m = torch.maximum(torch.full_like(self.speed, cfg.align_lookahead_m), self.speed * cfg.align_lookahead_s)
+        ahead = (lookahead_m / self.track.spacing_m).clamp(min=1.0).long()
+        to_target = self.track.centerline[(ref_index + ahead) % n_ref] - self.pos
+        align_err = torch.atan2(to_target[:, 1], to_target[:, 0]) - self.heading
+        align_err = torch.atan2(align_err.sin(), align_err.cos())
+        align_term = -cfg.align_penalty * (1.0 - align_err.cos())
+        reward = progress_term + bonus_term + wall_term + speed_term + stall_term + pace_term + align_term - cfg.time_tax
         # Keep the terminal event a fixed cost. Making the crash penalty depend
         # on impact speed adds a large, orthogonal gradient whose easiest local
         # solution is to slow down rather than learn the steering response.
@@ -692,18 +818,39 @@ class CarEnv:
         # upward and progress collapsed. Speed is already shaped continuously
         # by `speed_penalty`; the terminal event should not double-count it.
         # Finishing is not a crash: the last step is paid normally.
-        reward = torch.where(alive | finished, reward, torch.full_like(reward, -cfg.crash_penalty))
+        # Under a step budget an ended car is charged as if it stood still for
+        # the unused steps (time tax plus full pace penalty each), so no early
+        # ending scores above driving on; finishing the lap early is the only
+        # way to save any of the budget.
+        if cfg.episode_steps > 0:
+            remaining = (cfg.episode_steps - self.step_count).clamp(min=0).to(reward.dtype)
+        else:
+            remaining = torch.zeros_like(reward)
+        crash_cost = cfg.crash_penalty + (cfg.time_tax + cfg.pace_penalty + cfg.align_penalty) * remaining
+        reward = torch.where(alive | finished, reward, -crash_cost)
         # A crashed car stays at its last legal pose: the crash frame shows the
         # body against the barrier, not one step's travel through it.
         self.pos = torch.where(crashed.unsqueeze(1), self.prev_pos, self.pos)
         self.heading = torch.where(crashed, self.prev_heading, self.heading)
         # Per-term breakdown for the exploit monitor, telemetry and debugging.
+        for name, old in frozen.items():
+            new = getattr(self, name)
+            setattr(self, name, torch.where(was_done.unsqueeze(1) if new.dim() == 2 else was_done, old, new))
+        reward = torch.where(was_done, torch.zeros_like(reward), reward)
+        delta = torch.where(was_done, torch.zeros_like(delta), delta)
+        raw_delta = torch.where(was_done, torch.zeros_like(raw_delta), raw_delta)
+        alive = alive & ~was_done
         self.last_terms = {
             "progress": progress_term,
             "bonus": bonus_term,
             "wall": wall_term,
             "stall": stall_term,
+            "pace": pace_term,
+            "speed_ref": speed_ref,
+            "align": align_term,
+            "align_err": align_err,
             "time_tax": torch.full_like(reward, -cfg.time_tax),
+            "crash_cost": crash_cost,
             "delta": delta,
             "raw_delta": raw_delta,
             "clearance": clearance,

@@ -139,7 +139,7 @@ def rollout(
     """
     agent.seed(seed)
     obs = env.reset()
-    agent.reset()
+    agent.reset(batch=env.batch)
     watch = ExploitMonitor(env) if monitor else None
     device = env.device
     full = env.batch
@@ -217,7 +217,10 @@ def rollout(
             live["fitness"] = live["fitness"] + reward * alive
             live["steps_alive"] = live["steps_alive"] + alive
             live["speed_sum"] = live["speed_sum"] + env.speed * alive
-            vis_hz = vis_hz + agent.sensory_rates(obs, theta)[:, : agent.cfg.n_rays].mean()
+            # Telemetry from the rates `act` already computed for this step: calling
+            # `agent.sensory_rates` again here overwrote `prev_proximity` with the
+            # post-step view, which zeroed the looming channel on every control step.
+            vis_hz = vis_hz + agent.last_rates_hz[:, : agent.cfg.n_rays].mean()
             live["alive"] = alive * (~done).float()
             ran = step + 1
             body_steps += env.batch
@@ -318,7 +321,7 @@ class TrackBank:
         return self._cache[key]
 
 
-def make_env(bank: TrackBank, stage: int, generation: int, popsize: int, starts_per_gen: int) -> CarEnv:
+def make_env(bank: TrackBank, stage: int, generation: int, popsize: int, starts_per_gen: int, steps: int = 0) -> CarEnv:
     """Environment for one generation: `starts_per_gen` start points per member."""
     if bank.layout == "monaco":
         cfg, track = bank.get(stage)
@@ -328,13 +331,15 @@ def make_env(bank: TrackBank, stage: int, generation: int, popsize: int, starts_
         cfg, track = bank.get(stage, generation % bank.n_tracks)
         fractions = [k / starts_per_gen for k in range(starts_per_gen)]
     per_car = torch.tensor(fractions).repeat(popsize)
+    cfg = replace(cfg, episode_steps=max(0, steps))  # the environment charges unused budget at early endings
     return CarEnv(popsize * starts_per_gen, bank.device, cfg, track=track, start_fraction=per_car)
 
 
-def make_eval_env(bank: TrackBank, stage: int, islands: int, starts_per_gen: int) -> CarEnv:
+def make_eval_env(bank: TrackBank, stage: int, islands: int, starts_per_gen: int, steps: int = 0) -> CarEnv:
     """Evaluate every island on the same deterministic start set."""
     cfg, track = bank.get(stage)
     fractions = torch.tensor([(b % bank.n_tracks) / bank.n_tracks for b in range(starts_per_gen)]).repeat(islands)
+    cfg = replace(cfg, episode_steps=max(0, steps))
     return CarEnv(islands * starts_per_gen, bank.device, cfg, track=track, start_fraction=fractions)
 
 
@@ -342,14 +347,14 @@ def evaluate_mean(
     agent: ConnectomeAgent, bank: TrackBank, mu: torch.Tensor, stage: int, steps: int, seed: int, starts_per_gen: int
 ) -> dict[str, float]:
     islands = mu.shape[0]
-    batch = agent.brain.batch
-    bodies_per_island = batch // islands
-    cfg, track = bank.get(stage)
+    # One body per (island, start): `rollout` runs the brain at this reduced
+    # batch. Evaluating on the brain's full batch drove 64 identical copies of
+    # every (island, start) pair (shared noise), so each evaluation cost as
+    # much as a whole generation and halved the number of generations per hour.
+    bodies_per_island = starts_per_gen
     n_tracks = bank.n_tracks
-    fractions = torch.tensor([(b % n_tracks) / n_tracks for b in range(starts_per_gen)])
-    repeats = batch // starts_per_gen + 1
-    fractions = fractions.repeat(repeats)[:batch]
-    env = CarEnv(batch, bank.device, cfg, track=track, start_fraction=fractions)
+    env = make_eval_env(bank, stage, islands, starts_per_gen, steps)
+    batch = env.batch
     mu_expanded = mu.repeat_interleave(bodies_per_island, dim=0)
     theta = agent.unpack(mu_expanded)
     result = rollout(agent, env, theta, steps, seed)
@@ -444,6 +449,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="if the entire population's fitness range is below this, treat the generation as non-informative (no gradient); catches collapse mode where all cars crash at the same step",
     )
     parser.add_argument("--lr", type=float, default=0.05)
+    parser.add_argument(
+        "--max-step-frac",
+        type=float,
+        default=0.03,
+        help="trust region: cap one generation's move of an island mean at this fraction of the mean's norm (0 disables)",
+    )
     parser.add_argument(
         "--precision",
         default=None,
@@ -666,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
                 "param_shapes": {k: list(v) for k, v in agent.param_shapes.items()},
                 "agent_cfg": asdict(agent_cfg),
                 "readout": agent.readout_state(),
-                "car_cfg": asdict(bank.get(stage)[0]),
+                "car_cfg": asdict(replace(bank.get(stage)[0], episode_steps=episode_cap(args.episode_steps, stage))),
                 "layout": args.layout,
                 "starts": args.tracks,
                 "precision": brain.precision,
@@ -691,7 +702,7 @@ def main(argv: list[str] | None = None) -> int:
         theta = agent.unpack(params.repeat_interleave(args.starts_per_gen, dim=0))
 
         total_members = args.islands * args.popsize
-        env = make_env(bank, stage, generation, total_members, args.starts_per_gen)
+        env = make_env(bank, stage, generation, total_members, args.starts_per_gen, steps)
         result = rollout(agent, env, theta, steps, seed=args.seed * 7919 + generation, monitor=not args.no_exploit_monitor)
         fitness = result["fitness"].view(args.islands, args.popsize, args.starts_per_gen).mean(2)
         laps = result["laps"].view(args.islands, args.popsize, args.starts_per_gen).mean(2)
@@ -722,7 +733,16 @@ def main(argv: list[str] | None = None) -> int:
         if informative:
             grad = (perturb * advantage[:, :, None]).sum(1) / (args.popsize * sigma)
             momentum = args.momentum * momentum + grad
-            mu = agent.clamp_params(mu + args.lr * momentum)
+            step = args.lr * momentum
+            if args.max_step_frac > 0:
+                # Trust region: one generation may move an island's mean by at
+                # most this fraction of its norm. Generation 1 of the calibrated
+                # run moved it by 26 % (grad norm 37, lr 0.05) and the driver
+                # went from 1.3 laps to crawling at 8 km/h.
+                limit = args.max_step_frac * mu.norm(dim=1, keepdim=True).clamp(min=1e-6)
+                scale = (limit / step.norm(dim=1, keepdim=True).clamp(min=1e-12)).clamp(max=1.0)
+                step = step * scale
+            mu = agent.clamp_params(mu + step)
         else:
             # In particular, a flat/rejected generation must not continue to
             # move the means through stale momentum from earlier generations.
@@ -795,6 +815,7 @@ def main(argv: list[str] | None = None) -> int:
             "at_bounds": agent.fraction_at_bounds(mu),
             "mu_norm": float(mu.norm()),
             "grad_norm": float(grad.norm()),
+        "step_norm": float((args.lr * momentum).norm()) if informative else 0.0,
             "momentum_norm": float(momentum.norm()),
             "sigma": sigma,
             "lr": args.lr,

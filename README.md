@@ -105,6 +105,22 @@ channel) are migrated block by block on load: trained blocks are kept, new
 blocks start from their initial values, so a layout change never restarts
 training from scratch.
 
+### Generations, not just body-steps
+
+The kernel costs the same for a crashed car as for a driving one, so
+`train.rollout` compacts the batch: every 25 steps the finished bodies are
+dropped from the brain (state gathered per body, spike ring re-packed), the
+environment and the exploit monitor, and their results are scattered back in
+body order. A generation's cost is then the survivors' driving time, not the
+population size times the episode cap. `run_training.sh` defaults to 64
+members x 4 islands x 6 starts (1,536 bodies, ~90 % of the kernel's peak
+throughput; 3,072 bodies reach 96 % but take twice as long per generation) and a
+6,000-step cap; `POPSIZE`, `ISLANDS`, `EPISODE_STEPS`, `SIGMA`, `LR`,
+`MAX_STEP_FRAC` and `EVAL_EVERY` are environment overrides. The ES step is a
+trust region (3 % of the island mean per generation) and the mean is evaluated
+deterministically every generation, reverting when it drives worse than the
+last accepted mean.
+
 ## How it works
 
 ```
@@ -176,6 +192,29 @@ public W11 figures: 795 kg, ~750 kW, 3.70 m wheelbase, 2.0 m wide, drag area
 Checks: 0-100 km/h 2.6 s, top speed 326 km/h, full lock 10 m radius at
 50 km/h. Lateral demand is served first; braking and traction get what the
 grip circle has left, so the car must slow for corners.
+
+### Reward
+
+Fitness is the sum of per-step reward over a fixed step budget, so it is
+distance covered in the budget: average speed. The terms (`CarConfig`):
+
+| term | per step | why |
+|---|---|---|
+| progress | `progress_per_m` x metres along the centerline (sub-sample: nearest sample plus the signed offset along its tangent, `Track.progress_at`) | pays every moving step; the old nearest-sample lookup paid nothing on 86 % of steps at 54 km/h and 1.6 m lumps on the rest |
+| lap bonus | `lap_bonus` per *new* lap | crossing back and forth pays once |
+| time tax | `-time_tax` | lap time pressure; only finishing the lap early saves any of it |
+| pace | `-pace_penalty x max(0, 1 - v / (pace_margin x v_ref))^2` | `v_ref` is `Track.speed_ref`, the fastest this vehicle's grip circle, power, drag and brakes can pass that point (`speed_profile`: cornering speed, backward braking pass, forward traction pass, road grade). Zero at 90 % of pace, so slowness is charged where there is room to go faster, not in the hairpin |
+| alignment | `-align_penalty x (1 - cos(heading error to a point max(15 m, 1 s) ahead))` | graded steering feedback: pointed down the road costs nothing, 90 degrees off costs one penalty, backwards two |
+| wall | `-wall_penalty x near^2` inside `wall_margin` (0.75 m from the body edge) | a gradient before the crash cliff that still lets the line brush the barrier |
+| stall | low-speed near-full-lock penalty | the stationary steering attractor seen in an earlier collapse |
+| ending | `-(crash_penalty + (time_tax + pace_penalty + align_penalty) x unused steps)` | an ended car is charged as standing still for the rest of the budget (`episode_steps`, set by the trainer), so no early ending scores above driving on. With the old flat `-crash_penalty` a crash on step 400 (-28) outscored 12,000 steps at 36 km/h (-75) |
+
+`python3 src/bench_reward.py` prints these effects with numbers, the vehicle
+model against public W11 figures (0-100 km/h 2.45 s, 0-200 4.53 s, 0-300
+9.06 s, 326 km/h drag-limited, 323-0 km/h in 115 m at 5.4 g peak) and the
+model's own Monaco reference lap (1:25.9 on the centerline; the real pole is
+1:10.2 on the racing line). The exploit monitor (`exploits.py`) checks every
+term above against the reward actually paid, including the ending charge.
 
 ### Episode ends
 

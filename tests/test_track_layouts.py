@@ -97,7 +97,7 @@ def test_reward_pays_progress_not_speed_and_ramps_near_wall():
     _, reward, done = env.step(torch.tensor([[0.0, 1.0], [0.0, 1.0]]))
     assert not bool(done.any())
     assert float(reward[1]) < float(reward[0]), "wall proximity must cost something"
-    assert float(reward[0]) > -cfg.time_tax, "moving forward beats standing still"
+    assert float(reward[0]) > -(cfg.time_tax + cfg.pace_penalty), "moving forward beats standing still (time tax plus full pace deficit)"
 
 
 def test_completing_a_lap_pays_the_bonus():

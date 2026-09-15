@@ -7,6 +7,7 @@ Pure-environment tests run without the connectome; the ones marked
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -58,7 +59,8 @@ def drive(env: CarEnv, steer: float, pedal: float, steps: int) -> torch.Tensor:
 
 # --- 1, 17: reward -------------------------------------------------------------------
 def test_finish_line_oscillation_pays_the_lap_bonus_once(loop_track):
-    env = CarEnv(1, CPU, FAST, track=loop_track)
+    # max_laps=0: completing the lap must not end (and freeze) the car, or it cannot drive back.
+    env = CarEnv(1, CPU, replace(FAST, max_laps=0.0), track=loop_track)
     env.reset()
     cl = loop_track.centerline
     n = cl.shape[0]

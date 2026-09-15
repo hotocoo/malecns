@@ -210,9 +210,13 @@ class Brain:
     def uses_metal(self) -> bool:
         return self.metal is not None and self.gain is None
 
-    def reset(self) -> None:
-        if self.batch != self.full_batch:
-            self._set_batch(self.full_batch)
+    def reset(self, batch: int | None = None) -> None:
+        """Fresh state for `batch` bodies (default: the full batch this brain was built for)."""
+        target = self.full_batch if batch is None else int(batch)
+        if not 1 <= target <= self.full_batch:
+            raise ValueError(f"reset batch {target} outside 1..{self.full_batch}")
+        if self.batch != target:
+            self._set_batch(target)
         shape = (self.n, self.batch)
         # u = V - V_rest, so rest is zero and the leak is a plain multiply.
         self.u = torch.zeros(shape, device=self.device, dtype=self.state_dtype)
@@ -298,6 +302,8 @@ class Brain:
 
     def _gather_bits(self, bits: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """(slots, n, words) bit masks -> the same for the bodies in `idx`, packed into consecutive bits."""
+        # Advanced indexing, not index_select: torch 2.13 index_select on int32
+        # MPS tensors returns wrong data (see tests/test_compaction.py).
         slots = bits.shape[0]
         new_words = (idx.numel() + 31) // 32
         out = torch.zeros((slots, self.n, new_words), dtype=torch.int32, device=self.device)

@@ -153,8 +153,10 @@ def test_rollout_with_compaction_matches_uncompacted(connectome):
     agent = ConnectomeAgent(brain, connectome.neurons, AgentConfig(substeps=8))
     cfg = CarConfig(dt_s=0.016)
 
+    base = agent.initial_params(torch.Generator().manual_seed(21))
+
     def theta_for(n: int) -> dict[str, torch.Tensor]:
-        params = agent.initial_params().to(MPS).repeat(n, 1)
+        params = base.to(MPS).repeat(n, 1)
         theta = agent.unpack(params)
         # Steer biases from hard left to hard right: cars leave the road at different times.
         theta["b_out"] = theta["b_out"].clone()
@@ -178,4 +180,6 @@ def test_rollout_with_compaction_matches_uncompacted(connectome):
     for key in ("crash", "reverse", "stuck", "finished", "alive"):
         assert out[key] == ref[key]
     assert out["exploits"]["cars"] == ref["exploits"]["cars"] == batch
-    assert brain.batch == batch  # rollout's final reset restores the full population
+    assert brain.batch < batch  # the brain stays compacted until the next episode starts
+    agent.reset()
+    assert brain.batch == batch and brain.u.shape == (brain.n, batch)

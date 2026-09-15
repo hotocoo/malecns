@@ -248,7 +248,7 @@ main {
 
 .rate-list li, .dn-list li {
   display: grid;
-  grid-template-columns: 1fr 4fr auto;
+  grid-template-columns: minmax(150px, 1.3fr) 3fr auto;
   align-items: center;
   gap: 10px;
   font-size: 12px;

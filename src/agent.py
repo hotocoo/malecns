@@ -493,8 +493,9 @@ class ConnectomeAgent:
         return out
 
     # --- closed loop ----------------------------------------------------------------
-    def reset(self) -> None:
-        self.brain.reset()
+    def reset(self, batch: int | None = None) -> None:
+        """Fresh brain and readout state for `batch` bodies (default: the brain's full batch)."""
+        self.brain.reset(batch)
         self.motor_state = torch.zeros(self.brain.batch, self.n_readout, device=self.device)
         self.prev_proximity = None
         self.last_motor = torch.zeros(self.brain.batch, 2, device=self.device)

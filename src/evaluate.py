@@ -293,7 +293,8 @@ def main(argv: list[str] | None = None) -> int:
             # cars beyond the scenario's starts duplicate the first start; they
             # are dropped from the summary
             starts = torch.cat([starts, starts[:1].repeat(batch - n)])
-        env = CarEnv(batch, device, cfg, track=track, start_fraction=starts)
+        # Same step budget the episode runs for, so early endings are charged as in training.
+        env = CarEnv(batch, device, replace(cfg, episode_steps=max(0, args.steps)), track=track, start_fraction=starts)
         rec = None
         sample = None
         if i == 0 and args.record is not None:

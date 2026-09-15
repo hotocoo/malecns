@@ -92,7 +92,8 @@ def test_driving_forward_earns_progress_reward():
     rewards = [float(env.step(action)[1].mean()) for _ in range(120)]
     assert not bool(env.step(action)[2].any()), "gentle straight driving stays on the road"
     assert float(env.laps.min()) > 0.0, "forward driving accumulates lap fraction"
-    assert sum(rewards) > -env.cfg.time_tax * 120, "progress pays above the time tax alone"
+    standing_still = -(env.cfg.time_tax + env.cfg.pace_penalty) * 120  # time tax plus full pace deficit
+    assert sum(rewards) > standing_still, "progress pays above standing still"
 
 
 def test_idling_is_penalised():
