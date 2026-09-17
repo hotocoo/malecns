@@ -45,6 +45,13 @@ FOLD_INTO_CAR = (CLASS_TRUCK, CLASS_BUS)
 # Signal phases read out of the pixels, as three extra channels.
 PHASE_CHANNELS = ("signal_red", "signal_amber", "signal_green")
 
+# The drivable surface, measured from the frame itself. A detector reports
+# objects; it says nothing about where the road goes, and a driver given only
+# objects has no information at all on an empty street. These two channels
+# carry what the pixels say about the road: how far it runs in each direction,
+# and where its painted markings are.
+ROAD_CHANNELS = ("road_extent", "lane_marking")
+
 DEFAULT_WEIGHTS = "yolo26n.pt"
 
 
@@ -78,6 +85,7 @@ class EyeConfig:
 
     columns: int = 12
     confidence: float = 0.25
+    include_road: bool = True
     # A box this tall fills the near field; taller saturates. Chosen as a
     # fraction of frame height, so it holds at any resolution.
     near_height_fraction: float = 0.45
@@ -85,7 +93,54 @@ class EyeConfig:
 
     @property
     def width(self) -> int:
-        return self.columns * (len(CHANNELS) + (len(PHASE_CHANNELS) if self.include_phase else 0))
+        channels = len(CHANNELS)
+        if self.include_phase:
+            channels += len(PHASE_CHANNELS)
+        if self.include_road:
+            channels += len(ROAD_CHANNELS)
+        return self.columns * channels
+
+
+def road_profile(frame: np.ndarray, columns: int) -> tuple[np.ndarray, np.ndarray]:
+    """How far the road runs in each column, and where its markings are.
+
+    Read from the frame and nothing else. Asphalt is dark and close to grey;
+    paint is bright and close to grey. For each column band the road extent is
+    the fraction of the image height, measured up from the bottom, that stays
+    road-like without a break, which is short where the carriageway curves away
+    and long where it runs ahead. The marking channel is the share of those
+    pixels that are painted, which rises as the car nears a line.
+
+    This is a measurement of the picture, not a lookup of the track: it is
+    wrong where the light is wrong, and it is the driver's only sense of the
+    road, exactly as a camera-only vehicle's would be.
+    """
+    height, width = frame.shape[:2]
+    rgb = frame.astype(np.float32) / 255.0
+    high = rgb.max(axis=2)
+    low = rgb.min(axis=2)
+    saturation = np.where(high > 0.0, (high - low) / np.maximum(high, 1e-6), 0.0)
+    grey = (saturation < 0.18)
+    asphalt = grey & (high > 0.06) & (high < 0.55)
+    paint = grey & (high >= 0.55)
+    surface = asphalt | paint
+
+    extent = np.zeros(columns, dtype=np.float32)
+    marking = np.zeros(columns, dtype=np.float32)
+    edges = np.linspace(0, width, columns + 1).astype(int)
+    for c in range(columns):
+        band = surface[:, edges[c] : max(edges[c] + 1, edges[c + 1])]
+        if band.size == 0:
+            continue
+        # A column of the band is road up to the first row from the bottom that
+        # is not; taking the median across the band ignores a single stray pixel.
+        rows = band[::-1]  # bottom row first
+        run = np.cumprod(rows, axis=0).sum(axis=0)
+        reach = float(np.median(run))
+        extent[c] = min(reach / height, 1.0)
+        painted = paint[:, edges[c] : max(edges[c] + 1, edges[c + 1])]
+        marking[c] = float(painted.mean())
+    return extent, marking
 
 
 def classify_lens(patch: np.ndarray) -> str | None:
@@ -165,10 +220,17 @@ class DetectionEye:
         return self.config.width
 
     def channel_names(self) -> tuple[str, ...]:
+        return tuple(
+            f"{name}[{column}]" for name in self._rows() for column in range(self.config.columns)
+        )
+
+    def _rows(self) -> list[str]:
         names = list(CHANNELS)
         if self.config.include_phase:
             names += list(PHASE_CHANNELS)
-        return tuple(f"{name}[{column}]" for name in names for column in range(self.config.columns))
+        if self.config.include_road:
+            names += list(ROAD_CHANNELS)
+        return names
 
     def encode(self, detections: list[Detection], frame: np.ndarray) -> np.ndarray:
         """One frame's detections as a flat vector in [0, 1].
@@ -178,9 +240,14 @@ class DetectionEye:
         """
         cfg = self.config
         height, width = frame.shape[:2]
-        names = list(CHANNELS) + (list(PHASE_CHANNELS) if cfg.include_phase else [])
+        names = self._rows()
         grid = np.zeros((len(names), cfg.columns), dtype=np.float32)
         index = {name: i for i, name in enumerate(names)}
+
+        if cfg.include_road:
+            extent, marking = road_profile(frame, cfg.columns)
+            grid[index["road_extent"]] = extent
+            grid[index["lane_marking"]] = marking
 
         near = cfg.near_height_fraction * height
         for found in detections:

@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -42,7 +42,7 @@ from dataset import load_scene
 from events import Director, HazardRates
 from eye_camera import CameraSensor, SensorConfig
 from law import load_law
-from lawreward import LawEnforcer
+from lawreward import LawEnforcer, LawWeights
 from perceive import EyeConfig
 from roadlaw import control_points_for_circuit, legal_profile_for_circuit
 from scene import SceneConfig, Traffic
@@ -51,21 +51,60 @@ from train import rank_normalise
 CHECKPOINT_DIR = Path("checkpoints/camera")
 
 
-def build_world(args, device: torch.device):
-    """The circuit, its law, its traffic and the sensor that looks at it."""
-    scene_cfg = SceneConfig()
-    scene = load_scene(args.track, scene_cfg)
-    traffic = Traffic.populate(
+@dataclass(frozen=True)
+class Stage:
+    """One rung of the curriculum: how wide the road, how busy, how eventful.
+
+    A connectome that cannot yet hold a heading has nothing to learn from a
+    motorcycle filtering past it: every body ends the same way and the search
+    cannot tell them apart. So the road starts wide and empty, and traffic,
+    then events, arrive once the population can survive what is already there.
+    Nothing about the law or the geometry changes between rungs - only how much
+    is happening at once.
+    """
+
+    name: str
+    width_mult: float
+    traffic_fraction: float
+    event_fraction: float
+
+
+CURRICULUM = (
+    Stage("empty road", 3.0, 0.0, 0.0),
+    Stage("wide with traffic", 2.2, 0.35, 0.0),
+    Stage("narrowing", 1.6, 0.7, 0.4),
+    Stage("real street", 1.0, 1.0, 1.0),
+)
+
+
+def populate_for(args, scene, stage: Stage, scene_cfg: SceneConfig) -> Traffic:
+    """The traffic this rung of the curriculum puts on the road."""
+    share = stage.traffic_fraction
+    return Traffic.populate(
         scene.centerline,
         scene.heights,
         scene.profile,
         scene.control_points,
-        vehicles=args.vehicles,
-        motorcycles=args.motorcycles,
-        pedestrians=args.pedestrians,
+        vehicles=int(args.vehicles * share),
+        motorcycles=int(args.motorcycles * share),
+        pedestrians=int(args.pedestrians * share),
         seed=args.seed,
         cfg=scene_cfg,
     )
+
+
+def rates_for(stage: Stage) -> HazardRates:
+    """The event rates this rung runs at; an empty road stages nothing."""
+    base = HazardRates()
+    return HazardRates(per_km={k: v * stage.event_fraction for k, v in base.per_km.items()})
+
+
+def build_world(args, device: torch.device, stage: Stage | None = None):
+    """The circuit, its law, its traffic and the sensor that looks at it."""
+    stage = stage or CURRICULUM[0]
+    scene_cfg = SceneConfig()
+    scene = load_scene(args.track, scene_cfg)
+    traffic = populate_for(args, scene, stage, scene_cfg)
     sensor = CameraSensor(
         scene,
         traffic,
@@ -75,19 +114,37 @@ def build_world(args, device: torch.device):
         scene_cfg,
     )
     director = Director(
-        scene.centerline, scene.heights, scene.profile, traffic, seed=args.seed, rates=HazardRates(), cfg=scene_cfg
+        scene.centerline,
+        scene.heights,
+        scene.profile,
+        traffic,
+        seed=args.seed,
+        rates=rates_for(stage),
+        cfg=scene_cfg,
     )
     return scene, traffic, sensor, director
 
 
-def build_env(args, scene, device: torch.device, batch: int) -> tuple[CarEnv, LawEnforcer]:
-    """A population on the surveyed circuit, charged under its road law."""
+def build_env(
+    args, scene, device: torch.device, batch: int, width_mult: float = 1.0
+) -> tuple[CarEnv, LawEnforcer]:
+    """A population on the surveyed circuit, charged under its road law.
+
+    `width_mult` widens the drivable corridor for the early generations. An
+    untrained connectome steers close to randomly and leaves a nine-metre
+    street within a second, so every body ends the same way and the search has
+    nothing to rank. Starting wide lets the first useful behaviour - hold a
+    heading, follow a bend - survive long enough to be selected, and the road
+    narrows back to its surveyed width as the population learns to stay on it.
+    The law, the traffic and the events do not change: only the margin does.
+    """
     cfg = CarConfig(
         layout="geojson",
         geojson_path=str(args.track),
         max_laps=0.0,  # a street has no finish line; the episode ends by budget
         episode_steps=args.steps,
         max_speed=args.max_speed,
+        track_halfwidth=CarConfig.track_halfwidth * width_mult,
     )
     starts = torch.linspace(0.0, 1.0, batch + 1)[:batch]
     env = CarEnv(batch, device, cfg, start_fraction=starts)
@@ -98,8 +155,21 @@ def build_env(args, scene, device: torch.device, batch: int) -> tuple[CarEnv, La
     centerline = points.numpy()
     profile = legal_profile_for_circuit(args.track, centerline, proj)
     control_points = control_points_for_circuit(args.track, proj, load_law(), centerline=centerline)
+    # Keeping left means nothing on a corridor three times its real width: the
+    # car can sit sixteen metres from the centre and still be on a road that
+    # does not exist. The side rule fades in as the road narrows to the
+    # surveyed one; the speed limit applies throughout, because it is about the
+    # car rather than the corridor.
+    weights = LawWeights()
+    if width_mult > 1.0:
+        weights = replace(weights, wrong_side=weights.wrong_side / (width_mult * width_mult))
     law = LawEnforcer(
-        profile, control_points, env.track.centerline.cpu().to(device), device, dt_s=cfg.dt_s
+        profile,
+        control_points,
+        env.track.centerline.cpu().to(device),
+        device,
+        weights=weights,
+        dt_s=cfg.dt_s,
     )
     env.attach_law(law)
 
@@ -218,6 +288,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--popsize", type=int, default=16, help="bodies per generation; each renders its own view")
     parser.add_argument("--steps", type=int, default=1200, help="control steps per episode")
     parser.add_argument("--sigma", type=float, default=0.08)
+    parser.add_argument("--stage", type=int, default=0, help="curriculum rung to start on")
+    parser.add_argument("--advance-at", type=float, default=0.6, help="survival fraction that promotes a rung")
+    parser.add_argument("--advance-after", type=int, default=3, help="consecutive generations at that survival")
     parser.add_argument("--lr", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--width", type=int, default=320)
@@ -244,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
     connectome = load_connectome(args.graph)
     neurons: pd.DataFrame = connectome.neurons
 
-    scene, traffic, sensor, director = build_world(args, device)
+    scene, traffic, sensor, director = build_world(args, device, CURRICULUM[min(max(args.stage, 0), len(CURRICULUM) - 1)])
     print(f"[world] eye {sensor.eye.width} channels, camera {args.width}x{args.height}, detector {args.weights}")
 
     brain = Brain(
@@ -257,10 +330,13 @@ def main(argv: list[str] | None = None) -> int:
     agent_cfg = AgentConfig(n_rays=sensor.eye.width, substeps=args.substeps)
     agent = ConnectomeAgent(brain, neurons, agent_cfg)
 
-    env, law = build_env(args, scene, device, args.popsize)
+    stage_index = min(max(args.stage, 0), len(CURRICULUM) - 1)
+    stage = CURRICULUM[stage_index]
+    env, law = build_env(args, scene, device, args.popsize, stage.width_mult)
     removed = clear_starts(traffic, env)
     env.attach_traffic(obstacle_provider(traffic, scene.fixtures))
-    print(f"[world] {removed} actors moved off the start line")
+    print(f"[world] stage {stage_index} '{stage.name}': road x{stage.width_mult:.2f}, "
+          f"{len(traffic.actors)} road users ({removed} moved off the start line)")
     print(f"[world] {law.summary()}")
 
     mu = agent.initial_params().to(device)
@@ -275,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
     sigma = args.sigma
+    steady = 0
     generator = torch.Generator(device="cpu").manual_seed(args.seed)
 
     for generation in range(args.generations):
@@ -286,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         theta = agent.unpack(params)
 
         result = run_episode(agent, env, sensor, director, theta, args.steps, args.seed + generation)
+        survived = result["endings"].get("alive", 0) / max(args.popsize, 1)
         fitness = result["fitness"]
         ranked = rank_normalise(fitness)
         gradient = (ranked.unsqueeze(1) * perturb).mean(dim=0)
@@ -306,20 +384,42 @@ def main(argv: list[str] | None = None) -> int:
             "crashes": result["endings"].get("crash", 0),
             "events": sum(result["events"].values()),
             "sigma": sigma,
+            "stage": stage_index,
+            "width_mult": stage.width_mult,
+            "survived": round(survived, 3),
         }
         rows.append(row)
         print(
             f"gen {generation:4d} fit {row['fitness_mean']:9.2f}/{row['fitness_best']:9.2f} "
             f"laps {row['laps_best']:.3f} law {row['law_mean']:7.2f} "
             f"coll {row['collisions']:2d} crash {row['crashes']:2d} "
-            f"{row['seconds']:5.1f}s"
+            f"alive {survived:.2f} s{stage_index} {row['seconds']:5.1f}s"
         )
+
+        # Promote once the population can survive this rung for a few
+        # generations running, not on one lucky episode.
+        steady = steady + 1 if survived >= args.advance_at else 0
+        if steady >= args.advance_after and stage_index + 1 < len(CURRICULUM):
+            stage_index += 1
+            stage = CURRICULUM[stage_index]
+            steady = 0
+            traffic.actors = populate_for(args, scene, stage, SceneConfig()).actors
+            director.traffic = traffic
+            director.rates = rates_for(stage)
+            director.active.clear()
+            sensor.traffic = traffic
+            env, law = build_env(args, scene, device, args.popsize, stage.width_mult)
+            clear_starts(traffic, env)
+            env.attach_traffic(obstacle_provider(traffic, scene.fixtures))
+            print(f"         -> stage {stage_index} '{stage.name}': road x{stage.width_mult:.2f}, "
+                  f"{len(traffic.actors)} road users")
 
         torch.save(
             {
                 "mu": mu.cpu(),
                 "generation": generation,
                 "eye_width": sensor.eye.width,
+                "stage": stage_index,
                 "agent_cfg": asdict(agent_cfg),
                 "track": str(args.track),
                 "weights": args.weights,
