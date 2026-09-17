@@ -23,11 +23,14 @@ from roadlaw import (  # noqa: E402
     MPH_TO_MPS,
     LegalProfile,
     class_speed_defaults,
+    control_points_for_circuit,
     legal_profile_for_circuit,
     load_highways,
     parse_lanes,
     parse_maxspeed,
     parse_oneway,
+    parse_selector,
+    rules_triggered_by,
 )
 
 HIGHWAYS = ROOT / "data" / "tracks" / "monaco_osm_highways.json"
@@ -168,6 +171,75 @@ class TestLegalProfile:
         track = tmp_path / "nowhere.geojson"
         track.write_text(json.dumps({"features": [{"geometry": {"coordinates": [[0, 0], [0, 1]]}}]}))
         assert legal_profile_for_circuit(track, np.zeros((4, 2)), None) is None
+
+
+class TestSelectors:
+    def test_key_and_value(self):
+        assert parse_selector("osm:highway=traffic_signals") == ("highway", "traffic_signals")
+
+    def test_bare_key(self):
+        assert parse_selector("osm:maxspeed") == ("maxspeed", None)
+
+    @pytest.mark.parametrize("raw", ["roadlaw:class_median", "highway=stop", "osm:", ""])
+    def test_not_an_osm_selector(self, raw):
+        assert parse_selector(raw) is None
+
+
+class TestRulesTriggered:
+    class FakeRule:
+        def __init__(self, rule_id, applies_to):
+            self.rule_id = rule_id
+            self.applies_to = applies_to
+
+    def corpus(self):
+        return [
+            self.FakeRule("red_signal", {"signal_source": "osm:highway=traffic_signals"}),
+            self.FakeRule("pedestrian_crossing", {"crossing_source": "osm:highway=crossing"}),
+            self.FakeRule("speeding", {"limit_source": "osm:maxspeed"}),
+        ]
+
+    def test_value_selector_matches_that_value_only(self):
+        assert rules_triggered_by({"highway": "traffic_signals"}, self.corpus()) == ("red_signal",)
+        assert rules_triggered_by({"highway": "bus_stop"}, self.corpus()) == ()
+
+    def test_bare_key_selector_matches_any_value(self):
+        assert rules_triggered_by({"maxspeed": "60"}, self.corpus()) == ("speeding",)
+
+    def test_a_node_can_trigger_several_rules(self):
+        hits = rules_triggered_by({"highway": "crossing", "maxspeed": "30"}, self.corpus())
+        assert set(hits) == {"pedestrian_crossing", "speeding"}
+
+    def test_untagged_node_triggers_nothing(self):
+        assert rules_triggered_by({}, self.corpus()) == ()
+
+
+@needs_survey
+class TestControlPoints:
+    @pytest.fixture(scope="class")
+    def points(self):
+        from car_env import load_geojson_centerline
+        from law import load_law
+
+        _, proj = load_geojson_centerline(TRACK, return_projection=True)
+        return control_points_for_circuit(TRACK, proj, load_law())
+
+    def test_the_survey_carries_control_points(self, points):
+        assert len(points) > 0
+
+    def test_each_point_names_the_rules_it_puts_in_play(self, points):
+        from law import load_law
+
+        known = {r.rule_id for r in load_law()}
+        for point in points:
+            assert point.rules
+            assert set(point.rules) <= known
+
+    def test_points_are_in_track_metres(self, points):
+        extent = max(float(abs(p.pos).max()) for p in points)
+        assert extent < 20_000.0
+
+    def test_points_keep_their_osm_identity(self, points):
+        assert all(p.node_id > 0 for p in points)
 
 
 @needs_survey

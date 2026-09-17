@@ -173,6 +173,68 @@ class LegalProfile:
         return float(np.isfinite(self.limit_mps).mean())
 
 
+@dataclass(frozen=True)
+class ControlPoint:
+    """A place on the road where a rule bites: a signal, a stop line, a crossing."""
+
+    node_id: int
+    rules: tuple[str, ...]  # rule ids from the law corpus this node triggers
+    pos: np.ndarray  # (2,) metres in the track frame
+    tags: dict
+
+
+def parse_selector(selector: str) -> tuple[str, str | None] | None:
+    """`osm:highway=traffic_signals` -> ("highway", "traffic_signals"); `osm:maxspeed` -> ("maxspeed", None).
+
+    The law corpus states where each rule is measured; this reads that
+    statement so the tag mapping lives with the law, not in this module.
+    """
+    if not selector.startswith("osm:"):
+        return None
+    body = selector[len("osm:") :]
+    key, _, value = body.partition("=")
+    key = key.strip()
+    return (key, value.strip() or None) if key else None
+
+
+def rules_triggered_by(tags: dict, corpus) -> tuple[str, ...]:
+    """Which rules of `corpus` this node's tags put in play."""
+    hits: list[str] = []
+    for rule in corpus:
+        for key, selector in rule.applies_to.items():
+            if not key.endswith("_source") or not isinstance(selector, str):
+                continue
+            parsed = parse_selector(selector)
+            if parsed is None:
+                continue
+            tag_key, tag_value = parsed
+            if tag_key in tags and (tag_value is None or str(tags[tag_key]) == tag_value):
+                hits.append(rule.rule_id)
+                break
+    return tuple(hits)
+
+
+def control_points_for_circuit(geojson: str | Path, proj, corpus) -> tuple[ControlPoint, ...]:
+    """The rule-bearing nodes of the survey, projected into the track frame.
+
+    A node the law corpus has no rule for is dropped: the driver can only be
+    judged by rules the corpus carries.
+    """
+    path = highways_path(geojson)
+    if not path.exists() or proj is None:
+        return ()
+    data = json.loads(path.read_text())
+    points: list[ControlPoint] = []
+    for node in data.get("control_nodes", []):
+        tags = node.get("tags") or {}
+        rules = rules_triggered_by(tags, corpus)
+        if not rules or node.get("lat") is None:
+            continue
+        pos = proj.project(np.array([[node["lon"], node["lat"]]], dtype=np.float64))[0]
+        points.append(ControlPoint(node_id=int(node.get("id", -1)), rules=rules, pos=pos, tags=tags))
+    return tuple(points)
+
+
 def highways_path(geojson: str | Path) -> Path:
     geojson = Path(geojson)
     return geojson.with_name(geojson.stem + "_osm_highways.json")

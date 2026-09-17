@@ -1,0 +1,308 @@
+{
+  "jurisdiction": "MY",
+  "enforced_by": "Jabatan Pengangkutan Jalan (JPJ) and the Royal Malaysia Police",
+  "note": "Every quote is sliced verbatim from the pinned source document. A rule with status 'cited' carries a citation taken from a primary document but not the instrument's own words; supply the instrument to promote it to 'verified'.",
+  "sources": [
+    {
+      "name": "act333",
+      "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+      "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+      "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f",
+      "publisher": "Ministry of Transport Malaysia"
+    }
+  ],
+  "rules": [
+    {
+      "rule_id": "speeding",
+      "subject": "speed",
+      "citation": "Road Transport Act 1987 (Act 333), section 40(1)",
+      "status": "verified",
+      "quote": "Exceeding speed limit\n\n40. (1) If any person drives a motor vehicle at a speed exceeding any\nspeed limit imposed for such motor vehicle under the powers\nconferred by this Act he shall be guilty of an offence and shall on\n\n\nconviction be liable to a fine of not less than three hundred ringgit\nand not more than two thousand ringgit.\n\n  (2) The court shall, unless for any special reasons it thinks fit to\norder otherwise, order particulars of any finding of guilt under this\nsection to be endorsed on any driving licence held by the person\nconvicted.\n\n  (3) A first or second conviction for an offence under this section\nshall not render the offender liable to be disqualified from holding or\nobtaining a driving licence for a longer period than in the first\nconviction, one month or, in the case of a second conviction, six\nmonths.",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "limit_source": "osm:maxspeed",
+        "limit_fallback": "roadlaw:class_median",
+        "offence_when": "speed > limit"
+      }
+    },
+    {
+      "rule_id": "speed_limit_authority",
+      "subject": "speed",
+      "citation": "Road Transport Act 1987 (Act 333), section 69",
+      "status": "verified",
+      "quote": "Speed limits\n\n69. (1) The Minister may, by order published in the Gazette,\nprescribe a national speed limit for all roads in Malaysia.\n\n  (1A) Notwithstanding subsection (1), the Minister charged with the\nresponsibility for works may, by order published in the Gazette,\nprescribe for any highways or any part thereof a speed limit which is\nlower, or with the concurrence of the Minister, higher than the\nnational speed limit.\n\n  (1B) Any person who fails to observe the national speed limit\nprescribed under subsection (1) or the speed limit prescribed in\nsubsection (1A) shall be guilty of an offence.\n\n  (2) Notwithstanding subsection (1), the Minister charged with the\nresponsibility for works in relation to a Federal road, including\nhighways, and the appropriate authority in relation to a road other\nthan a Federal road, within the area of such authority, may by order\npublished in the Gazette, prohibit the driving of motor vehicles, or of\nany specified class or description of motor vehicles, at a speed greater\nthan the speed specified in such order, over any road or part thereof\nspecified in the order, and either generally or at a specified time or\ntimes:\n\n\n  Provided that the speed specified in such order shall not exceed that\nof the national speed limit or in relation to highways or part thereof,\nthe speed limit prescribed under subsection (1A) for that highway or\npart thereof.\n\n  (3) The following persons shall erect and maintain in such positions\nin any place as shall give adequate notice of the speed limit\nprescribed under subsections (1) and (1A) and the prohibition under\nsubsection (2), such traffic signs as shall be prescribed, indicating the\nnature of the prohibition:\n       (a) in relation to a Federal road which is also a highway, the\n           Director General of Highway Authority or any person\n           with proper authority from the Director General of\n           Highway Authority, who is a person authorized under the\n           Federal Roads (Private Management) Act 1984 [Act 306];\n\n       (b) in relation to a Federal road which is not a highway, the\n           Director General of Public Works; and\n       (c) in relation to any other road within the area of any local\n           authority, the relevant local authority.\n\n (4) In this section, ―highway‖ means—\n       (a) a Federal road where the traffic for both directions is\n           separated by median and where its intersections are\n           connected to public roads by interchanges without any\n           direct connection to any private roads; or\n       (b) a Federal road declared to be a highway by the Minister\n           charged with the responsibility for works by an order\n           published in the Gazette, which is a road where the traffic\n           for both directions is separated by median and where its\n           intersections are connected to public or private roads.",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "limit_source": "osm:maxspeed",
+        "posted_by": "traffic sign"
+      }
+    },
+    {
+      "rule_id": "traffic_sign",
+      "subject": "signs",
+      "citation": "Road Transport Act 1987 (Act 333), section 79(2)",
+      "status": "verified",
+      "quote": "Penalties for neglect of traffic directions and signs\n\n79. (1) Where a police officer in uniform, a road transport officer in\nuniform or a traffic warden in uniform, is for the time being engaged\nin regulating traffic on a road, notwithstanding that any traffic sign\nhas been lawfully placed on or near that road, any person driving or\npropelling any vehicle who fails or neglects to stop the vehicle or to\nmake it proceed in or keep to a particular line of traffic when directed\nso to do by such police officer, road transport officer or traffic\nwarden, shall be guilty of an offence and shall on conviction be liable\nto a fine of not less than three hundred ringgit and not more than two\nthousand ringgit.\n\n  (2) Subject to subsection (1) and section 76A, where any traffic\nsign has been lawfully placed on or near any road, any pedestrian or\nany person driving or propelling any vehicle, who fails or neglects to\n\n\nconform to the indication given by the sign, shall be guilty of an\noffence and shall on conviction be liable to a fine of not less than\nthree hundred ringgit and not more than two thousand ringgit.\n\n  (3) In any proceedings for an offence against this section, in so far\nas it is necessary in order to establish the offence charged, it shall be\npresumed until the contrary is proved that such sign was lawfully\nplaced under the provisions of section 77.",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "sign_source": "osm:traffic_sign",
+        "offence_when": "indication not followed"
+      }
+    },
+    {
+      "rule_id": "authorized_left_turn",
+      "subject": "signals",
+      "citation": "Road Transport Act 1987 (Act 333), section 76A(1)",
+      "status": "verified",
+      "quote": "Authorized left turns\n\n76A. (1) Notwithstanding a red signal or other traffic sign indicating a\nplace where traffic must stop at any traffic junction, any person\ndriving a motor vehicle on a road may turn left at the traffic junction\nin accordance with any traffic sign authorizing such left turn that has\nbeen lawfully sited on such road after stopping before the marked\nstop line on the road to ascertain that it is safe to do so.\n\n   (2) For the purpose of subsection (1), the Minister may, after\nconsultation with the Minister charged with the responsibility for\nworks, make rules relating to the movement of motor vehicles and\npedestrians and the erection of traffic signs at such authorized left\nturn traffic junctions.\n\n   (3) An appropriate authority may, with the approval of the\nMinister charged with the responsibility for works in relation to a\nFederal road and designated Federal Territory road, and in any case\nafter consultation with the Chief Police Officer, establish such traffic\nsigns as it considers appropriate, and shall execute any works\n(including the placing, erection and maintenance of traffic signs)\nrequired in connection with such authorized left turn traffic junctions.\n\n\n   (4) Any person who contravenes this section or any rules made\nunder this section in relation to an authorized left turn shall be guilty\nof an offence and shall on conviction be liable to a fine of not less\nthan three hundred ringgit and not more than two thousand ringgit.",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "sign_source": "osm:traffic_sign",
+        "requires": "stop before the marked stop line",
+        "exception_to": "red_signal"
+      }
+    },
+    {
+      "rule_id": "pedestrian_crossing",
+      "subject": "pedestrians",
+      "citation": "Road Transport Act 1987 (Act 333), section 75",
+      "status": "verified",
+      "quote": "Pedestrian crossings\n\n75. (1) Crossings for pedestrians (in this section hereinafter referred\nto as ―crossing‖) may be established on roads in accordance with this\nsection, and not otherwise.\n\n  (2) The Minister, with the concurrence of the Minister charged\nwith the responsibility for works, may make rules with respect to the\nprecedence of vehicles and pedestrians respectively, and generally\nwith respect to the movement of traffic (including pedestrians) at and\nin the vicinity of a crossing (including rules prohibiting pedestrians\non the carriageway within one hundred metres of a crossing), and\nwith respect to the indication of the limits of a crossing by marks on\nthe roadway or otherwise, and to the erection of traffic signs in\nconnection therewith.\n\n  (3) Different rules may be made under this section in relation to\ndifferent traffic conditions and in particular, but without prejudice to\nthe generality of the foregoing, different rules may be made in\nrelation to crossings in the vicinity of, and at a distance from, a\njunction of roads, and to traffic which is controlled by the police, by\ntraffic warden and by traffic signals and by different kinds of traffic\nsignals and to traffic which is not so controlled.\n\n  (4) An appropriate authority may, with the approval of the Minister\ncharged with the responsibility for works in relation to a Federal\nroad, and in any case after consultation with the Chief Police Officer,\nestablish such crossings as it thinks fit, and shall execute any works\n(including the placing, erection and maintenance of marks and traffic\nsigns) required in connection with such crossings, or with the\nindication in accordance with the rules made under this section.\n\n\n  (5) If any person contravenes any rule having effect in relation to a\ncrossing he shall be guilty of an offence and shall on conviction be\nliable to a fine not exceeding five hundred ringgit.",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "crossing_source": "osm:highway=crossing"
+      }
+    },
+    {
+      "rule_id": "careless_driving",
+      "subject": "conduct",
+      "citation": "Road Transport Act 1987 (Act 333), section 43(1)",
+      "status": "verified",
+      "quote": "Careless and inconsiderate driving\n\n43. (1) A person who drives a motor vehicle on a road without due\ncare and attention or without reasonable consideration for another\npersons using the road shall be guilty of an offence and ***shall on\nconviction be punished with a fine of not less than four thousand\nringgit and not more than ten thousand ringgit and shall also be liable\nto imprisonment for a term not exceeding twelve months.\n*NOTE—previously ―liable to a fine not exceeding six thousand ringgit or to imprisonment for a term\nnot exceeding three years or to both and, in the case of a second or subsequent conviction, to a fine not\nexceeding ten thousand ringgit or to imprisonment for a term not exceeding five years or to both‖–see\nAct A1065\n**NOTE—previously ―twelve months‖–see Act A1065\n***NOTE—previously ―liable to a fine not exceeding two thousand ringgit or to imprisonment for a\nterm not exceeding six months‖–see Act A1065\n\n\n  (2) The court shall, (unless for any special reason it thinks fit to\norder otherwise), order particulars of any conviction under this\nsection to be endorsed on any driving licence held by the person\nconvicted.\n\n  (3) On a second or subsequent conviction under this section, the\ncourt shall exercise the power conferred by this Part ordering that the\noffender shall be disqualified from holding or obtaining a driving\nlicence unless the court having regard to the lapse of time since the\ndate of the previous or last previous conviction or for any other\nreason (which reason shall be stated in the order), thinks fit to order\notherwise, but this provision shall not be construed as affecting the\nright of the court to exercise the power aforesaid on a first conviction.\n  (4) Notwithstanding subsection (1), where a person who is a holder\nof a probationary driving licence is convicted under this section, the\ncourt shall revoke his driving licence.",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "offence_when": "without due care and attention"
+      }
+    },
+    {
+      "rule_id": "reckless_driving",
+      "subject": "conduct",
+      "citation": "Road Transport Act 1987 (Act 333), section 42",
+      "status": "verified",
+      "quote": "Reckless and dangerous driving\n42. (1) Any person who drives a motor vehicle on a road recklessly\nor at a speed or in a manner which having regard to all the\n\n\ncircumstances (including the nature, condition and size of the road\nand the amount of traffic which is or might be expected to be on the\nroad) is dangerous to the public shall be guilty of an offence and shall\non conviction be punished with imprisonment for a term *not\nexceeding five years and to a fine of not less than five thousand\nringgit and not more than fifteen thousand ringgit and, in the case of a\nsecond or subsequent conviction, to imprisonment for a term not\nexceeding ten years and to a fine of not less than ten thousand ringgit\nand not more than twenty thousand ringgit.\n.\n  (2) The court shall order particulars of any conviction under this\nsection to be endorsed on any driving licence held by the person\nconvicted.\n\n  (3) A person convicted under this section shall be disqualified from\nholding or obtaining a driving licence for a period of not less than\n**two years from the date of the conviction and, in the case of a\nsecond or subsequent conviction, be disqualified for a period of ten\nyears from the date of the conviction.\n\n  (4) Notwithstanding subsection (1), where a person who is a holder\nof a probationary driving licence is convicted under this section, the\ncourt shall revoke his driving licence.",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "offence_when": "manner dangerous to the public"
+      }
+    },
+    {
+      "rule_id": "duty_to_stop_after_accident",
+      "subject": "conduct",
+      "citation": "Road Transport Act 1987 (Act 333), section 52",
+      "status": "verified",
+      "quote": "Duty to stop in case of accidents\n\n52. (1) If in any case, owing to the presence of a motor vehicle on a\nroad, an accident occurs, the driver of the motor vehicle shall stop\nand, if required so to do by any person having reasonable grounds for\nso requiring, give his name and address and also the name and\naddress of the owner and the registration number of the motor\nvehicle.\n\n  (2) In the case of any such accident as aforesaid the driver of such\nmotor vehicle and, if there is more than one motor vehicle, the driver\nof each such motor vehicle, shall report the accident at the nearest\npolice station as soon as reasonably practicable and in any case\nwithin twenty-four hours of such occurrence, and shall produce to the\nofficer in charge of such police station his driving licence and if so\nrequired, the certificate of insurance issued under section 90 of this\nAct.\n\n  (3) In the case of any such accident as aforesaid the driver of any\nsuch motor vehicle shall render such assistance as may be reasonably\nrequired by any police officer or traffic warden or, in the absence of\n\n\nany police officer or traffic warden, such assistance as it may\nreasonably be in the power of such driver to render.\n\n  (4) Where a police officer or traffic warden has reasonable cause to\nbelieve that any person—\n\n       (a) was the driver of a motor vehicle at a time when an\n           accident occurred owing to the presence of such motor\n           vehicle on a road;\n\n       (b) has committed an offence in relation to the use of a motor\n           vehicle on a road; or\n\n       (c) was accompanying the holder of a learner‘s driving\n           licence granted under this Act whilst such holder was\n           driving a motor vehicle and that an accident occurred\n           whereby damage or injury was caused to any person,\n           property or animal owing to the presence of such motor\n           vehicle on a road, such police officer or traffic warden\n           may require such person to produce for examination his\n           driving licence and the certificate of insurance relating to\n           the user of such vehicle at such time.\n\n  (5) If any person fails to comply with this section he shall be guilty\nof an offence:\n\n  Provided that a person shall not be convicted of an offence against\nsubsection (2) or (4) by reason only of the failure to produce his\ndriving licence or certificate of insurance if within five days after the\naccident or the requirement under subsection (4), he produces such\nlicence or certificate in person at such police office or police station\nin Malaysia as may be specified by him at the time the accident was\nreported or the requirement under subsection (4) was made.",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "offence_when": "collision without stopping"
+      }
+    },
+    {
+      "rule_id": "scheduled_offences",
+      "subject": "index",
+      "citation": "Road Transport Act 1987 (Act 333), First and Second Schedules",
+      "status": "verified",
+      "quote": "FIRST SCHEDULE\n\n                                       [Section 2]\n\n                             SCHEDULED OFFENCE\n\n\n\nItem            Types of offence                           Provision of the law\n                      (1)                                          (2)\n (i)    Driving above the speed limit                Rule 3, Motor Vehicles\n                                                     (Speed Limit) Rules 1989\n                                                     [P.U. (A) 25/1989]\n(ii)    Failure to comply with traffic sign          Subsection 79(2) of this Act\n(iii)   Overtaking at double lines                   Subsection 79(2) of this Act\n(iv)    Driving in emergency lanes                   Rule 53, Road Traffic Rules 1959\n                                                     [L.N. 166/1959]\n(v)     Overtaking     and     preventing            Rule 6, Road Traffic Rules 1959\n        another from overtaking                      [L.N. 166/1959]\n(vi)    Queue-jumping                                Rule 3(2)(b), Road Traffic Rules\n                                                     1959 [L.N. 166/1959]\n(vii)   Using mobile       phones     while          Rule 17A, Road Traffic Rules 1959\n        driving                                      [L.N. 166/1959]\n\n\n                                SECOND SCHEDULE\n\n                                    [Section 2]\n\n                          CAMERA-RECORDED OFFENCE\n\n       (i) Driving vehicle other than buses in a bus lane\n      (ii) Driving above the prescribed speed limit\n      (iii) Subject to section 76A, failing to obey a red signal at the traffic sign",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "role": "names the subsidiary rules that carry the remaining offences"
+      }
+    },
+    {
+      "rule_id": "lane_discipline",
+      "subject": "lane",
+      "citation": "Road Traffic Rules 1959 [L.N. 166/1959], rule 3",
+      "status": "cited",
+      "quote": null,
+      "named_by": "Road Transport Act 1987 (Act 333), First Schedule item (vi)",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "side_source": "osm:driving_side",
+        "offence_when": "not keeping to the near side"
+      }
+    },
+    {
+      "rule_id": "queue_jumping",
+      "subject": "lane",
+      "citation": "Road Traffic Rules 1959 [L.N. 166/1959], rule 3(2)(b)",
+      "status": "cited",
+      "quote": null,
+      "named_by": "Road Transport Act 1987 (Act 333), First Schedule item (vi)",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "offence_when": "leaving the queue to pass it"
+      }
+    },
+    {
+      "rule_id": "overtaking",
+      "subject": "overtaking",
+      "citation": "Road Traffic Rules 1959 [L.N. 166/1959], rule 6",
+      "status": "cited",
+      "quote": null,
+      "named_by": "Road Transport Act 1987 (Act 333), First Schedule item (v)",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "offence_when": "overtaking unsafely or preventing another from overtaking"
+      }
+    },
+    {
+      "rule_id": "emergency_lane",
+      "subject": "lane",
+      "citation": "Road Traffic Rules 1959 [L.N. 166/1959], rule 53",
+      "status": "cited",
+      "quote": null,
+      "named_by": "Road Transport Act 1987 (Act 333), First Schedule item (iv)",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "lane_source": "osm:shoulder",
+        "offence_when": "driving in an emergency lane"
+      }
+    },
+    {
+      "rule_id": "double_line_overtaking",
+      "subject": "overtaking",
+      "citation": "Road Transport Act 1987 (Act 333), subsection 79(2)",
+      "status": "cited",
+      "quote": null,
+      "named_by": "Road Transport Act 1987 (Act 333), First Schedule item (iii)",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "marking_source": "osm:overtaking=no",
+        "offence_when": "crossing a double line to overtake"
+      }
+    },
+    {
+      "rule_id": "red_signal",
+      "subject": "signals",
+      "citation": "Road Transport Act 1987 (Act 333), Second Schedule item (iii)",
+      "status": "cited",
+      "quote": null,
+      "named_by": "Road Transport Act 1987 (Act 333), Second Schedule",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "signal_source": "osm:highway=traffic_signals",
+        "offence_when": "failing to obey a red signal at the traffic sign",
+        "subject_to": "authorized_left_turn"
+      }
+    },
+    {
+      "rule_id": "bus_lane",
+      "subject": "lane",
+      "citation": "Road Transport Act 1987 (Act 333), Second Schedule item (i)",
+      "status": "cited",
+      "quote": null,
+      "named_by": "Road Transport Act 1987 (Act 333), Second Schedule",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "lane_source": "osm:lanes:psv",
+        "offence_when": "driving a non-bus in a bus lane"
+      }
+    },
+    {
+      "rule_id": "speed_limit_rule",
+      "subject": "speed",
+      "citation": "Motor Vehicles (Speed Limit) Rules 1989 [P.U. (A) 25/1989], rule 3",
+      "status": "cited",
+      "quote": null,
+      "named_by": "Road Transport Act 1987 (Act 333), First Schedule item (i)",
+      "source": {
+        "name": "act333",
+        "title": "Laws of Malaysia, Act 333, Road Transport Act 1987 (reprint)",
+        "url": "https://www.mot.gov.my/en/Documents/Act%20333%20-%20Road%20Transport%20Act%201987.pdf",
+        "sha256": "fd23f3d020334a071bf0a76ef3842bca745051969821fc08c40c70694a7ddc1f"
+      },
+      "applies_to": {
+        "limit_source": "osm:maxspeed"
+      }
+    }
+  ]
+}

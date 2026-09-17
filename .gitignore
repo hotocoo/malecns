@@ -2,6 +2,12 @@
 data/*
 !data/tracks/
 !data/tracks/*.geojson
+# The road survey a circuit is judged on travels with the circuit; the country
+# extract it was cut from (hundreds of MB) and the statute PDFs do not.
+!data/tracks/*_osm_highways.json
+!data/law/
+data/law/sources/
+data/osm/
 checkpoints/
 logs/
 __pycache__/
