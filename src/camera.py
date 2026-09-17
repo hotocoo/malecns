@@ -65,6 +65,130 @@ def assets_available() -> bool:
     return any(available(m) for family in MODELS_FOR.values() for m in family)
 from lawreward import AMBER, GREEN, RED
 
+# Surface texture, by material, in world metres. One GLSL function shared by
+# this renderer and the browser's 3D page (live.py splices it into its
+# shader), so both draw the same asphalt grain, paving slabs and kerbstone.
+# `streets.MAT_*` numbers the materials.
+SURFACE_GLSL = """
+float surf_hash(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+float surf_noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = surf_hash(i);
+    float b = surf_hash(i + vec2(1.0, 0.0));
+    float c = surf_hash(i + vec2(0.0, 1.0));
+    float d = surf_hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+vec3 surface_colour(vec3 base, float material, vec3 w) {
+    if (material < 0.5) return base;
+    if (material < 1.5) {
+        // Asphalt: fine aggregate grain, patches of older and newer surface,
+        // and two slightly polished wheel tracks per lane are not modelled;
+        // the tone stays inside the band the road profile reads as asphalt.
+        float fine = surf_noise(w.xy * 18.0);
+        float mid = surf_noise(w.xy * 2.5);
+        float coarse = surf_noise(w.xy * 0.35);
+        float tone = 0.84 + 0.22 * fine + 0.10 * (coarse - 0.5) + 0.06 * (mid - 0.5);
+        return base * tone;
+    }
+    if (material < 2.5) {
+        // Pavement: 0.6 m slabs with dark joints, weathered unevenly.
+        vec2 g = fract(w.xy / 0.6);
+        float joint = (g.x < 0.05 || g.y < 0.05) ? 0.74 : 1.0;
+        float n = surf_noise(w.xy * 6.0);
+        return base * joint * (0.90 + 0.18 * n);
+    }
+    if (material < 3.5) {
+        // Kerbstone: concrete, a joint every metre along either axis.
+        vec2 g = fract(w.xy / 1.0);
+        float joint = (g.x < 0.03 || g.y < 0.03) ? 0.82 : 1.0;
+        float n = surf_noise(w.xy * 9.0);
+        return base * joint * (0.92 + 0.14 * n);
+    }
+    if (material < 4.5) {
+        // Ground: grass and bare earth in patches.
+        float n1 = surf_noise(w.xy * 0.9);
+        float n2 = surf_noise(w.xy * 7.0);
+        vec3 earth = vec3(0.42, 0.36, 0.28);
+        vec3 grass = base * (0.82 + 0.30 * n2);
+        return mix(grass, earth, smoothstep(0.66, 0.92, n1));
+    }
+    // Facade bays run along whichever wall axis this face lies on. One
+    // number per building block keeps two neighbours from sharing a grid.
+    float block = surf_hash(floor(w.xy / 32.0));
+    float bay_m = 1.8 + 0.9 * block;
+    float bay = fract(max(abs(fract(w.x / bay_m) - 0.5), abs(fract(w.y / bay_m) - 0.5)) + 0.5);
+    float storey = fract(w.z / 3.2);
+    float floor_index = floor(w.z / 3.2);
+
+    if (material < 5.5) {
+        // Painted render: punched windows, a recessed frame around each, a
+        // slab line between storeys and a blind panel here and there.
+        bool pane = storey > 0.28 && storey < 0.74 && bay > 0.60 && bay < 0.95;
+        bool frame = storey > 0.22 && storey < 0.80 && bay > 0.54 && bay < 0.99;
+        float lit = surf_hash(vec2(floor(w.x / bay_m) + floor(w.y / bay_m), floor_index));
+        vec3 glass = mix(vec3(0.20, 0.26, 0.34), vec3(0.46, 0.56, 0.40), step(0.86, lit));
+        float slab = (storey < 0.07) ? 0.88 : 1.0;
+        float weather = 0.95 + 0.07 * surf_noise(w.xy * 2.2 + w.z * 0.4);
+        if (pane) return glass * (0.85 + 0.35 * surf_noise(w.xy * 0.6 + w.z));
+        if (frame) return base * 0.82 * weather;
+        return base * slab * weather;
+    }
+    if (material < 6.5) {
+        // Curtain wall: a glazed band per storey between spandrel panels,
+        // mullions every bay, and a sky gradient that brightens with height.
+        float mullion = smoothstep(0.02, 0.06, min(bay, 1.0 - bay));
+        float spandrel = step(0.74, storey);
+        // Glass takes most of its colour from the sky it faces, so a tower
+        // reads as glazing rather than as a dark box: brighter with height,
+        // with one pane in a while catching the sun.
+        float sky = clamp(0.95 + w.z * 0.006, 0.9, 1.35);
+        float flash = surf_hash(vec2(floor(w.x / bay_m) + floor(w.y / bay_m), floor_index));
+        vec3 pane = mix(base, vec3(0.62, 0.70, 0.80), 0.45) * sky * (0.92 + 0.45 * flash);
+        vec3 panel = mix(base, vec3(0.30, 0.33, 0.36), 0.5);
+        vec3 face = mix(pane, panel, spandrel);
+        return face * mix(0.80, 1.0, mullion);
+    }
+    if (material < 7.5) {
+        // Shop glazing: panes between dark mullions, dim but never black. It
+        // reflects the street and shows the lit interior behind, which is what
+        // a camera reads at this height. The tint stays off neutral grey on
+        // purpose: `perceive.road_profile` measures road as grey pixels, and a
+        // grey shopfront at eye height would read as more road.
+        float panel = fract(max(abs(fract(w.x / 1.4) - 0.5), abs(fract(w.y / 1.4) - 0.5)) + 0.5);
+        if (panel < 0.62) return base * 0.55;
+        float lit = surf_hash(floor(w.xy / 4.2));
+        vec3 inside = mix(vec3(0.22, 0.27, 0.35), vec3(0.42, 0.39, 0.31), step(0.72, lit));
+        float sheen = 0.86 + 0.26 * fract(w.z * 0.6);
+        return inside * sheen * (0.94 + 0.14 * surf_noise(w.xy * 1.6 + w.z));
+    }
+    if (material < 8.5) {
+        // Roof: gravel and screed, with wet patches where it ponds.
+        float grit = surf_noise(w.xy * 9.0);
+        float pond = surf_noise(w.xy * 0.7);
+        return base * (0.88 + 0.22 * grit) * mix(1.0, 0.82, smoothstep(0.6, 0.85, pond));
+    }
+    if (material < 9.5) {
+        // Signboard over the shopfront: painted board, one colour per unit,
+        // with the lettering left to the eye at this resolution.
+        float unit = surf_hash(floor(w.xy / 6.0));
+        vec3 board = mix(vec3(0.48, 0.22, 0.19), vec3(0.20, 0.30, 0.42), step(0.5, unit));
+        board = mix(board, vec3(0.56, 0.47, 0.20), step(0.82, unit));
+        return mix(base * 0.8, board, 0.55) * (0.94 + 0.10 * surf_noise(w.xy * 3.0));
+    }
+    // Plinth under the glazing: glazed tiles, a joint every 30 cm.
+    vec2 tile = fract(w.xy / 0.3);
+    float joint = (tile.x < 0.08 || tile.y < 0.08) ? 0.80 : 1.0;
+    return base * joint * (0.94 + 0.10 * surf_noise(w.xy * 8.0));
+}
+"""
+
 VERTEX_SHADER = """
 #version 330
 uniform mat4 mvp;
@@ -73,7 +197,10 @@ uniform float ambient;
 in vec3 in_position;
 in vec3 in_colour;
 in vec3 in_normal;
+in float in_material;
 out vec3 v_colour;
+out vec3 v_world;
+out float v_material;
 out float v_depth;
 void main() {
     vec4 clip = mvp * vec4(in_position, 1.0);
@@ -82,23 +209,84 @@ void main() {
     // the shape disappears; with it the roof, bonnet and flanks separate.
     float lit = ambient + (1.0 - ambient) * max(dot(normalize(in_normal), sun), 0.0);
     v_colour = in_colour * lit;
+    v_world = in_position;
+    v_material = in_material;
     v_depth = clip.w;
 }
 """
 
-FRAGMENT_SHADER = """
+FRAGMENT_SHADER = (
+    """
 #version 330
 uniform vec3 fog_colour;
 uniform float fog_start;
 uniform float fog_end;
 in vec3 v_colour;
+in vec3 v_world;
+in float v_material;
 in float v_depth;
 out vec4 f_colour;
+"""
+    + SURFACE_GLSL
+    + """
 void main() {
+    vec3 shaded = surface_colour(v_colour, v_material, v_world);
     float t = clamp((v_depth - fog_start) / max(fog_end - fog_start, 1.0), 0.0, 1.0);
-    f_colour = vec4(mix(v_colour, fog_colour, t), 1.0);
+    f_colour = vec4(mix(shaded, fog_colour, t), 1.0);
 }
 """
+)
+
+
+def face_normals(vertices: np.ndarray) -> np.ndarray:
+    """Unit normal of every triangle, repeated for its three vertices."""
+    tris = np.asarray(vertices, dtype=np.float32).reshape(-1, 3, 3)
+    n = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    n /= np.linalg.norm(n, axis=1, keepdims=True).clip(min=1e-9)
+    return np.repeat(n, 3, axis=0).astype(np.float32)
+
+
+def assemble_static(
+    road: RoadMesh,
+    network: RoadMesh | None,
+    buildings: RoadMesh | None,
+    ground_colour: tuple[float, float, float],
+    ground_height_m: float = -0.05,
+    extent_m: float = 12_000.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Everything that never moves, as one set of (vertices, colours, normals, materials).
+
+    Used by the driver's camera and served to the browser's 3D page, so the two
+    draw the same city from the same triangles. Materials follow `streets.MAT_*`:
+    the ground is grass, a surface without its own material is asphalt, paint
+    is flat.
+    """
+    ground = ground_plane(extent_m, ground_height_m)
+    parts: list[np.ndarray] = [ground]
+    tints: list[np.ndarray] = [np.tile(np.array(ground_colour, dtype=np.float32), (ground.shape[0], 1))]
+    materials: list[np.ndarray] = [np.full(ground.shape[0], 4.0, dtype=np.float32)]
+
+    def add(mesh: RoadMesh | None, default_material: float) -> None:
+        if mesh is None or not mesh.surface.shape[0]:
+            return
+        parts.append(mesh.surface)
+        tints.append(mesh.surface_colour)
+        if mesh.surface_material is not None and mesh.surface_material.shape[0] == mesh.surface.shape[0]:
+            materials.append(np.asarray(mesh.surface_material, dtype=np.float32))
+        else:
+            materials.append(np.full(mesh.surface.shape[0], default_material, dtype=np.float32))
+        if mesh.markings.shape[0]:
+            parts.append(mesh.markings)
+            tints.append(mesh.markings_colour)
+            materials.append(np.zeros(mesh.markings.shape[0], dtype=np.float32))
+
+    add(network, 1.0)
+    add(buildings, 5.0)
+    add(road, 1.0)
+    vertices = np.concatenate(parts).astype(np.float32)
+    colours = np.concatenate(tints).astype(np.float32)
+    return vertices, colours, face_normals(vertices), np.concatenate(materials)
+
 
 # The lens on the car. A road camera is wider than a photographer's normal
 # lens and narrower than a fisheye; these are the run's optics, not the law's.
@@ -112,7 +300,7 @@ class CameraConfig:
     near_m: float = 0.5
     far_m: float = 400.0
     sky_colour: tuple[float, float, float] = (0.62, 0.71, 0.82)
-    ground_colour: tuple[float, float, float] = (0.30, 0.33, 0.26)
+    ground_colour: tuple[float, float, float] = (0.27, 0.37, 0.23)
     fog_start_m: float = 120.0
     # A high sun a little behind the driver's left shoulder: near noon, which
     # is what a tropical street looks like for most of the day.
@@ -213,7 +401,11 @@ class DriverCamera:
         return str(self.ctx.info["GL_RENDERER"])
 
     def _vertex_array(
-        self, vertices: np.ndarray, colours: np.ndarray, normals: np.ndarray | None = None
+        self,
+        vertices: np.ndarray,
+        colours: np.ndarray,
+        normals: np.ndarray | None = None,
+        materials: np.ndarray | None = None,
     ) -> tuple[moderngl.VertexArray, moderngl.Buffer]:
         """A vertex array and the buffer behind it.
 
@@ -223,10 +415,14 @@ class DriverCamera:
         """
         if normals is None or normals.shape != vertices.shape:
             normals = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (vertices.shape[0], 1))
-        data = np.concatenate([vertices, colours, normals], axis=1).astype("f4").tobytes()
+        if materials is None or materials.shape[0] != vertices.shape[0]:
+            materials = np.zeros(vertices.shape[0], dtype=np.float32)
+        data = np.concatenate(
+            [vertices, colours, normals, materials.reshape(-1, 1)], axis=1
+        ).astype("f4").tobytes()
         buffer = self.ctx.buffer(data)
         array = self.ctx.vertex_array(
-            self.program, [(buffer, "3f 3f 3f", "in_position", "in_colour", "in_normal")]
+            self.program, [(buffer, "3f 3f 3f 1f", "in_position", "in_colour", "in_normal", "in_material")]
         )
         return array, buffer
 
@@ -254,21 +450,10 @@ class DriverCamera:
         the lap's own surface, so a junction the driver reaches has the streets
         that really lead off it.
         """
-        ground = ground_plane(extent_m, ground_height_m)
-        ground_colour = np.tile(np.array(self.cfg.ground_colour, dtype=np.float32), (ground.shape[0], 1))
-        parts = [ground]
-        tints = [ground_colour]
-        if network is not None and network.surface.shape[0]:
-            parts += [network.surface, network.markings]
-            tints += [network.surface_colour, network.markings_colour]
-        if buildings is not None and buildings.surface.shape[0]:
-            parts.append(buildings.surface)
-            tints.append(buildings.surface_colour)
-        parts += [road.surface, road.markings]
-        tints += [road.surface_colour, road.markings_colour]
-        vertices = np.concatenate(parts)
-        colours = np.concatenate(tints)
-        self._static, self._static_buffer = self._vertex_array(vertices, colours)
+        vertices, colours, normals, materials = assemble_static(
+            road, network, buildings, self.cfg.ground_colour, ground_height_m, extent_m
+        )
+        self._static, self._static_buffer = self._vertex_array(vertices, colours, normals, materials)
         self._static_count = vertices.shape[0]
 
     def visible(self, pos_xy: np.ndarray, heading: float, actors: list[Actor]) -> list[Actor]:

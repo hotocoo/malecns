@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from lawreward import GREEN, RED, SignalTiming, signal_phase_numpy
+import streets
 from roadlaw import UNKNOWN_LANES, ControlPoint, LegalProfile, parse_lanes, parse_oneway
 
 # Classes a camera should see as road. Wider than the set a route is built on:
@@ -113,6 +114,9 @@ class RoadMesh:
     markings: np.ndarray  # (v, 3) float32 painted lines, drawn just above
     markings_colour: np.ndarray  # (v, 3) float32
     halfwidth_m: np.ndarray  # (n,) per centerline sample
+    # Per-vertex material of `surface` (see `streets.MAT_*`); None means the
+    # whole surface is asphalt. Markings are always flat paint.
+    surface_material: np.ndarray | None = None
 
 
 @dataclass
@@ -189,12 +193,17 @@ def build_road(
     heights: np.ndarray,
     profile: LegalProfile,
     cfg: SceneConfig | None = None,
+    paint: bool = True,
 ) -> RoadMesh:
     """The road surface and its painted markings.
 
     A two-way road gets a dashed centre line; a one-way carriageway does not,
     because there is no opposing traffic to divide it from. Both get solid
     edge lines. Which is which comes from the survey's `oneway` tag.
+
+    With `paint=False` only the surface is built: when the whole street
+    network is meshed (`build_network`) its paint already stops at junctions,
+    and a second set of lines along the lap would run straight through them.
     """
     cfg = cfg or SceneConfig()
     centerline = np.asarray(centerline, dtype=np.float64)
@@ -204,6 +213,9 @@ def build_road(
 
     surface = _ribbon(centerline, heights, normal, -half, half, 0.0)
     surface_colour = np.tile(np.array([0.24, 0.24, 0.25], dtype=np.float32), (surface.shape[0], 1))
+    if not paint:
+        empty = np.zeros((0, 3), dtype=np.float32)
+        return RoadMesh(surface, surface_colour, empty, empty, half)
 
     mark = cfg.marking_width_m
     edge = half - cfg.shoulder_m
@@ -242,62 +254,49 @@ def build_network(
     cfg: SceneConfig | None = None,
     ground_z: float = 0.0,
     classes: frozenset[str] | None = None,
+    centre: np.ndarray | None = None,
+    max_distance_m: float | None = 1200.0,
 ) -> RoadMesh:
-    """Every surveyed road in the region, not only the lap the car drives.
+    """Every surveyed road near the lap, built as a street rather than a ribbon.
 
-    A single ribbon looks nothing like a city: the junctions the driver meets
-    have roads leading off them, and a camera sees those. This meshes every way
-    in the survey at the width its own lane count implies, which is what turns
-    the view from a track into a street.
+    Carriageways are joined where they meet, edge lines stop at every side
+    road, centre lines are cut out of junctions, and streets with footways get
+    kerbs and pavements. See `streets.build_streets` for the construction. The
+    result's `surface` carries a per-vertex material so the renderer can
+    texture asphalt, paving and kerbstone; the paint is in `markings`.
 
     Ways are drawn flat at `ground_z`; the lap's own surface is drawn over them
     by `build_road`, so the road under the car keeps its surveyed height.
+    Ways further than `max_distance_m` from the lap are left out.
     """
+    from streets import MAT_FLAT, MAT_ASPHALT, StreetConfig, build_streets, read_ways
+
     cfg = cfg or SceneConfig()
     classes = classes or DRIVABLE_CLASSES
-    data = json.loads(Path(survey_path).read_text())
-
-    surfaces: list[np.ndarray] = []
-    marks: list[np.ndarray] = []
-    for way in data.get("elements", []):
-        tags = way.get("tags") or {}
-        if tags.get("highway") not in classes:
-            continue
-        geometry = way.get("geometry") or []
-        if len(geometry) < 2:
-            continue
-        lonlat = np.array([[p["lon"], p["lat"]] for p in geometry], dtype=np.float64)
-        points = proj.project(lonlat)
-        if points.shape[0] < 2:
-            continue
-        lanes = parse_lanes(tags.get("lanes"))
-        if lanes is None:
-            lanes = LANES_BY_CLASS.get(str(tags.get("highway")), cfg.default_lanes)
-        half = np.full(points.shape[0], lanes * cfg.lane_width_m / 2.0 + cfg.shoulder_m)
-        heights = np.full(points.shape[0], ground_z)
-        surfaces.append(_open_ribbon(points, heights, -half, half, 0.0))
-        edge = half - cfg.shoulder_m
-        marks.append(_open_ribbon(points, heights, edge - cfg.marking_width_m, edge, 0.01))
-        marks.append(_open_ribbon(points, heights, -edge, -edge + cfg.marking_width_m, 0.01))
-        # A two-way street is divided down the middle, like every real one.
-        if parse_oneway(tags.get("oneway")) in (None, 0):
-            mark = cfg.marking_width_m
-            dashes = _dashed(points, heights, -mark / 2.0, mark / 2.0, 0.012, cfg)
-            if dashes.shape[0]:
-                marks.append(dashes)
-
-    if not surfaces:
+    ways = read_ways(
+        survey_path,
+        proj,
+        cfg.lane_width_m,
+        cfg.shoulder_m,
+        cfg.default_lanes,
+        LANES_BY_CLASS,
+        classes,
+        centre=centre,
+        max_distance_m=max_distance_m,
+    )
+    mesh = build_streets(ways, ground_z, cfg.lane_width_m, cfg.shoulder_m, cfg.marking_width_m, StreetConfig())
+    if not mesh.vertices.shape[0]:
         empty = np.zeros((0, 3), dtype=np.float32)
         return RoadMesh(empty, empty, empty, empty, np.zeros(0))
 
-    surface = np.concatenate(surfaces)
-    markings = np.concatenate(marks) if marks else np.zeros((0, 3), dtype=np.float32)
+    is_paint = mesh.materials == MAT_FLAT
     return RoadMesh(
-        surface=surface,
-        surface_colour=np.tile(np.array([0.22, 0.22, 0.23], dtype=np.float32), (surface.shape[0], 1)),
-        markings=markings,
-        markings_colour=np.tile(np.array([0.88, 0.88, 0.84], dtype=np.float32), (markings.shape[0], 1)),
+        surface=mesh.vertices[~is_paint],
+        surface_colour=mesh.colours[~is_paint],
+        markings=mesh.vertices[is_paint],
+        markings_colour=mesh.colours[is_paint],
         halfwidth_m=np.zeros(0),
+        surface_material=mesh.materials[~is_paint],
     )
 
 
@@ -329,6 +328,7 @@ def build_buildings(
     data = json.loads(path.read_text())
     walls: list[np.ndarray] = []
     shades: list[np.ndarray] = []
+    materials: list[np.ndarray] = []
     for feature in data.get("features", []):
         rings = (feature.get("geometry") or {}).get("coordinates") or []
         if not rings or len(rings[0]) < 4:
@@ -341,10 +341,11 @@ def build_buildings(
         height = float((feature.get("properties") or {}).get("height") or 0.0)
         if height <= 0.0:
             height = cfg.unknown_storeys * cfg.storey_m
-        wall, shade = _extrude(outline, ground_z, height, cfg)
+        wall, shade, material = _extrude(outline, ground_z, height, cfg)
         if wall.shape[0]:
             walls.append(wall)
             shades.append(shade)
+            materials.append(material)
 
     if not walls:
         empty = np.zeros((0, 3), dtype=np.float32)
@@ -356,34 +357,160 @@ def build_buildings(
         markings=np.zeros((0, 3), dtype=np.float32),
         markings_colour=np.zeros((0, 3), dtype=np.float32),
         halfwidth_m=np.zeros(0),
+        surface_material=np.concatenate(materials),
     )
 
 
-def _extrude(outline: np.ndarray, base_z: float, height: float, cfg: SceneConfig) -> tuple[np.ndarray, np.ndarray]:
-    """Walls and a flat roof for one footprint."""
-    if outline.shape[0] < 3:
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
-    lower = np.concatenate([outline, np.full((outline.shape[0], 1), base_z)], axis=1)
-    upper = lower.copy()
-    upper[:, 2] = base_z + height
-    nxt = np.roll(np.arange(outline.shape[0]), -1)
-    wall = np.stack(
-        [lower, lower[nxt], upper[nxt], lower, upper[nxt], upper], axis=1
-    ).reshape(-1, 3)
-    # A fan from the first vertex closes the roof. Malaysian footprints are
-    # mostly convex shoplots and blocks, where a fan is exact; on a concave one
-    # it overdraws slightly, which the camera cannot tell from a flat roof.
-    fan = np.stack([np.repeat(upper[:1], outline.shape[0] - 2, axis=0), upper[1:-1], upper[2:]], axis=1)
-    surface = np.concatenate([wall, fan.reshape(-1, 3)]).astype(np.float32)
+# Facade families. A Malaysian street is shoplots at the bottom of the scale,
+# commercial blocks in the middle and glass towers above; drawing all three as
+# one grey box is what made every street look the same.
+FACADE_SHOPLOT = 0
+FACADE_BLOCK = 1
+FACADE_TOWER = 2
 
-    # A steady tint per building, drawn from its own footprint so the street is
-    # not one colour, and darker on the walls than the roof.
-    seed = abs(float(outline[0, 0]) * 3.7 + float(outline[0, 1]) * 11.3)
-    tone = 0.42 + 0.30 * ((seed * 0.618) % 1.0)
-    warm = np.array([tone, tone * 0.97, tone * 0.92], dtype=np.float32)
-    colours = np.tile(warm, (surface.shape[0], 1))
-    colours[wall.shape[0] :] *= 0.86  # roofs read darker from the street
-    return surface, colours
+SHOPLOT_MAX_M = 16.0
+TOWER_MIN_M = 45.0
+SHOPFRONT_M = 4.2
+PARAPET_M = 0.9
+
+# Painted render, as shoplots are kept: repainted often, rarely grey.
+# Every tone here is kept off neutral grey (saturation over about 0.2), because
+# `perceive.road_profile` measures the road as the grey pixels below the
+# horizon: a grey wall at eye height would read as more road.
+SHOPLOT_PAINT = (
+    (0.88, 0.83, 0.70),
+    (0.64, 0.84, 0.70),
+    (0.89, 0.76, 0.67),
+    (0.62, 0.74, 0.86),
+    (0.90, 0.85, 0.61),
+    (0.83, 0.71, 0.63),
+    (0.58, 0.74, 0.64),
+)
+# Tile and fair-faced concrete, the middle of the market.
+BLOCK_PAINT = (
+    (0.78, 0.72, 0.61),
+    (0.70, 0.62, 0.52),
+    (0.80, 0.74, 0.62),
+    (0.62, 0.55, 0.45),
+    (0.72, 0.60, 0.52),
+)
+# Curtain wall, read as the glass it is rather than as painted wall.
+TOWER_GLASS = (
+    (0.42, 0.50, 0.57),
+    (0.35, 0.44, 0.52),
+    (0.47, 0.53, 0.55),
+    (0.31, 0.40, 0.47),
+)
+CONCRETE = (0.66, 0.60, 0.50)
+
+
+def _facade_seed(outline: np.ndarray) -> float:
+    """A number steady for one footprint, so a building keeps its own look."""
+    x, y = float(outline[0, 0]), float(outline[0, 1])
+    return abs(x * 3.7 + y * 11.3 + float(outline[1, 0]) * 5.1) * 0.618 % 1.0
+
+
+def _facade_kind(height: float) -> int:
+    if height <= SHOPLOT_MAX_M:
+        return FACADE_SHOPLOT
+    return FACADE_TOWER if height >= TOWER_MIN_M else FACADE_BLOCK
+
+
+def _facade_paint(kind: int, seed: float) -> np.ndarray:
+    family = (SHOPLOT_PAINT, BLOCK_PAINT, TOWER_GLASS)[kind]
+    return np.array(family[int(seed * 977.0) % len(family)], dtype=np.float32)
+
+
+def _band(outline: np.ndarray, z0: float, z1: float) -> np.ndarray:
+    """The side walls of a footprint between two heights."""
+    lower = np.concatenate([outline, np.full((outline.shape[0], 1), z0)], axis=1)
+    upper = lower.copy()
+    upper[:, 2] = z1
+    nxt = np.roll(np.arange(outline.shape[0]), -1)
+    return np.stack([lower, lower[nxt], upper[nxt], lower, upper[nxt], upper], axis=1).reshape(-1, 3)
+
+
+def _cap(outline: np.ndarray, z: float) -> np.ndarray:
+    """A flat lid over a footprint, fanned from its first vertex."""
+    top = np.concatenate([outline, np.full((outline.shape[0], 1), z)], axis=1)
+    fan = np.stack([np.repeat(top[:1], outline.shape[0] - 2, axis=0), top[1:-1], top[2:]], axis=1)
+    return fan.reshape(-1, 3)
+
+
+def _roof_plant(outline: np.ndarray, roof_z: float, seed: float) -> np.ndarray:
+    """Water tanks and air handling on the roof, which break the skyline."""
+    span = outline.max(axis=0) - outline.min(axis=0)
+    footprint = float(min(span[0], span[1]))
+    if footprint < 8.0:
+        return np.zeros((0, 3), dtype=np.float32)
+    centre = outline.mean(axis=0)
+    reach = footprint * 0.22
+    pieces: list[np.ndarray] = []
+    for k in range(1 + int(seed * 31.0) % 3):
+        phase = seed * 7.0 + k * 1.7
+        offset = np.array([np.cos(phase), np.sin(phase)]) * reach
+        half = 1.2 + 1.4 * ((phase * 0.37) % 1.0)
+        tall = 1.4 + 1.8 * ((phase * 0.71) % 1.0)
+        corner = centre + offset
+        square = np.array(
+            [
+                [corner[0] - half, corner[1] - half],
+                [corner[0] + half, corner[1] - half],
+                [corner[0] + half, corner[1] + half],
+                [corner[0] - half, corner[1] + half],
+            ]
+        )
+        pieces.append(_band(square, roof_z, roof_z + tall))
+        pieces.append(_cap(square, roof_z + tall))
+    return np.concatenate(pieces).astype(np.float32) if pieces else np.zeros((0, 3), dtype=np.float32)
+
+
+def _extrude(outline: np.ndarray, base_z: float, height: float, cfg: SceneConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One footprint as a shopfront, a facade, a parapet and a roof.
+
+    The building is built in bands rather than one extrusion so the ground
+    floor can be glazed like the shop it is, the roof can carry a parapet and
+    plant, and each band can name its own material for the renderer to texture.
+    """
+    if outline.shape[0] < 3:
+        empty = np.zeros((0, 3), dtype=np.float32)
+        return empty, empty, np.zeros(0, dtype=np.float32)
+
+    seed = _facade_seed(outline)
+    kind = _facade_kind(height)
+    roof_z = base_z + height
+    plinth_top = base_z + min(SHOPFRONT_M, height * 0.5)
+    paint = _facade_paint(kind, seed)
+    concrete = np.array(CONCRETE, dtype=np.float32) * (0.9 + 0.2 * seed)
+
+    # The ground floor is split in three bands rather than textured by height,
+    # because the renderer only knows a vertex's absolute z: a building whose
+    # base sits 30 m up the terrain would otherwise get its fascia halfway up
+    # the glazing.
+    tile_top = min(base_z + 0.45, plinth_top)
+    fascia_base = max(plinth_top - 0.8, tile_top)
+    bands = [
+        (_band(outline, base_z, tile_top), paint * 0.66, streets.MAT_PLINTH),
+        (_band(outline, tile_top, fascia_base), paint * 0.92, streets.MAT_SHOPFRONT),
+        (_band(outline, fascia_base, plinth_top), paint * 0.78, streets.MAT_FASCIA),
+        (
+            _band(outline, plinth_top, roof_z),
+            paint,
+            streets.MAT_WALL_GLASS if kind == FACADE_TOWER else streets.MAT_WALL,
+        ),
+        (_band(outline, roof_z, roof_z + PARAPET_M), concrete, streets.MAT_ROOF),
+        (_cap(outline, roof_z), concrete * 0.88, streets.MAT_ROOF),
+        (_roof_plant(outline, roof_z, seed), concrete * 0.82, streets.MAT_ROOF),
+    ]
+
+    surface = np.concatenate([band for band, _, _ in bands if band.shape[0]]).astype(np.float32)
+    colours = np.concatenate(
+        [np.tile(tint, (band.shape[0], 1)) for band, tint, _ in bands if band.shape[0]]
+    ).astype(np.float32)
+    materials = np.concatenate(
+        [np.full(band.shape[0], material, dtype=np.float32) for band, _, material in bands if band.shape[0]]
+    )
+    return surface, colours, materials
 
 
 def _dashed(
