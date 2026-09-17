@@ -145,6 +145,8 @@ def build_env(
         episode_steps=args.steps,
         max_speed=args.max_speed,
         track_halfwidth=CarConfig.track_halfwidth * width_mult,
+        # Start in the lane the law keeps you in, not on the centre line.
+        lane_offset_m=args.lane_offset,
     )
     starts = torch.linspace(0.0, 1.0, batch + 1)[:batch]
     env = CarEnv(batch, device, cfg, start_fraction=starts)
@@ -288,6 +290,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--popsize", type=int, default=16, help="bodies per generation; each renders its own view")
     parser.add_argument("--steps", type=int, default=1200, help="control steps per episode")
     parser.add_argument("--sigma", type=float, default=0.08)
+    parser.add_argument(
+        "--lane-offset",
+        type=float,
+        default=-1.9,
+        help="metres left of centre at reset; negative is the left lane, as Malaysia drives",
+    )
     parser.add_argument("--stage", type=int, default=0, help="curriculum rung to start on")
     parser.add_argument("--advance-at", type=float, default=0.6, help="survival fraction that promotes a rung")
     parser.add_argument("--advance-after", type=int, default=3, help="consecutive generations at that survival")

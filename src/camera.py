@@ -246,6 +246,7 @@ class DriverCamera:
         ground_height_m: float = -0.05,
         extent_m: float = 12_000.0,
         network: RoadMesh | None = None,
+        buildings: RoadMesh | None = None,
     ) -> None:
         """Upload the geometry that does not change: ground, roads, markings.
 
@@ -260,6 +261,9 @@ class DriverCamera:
         if network is not None and network.surface.shape[0]:
             parts += [network.surface, network.markings]
             tints += [network.surface_colour, network.markings_colour]
+        if buildings is not None and buildings.surface.shape[0]:
+            parts.append(buildings.surface)
+            tints.append(buildings.surface_colour)
         parts += [road.surface, road.markings]
         tints += [road.surface_colour, road.markings_colour]
         vertices = np.concatenate(parts)

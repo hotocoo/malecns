@@ -89,6 +89,11 @@ class CarConfig:
     max_speed: float = 95.0  # aero-limited, ~340 km/h
     # --- track -------------------------------------------------------------------
     track_halfwidth: float = 5.5  # 11 m road, Monaco average
+    # Where in the road a car is placed at reset, positive to the left of the
+    # direction of travel. Zero puts it on the centre line, which is right for
+    # a racing circuit and wrong for a street: a Malaysian car starts in the
+    # left lane, which is about a lane's half-width to the left of centre.
+    lane_offset_m: float = 0.0
     grid_res: int = 2048
     grid_extent: float = 130.0  # grows automatically to fit the circuit
     # "loop": procedural random circuit from `seed`. "geojson": the circuit in
@@ -729,6 +734,12 @@ class CarEnv:
         start = cl[index]
         nxt = cl[(index + 8) % n]
         heading = torch.atan2(nxt[:, 1] - start[:, 1], nxt[:, 0] - start[:, 0])
+        # A car starts in a lane, not astride the centre line. `lane_offset_m`
+        # is positive to the left of the direction of travel, so a left-hand
+        # drive country passes a negative one.
+        if self.cfg.lane_offset_m:
+            left = torch.stack([-heading.sin(), heading.cos()], dim=1)
+            start = start + left * self.cfg.lane_offset_m
         return start, heading
 
     def reset(self, mask: torch.Tensor | None = None) -> torch.Tensor:

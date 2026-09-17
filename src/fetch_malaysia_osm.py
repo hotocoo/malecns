@@ -36,6 +36,7 @@ OSM_DIR = Path("data/osm")
 COUNTRY_PBF = OSM_DIR / "malaysia-singapore-brunei-latest.osm.pbf"
 ROADS_PBF = OSM_DIR / "malaysia_roads.osm.pbf"
 ATTRIBUTION = "(c) OpenStreetMap contributors, ODbL 1.0, https://www.openstreetmap.org/copyright"
+LEVEL_M = 3.2  # metres per storey where only building:levels is tagged
 
 # Highway classes a car may lawfully drive on. Service roads and tracks are
 # included because Malaysian kampung and industrial routes are tagged that way;
@@ -210,6 +211,78 @@ def surveyed_driving_side(bbox: tuple[float, float, float, float]) -> str | None
     return driving_side_from(fetch_retry(driving_side_query(lat, lon)))
 
 
+def export_buildings(
+    bbox: tuple[float, float, float, float], out: Path, src: Path = COUNTRY_PBF
+) -> dict:
+    """Every mapped building in the box, with its height, as GeoJSON polygons.
+
+    A street without buildings is a road in a field. OSM carries the footprint
+    of nearly every building in a Malaysian city, and `height` or
+    `building:levels` for many of them; both are read here, and a building the
+    survey gives no height is left at zero for the scene to decide.
+    """
+    south, west, north, east = bbox
+    inside = lambda lat, lon: south <= lat <= north and west <= lon <= east  # noqa: E731
+
+    features: list[dict] = []
+    for obj in osmium.FileProcessor(str(src)).with_locations().with_filter(
+        osmium.filter.KeyFilter("building")
+    ):
+        if obj.type_str() != "w":
+            continue
+        ring = [
+            [n.location.lon, n.location.lat]
+            for n in obj.nodes
+            if n.location.valid()
+        ]
+        if len(ring) < 4 or not any(inside(p[1], p[0]) for p in ring):
+            continue
+        if ring[0] != ring[-1]:
+            ring.append(ring[0])
+        tags = dict(obj.tags)
+        features.append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "kind": "building",
+                    "height": parse_building_height(tags),
+                    "levels": tags.get("building:levels"),
+                    "building": tags.get("building"),
+                    "name": tags.get("name"),
+                },
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+            }
+        )
+
+    payload = {
+        "type": "FeatureCollection",
+        "attribution": ATTRIBUTION,
+        "bbox": list(bbox),
+        "features": features,
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, separators=(",", ":")))
+    print(f"[ok] {out} {len(features)} buildings", file=sys.stderr)
+    return payload
+
+
+def parse_building_height(tags: dict) -> float:
+    """Metres from `height`, else from `building:levels`, else 0 for unknown."""
+    raw = tags.get("height") or tags.get("building:height")
+    if raw:
+        try:
+            return float(str(raw).replace("m", "").strip())
+        except ValueError:
+            pass
+    levels = tags.get("building:levels")
+    if levels:
+        try:
+            return float(str(levels).split(";")[0]) * LEVEL_M
+        except ValueError:
+            pass
+    return 0.0
+
+
 def parse_bbox(text: str) -> tuple[float, float, float, float]:
     parts = [float(p) for p in text.split(",")]
     if len(parts) != 4:
@@ -225,12 +298,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--download", action="store_true", help="fetch the country extract")
     parser.add_argument("--filter", action="store_true", help="reduce it to drivable roads and control nodes")
     parser.add_argument("--export", action="store_true", help="cut a region into roadlaw's schema")
+    parser.add_argument("--buildings", action="store_true", help="also export the region's buildings")
     parser.add_argument("--bbox", type=parse_bbox, help="south,west,north,east")
     parser.add_argument("--out", type=Path, help="where the region goes")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
 
-    if args.download or args.filter or not (args.export):
+    if args.download or args.filter or not (args.export or args.buildings):
         download(args.force)
     if args.filter:
         filter_roads()
@@ -238,6 +312,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.bbox is None or args.out is None:
             parser.error("--export needs --bbox and --out")
         export_region(args.bbox, args.out, driving_side=surveyed_driving_side(args.bbox))
+    if args.buildings:
+        if args.bbox is None or args.out is None:
+            parser.error("--buildings needs --bbox and --out")
+        export_buildings(args.bbox, args.out.with_name(args.out.stem.replace("_osm_highways", "") + "_buildings.geojson"))
     return 0
 
 

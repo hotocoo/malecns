@@ -34,6 +34,7 @@ from scene import (
     SCENE_CLASSES,
     SceneConfig,
     Traffic,
+    build_buildings,
     build_network,
     build_road,
     frame_at,
@@ -83,6 +84,7 @@ class SceneBundle:
     control_points: tuple
     road: object
     network: object  # every other surveyed road in the region
+    buildings: object  # the city the road runs through
     fixtures: list
     halfwidth: np.ndarray
 
@@ -104,6 +106,11 @@ def load_scene(track: Path, scene_cfg: SceneConfig | None = None) -> SceneBundle
     # instead of ending in grass.
     survey = highways_path(track)
     network = build_network(survey, proj, scene_cfg) if survey.exists() else None
+    # The city the street runs through. Without it the camera sees a road in a
+    # field, and so does the detector.
+    buildings = build_buildings(
+        track.with_name(track.stem + "_buildings.geojson"), proj, scene_cfg, centre=centerline
+    )
     fixtures = place_signals(control_points, centerline, heights, profile, profile.driving_side, scene_cfg)
     fixtures += place_signs(control_points, centerline, heights, profile, profile.driving_side, scene_cfg)
     return SceneBundle(
@@ -113,6 +120,7 @@ def load_scene(track: Path, scene_cfg: SceneConfig | None = None) -> SceneBundle
         control_points=control_points,
         road=road,
         network=network,
+        buildings=buildings,
         fixtures=fixtures,
         halfwidth=lane_halfwidth(profile, scene_cfg),
     )
@@ -176,7 +184,7 @@ def capture(
     )
 
     camera = DriverCamera(camera_cfg, scene_cfg)
-    camera.set_static(bundle.road, network=bundle.network)
+    camera.set_static(bundle.road, network=bundle.network, buildings=bundle.buildings)
     tangent, normal = frame_at(bundle.centerline)
     n = bundle.centerline.shape[0]
 

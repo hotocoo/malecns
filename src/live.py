@@ -33,6 +33,7 @@ import numpy as np
 import torch
 
 from camera import CameraConfig
+import defaults
 from defaults import CONTROL_DT_S
 from law import load_law
 from lawreward import GREEN, AMBER, RED, LawEnforcer, SignalTiming, signal_phase
@@ -156,7 +157,13 @@ class Simulation:
             self.scene.centerline, self.scene.heights, self.scene.profile, self.traffic, seed=seed
         )
 
-        cfg = CarConfig(layout="geojson", geojson_path=str(track), max_laps=0)
+        cfg = CarConfig(
+            layout="geojson",
+            geojson_path=str(track),
+            max_laps=0,
+            max_speed=17.0,  # a street car; the F1 default cannot corner here
+            lane_offset_m=-1.9,  # start in the left lane, as Malaysia drives
+        )
         self.device = torch.device("cpu")
         self.env = CarEnv(batch=1, device=self.device, cfg=cfg)
         points, proj = load_geojson_centerline(
@@ -167,20 +174,67 @@ class Simulation:
         control_points = control_points_for_circuit(track, proj, load_law(), centerline=centerline)
         self.law = LawEnforcer(profile, control_points, self.env.track.centerline.cpu(), self.device)
         self.env.attach_law(self.law)
+        # The camera is the eye here too: without this the environment would
+        # still hand out ray distances, and the connectome - evolved on a
+        # 120-channel detection view - would be reading a 20-column ray fan.
+        self.env.attach_sensor(self.sensor)
         self.timing = SignalTiming()
+        self.agent = None
+        self.brain = None
+        self.last_observation = None
+        self.last_action = None
+        self.driver_note = ""
         self.driver = self._load_driver(checkpoint)
+        print(f"[live] driver: {self.driver_note}")
         self.env.reset()
 
     def _load_driver(self, checkpoint: Path | None):
-        """The evolved driver when one is given, otherwise a steady cruise.
+        """The evolved connectome, when a checkpoint for this eye exists.
 
-        Without a checkpoint the car still drives the lap so the stream shows
-        the perception and the law working; it is simply not being steered by
-        the connectome.
+        A checkpoint is only usable if it was evolved against an eye of the same
+        width: the observation is one column per channel, and a brain built for
+        96 channels reads a 120-channel view as nonsense. A mismatch is reported
+        and the stream falls back to a scripted cruise, which still shows the
+        perception and the law working - it is simply not the connectome
+        driving, and the page says so.
         """
         if checkpoint is None or not Path(checkpoint).exists():
+            self.driver_note = "no checkpoint: scripted cruise"
             return None
-        return None  # a camera-eye checkpoint is produced by the trainer, not here
+        try:
+            saved = torch.load(checkpoint, map_location="cpu")
+        except (RuntimeError, EOFError) as exc:
+            self.driver_note = f"checkpoint unreadable ({exc.__class__.__name__}): scripted cruise"
+            return None
+
+        width = int(saved.get("eye_width", -1))
+        if width != self.eye.width:
+            self.driver_note = f"checkpoint eye {width} != {self.eye.width}: scripted cruise"
+            return None
+
+        from agent import AgentConfig, ConnectomeAgent
+        from brain import Brain, LIFConfig, load_connectome, pick_device
+
+        connectome = load_connectome(Path("data/graph"))
+        device = pick_device("cpu")
+        brain = Brain(connectome, batch=1, config=LIFConfig(), device=device, weight_scale=defaults.WEIGHT_SCALE)
+        saved_cfg = saved.get("agent_cfg") or {}
+        cfg = AgentConfig(
+            n_rays=self.eye.width,
+            substeps=int(saved_cfg.get("substeps", defaults.SUBSTEPS)),
+        )
+        agent = ConnectomeAgent(brain, connectome.neurons, cfg)
+        theta = agent.unpack(saved["mu"].to(device).unsqueeze(0))
+        agent.reset(batch=1)
+        agent.seed(0)
+        self.agent = agent
+        self.brain = brain
+        self.driver_note = f"connectome, generation {saved.get('generation', 0)}"
+
+        def drive(observation: torch.Tensor) -> torch.Tensor:
+            return agent.act(observation.to(device), theta)
+
+        return drive
 
     def control(self, observation: torch.Tensor) -> torch.Tensor:
         """Steer along the lap and hold a speed under whatever is posted."""
@@ -227,7 +281,60 @@ class Simulation:
             "nearest_hazard_m": round(self.director.nearest_hazard_m(env.pos[0].numpy()), 1),
             "signals": phases,
             "track": str(self.track),
+            "driver": self.driver_note,
+            "senses": self.senses(),
+            "brain": self.brain_state(),
+            "controls": {
+                "steer": float(self.last_action[0]) if self.last_action is not None else 0.0,
+                "pedal": float(self.last_action[1]) if self.last_action is not None else 0.0,
+            },
         }
+
+    def senses(self) -> dict:
+        """What the eye handed the brain this step, column by column.
+
+        This is the driver's whole world: nothing else reaches it. Each row is
+        one channel of the detection view, each column one slice of the field
+        of view, left to right.
+        """
+        if self.last_observation is None:
+            return {}
+        rows = self.eye._rows()
+        columns = self.eye.config.columns
+        grid = self.last_observation[: rows.__len__() * columns].reshape(len(rows), columns)
+        return {
+            "columns": columns,
+            "rows": rows,
+            "values": [[round(float(v), 3) for v in row] for row in grid],
+            "own_speed": round(float(self.last_observation[-1]), 3),
+        }
+
+    def brain_state(self) -> dict:
+        """How much of the connectome is firing, and how hard it is driving.
+
+        `rate_hz` is what the eye injected into the visual neurons; `dn_hz` is
+        what the descending neurons - the cells that actually carry a command
+        out of the brain - fired back. A driver that sees nothing has a flat
+        sensory row; one that has stopped reacting has a flat descending row.
+        """
+        agent = self.agent
+        if agent is None:
+            return {}
+        state: dict = {}
+        rates = getattr(agent, "last_rates_hz", None)
+        if rates is not None and rates.numel():
+            row = rates[0].detach().cpu().numpy()
+            state["sensory_hz"] = [round(float(v), 2) for v in row[: min(row.size, 64)]]
+            state["sensory_mean_hz"] = round(float(row.mean()), 2)
+        brain = self.brain
+        if brain is not None and getattr(brain, "dn_acc", None) is not None:
+            dn = brain.dn_acc.detach().cpu().numpy()
+            if dn.size:
+                per_body = dn[0] if dn.ndim > 1 else dn
+                state["dn_active"] = int((per_body > 0).sum())
+                state["dn_total"] = int(per_body.size)
+                state["dn_mean"] = round(float(per_body.mean()), 4)
+        return state
 
     def run(self, shared: Shared, fps: float) -> None:
         """Drive, render, detect and publish until asked to stop."""
@@ -238,6 +345,8 @@ class Simulation:
         while shared.running:
             started = time.time()
             action = self.control(observation)
+            self.last_observation = observation.detach().cpu().numpy()[0]
+            self.last_action = action.detach().cpu().numpy()[0]
             observation, _, done = self.env.step(action)
             if bool(done[0]):
                 self.env.reset()
@@ -275,6 +384,9 @@ PAGE = """<!doctype html>
  main{display:flex;gap:16px;padding:16px;flex-wrap:wrap}
  img{width:min(880px,96vw);border:1px solid #26272c;background:#000}
  table{border-collapse:collapse;min-width:280px}
+ .panel{margin-top:14px}
+ .label{color:#8b8d96;margin-bottom:5px;font-size:12px}
+ canvas{background:#0b0c0f;border:1px solid #26272c;width:min(880px,96vw)}
  td{padding:3px 10px 3px 0;vertical-align:top}
  td.k{color:#8b8d96}
  .warn{color:#ff8a7a}
@@ -282,7 +394,17 @@ PAGE = """<!doctype html>
 <body>
 <header>driver camera &mdash; real frames, real detector, real charges</header>
 <main>
-  <img id="feed" src="/stream.mjpg" alt="driver camera">
+  <div>
+    <img id="feed" src="/stream.mjpg" alt="driver camera">
+    <div class="panel">
+      <div class="label">what the brain receives &mdash; rows are channels, columns the field of view</div>
+      <canvas id="senses" width="880" height="230"></canvas>
+    </div>
+    <div class="panel">
+      <div class="label">steering and pedal</div>
+      <canvas id="controls" width="880" height="60"></canvas>
+    </div>
+  </div>
   <table id="telemetry"></table>
 </main>
 <script>
@@ -290,6 +412,7 @@ const rows = [
   ["step","step"],["speed","speed_kmh"],["posted limit","limit_kmh"],["keeps","driving_side"],
   ["offset from centre","offset_m"],["lap","lap"],["detected","detections"],["law this step","law_total"],
   ["events running","events"],["events so far","events_total"],["nearest hazard","nearest_hazard_m"],
+  ["driven by","driver"],
 ];
 async function poll(){
   try{
@@ -307,9 +430,43 @@ async function poll(){
     }).join("");
     const charges = Object.entries(t.law||{}).filter(([,v])=>v<0)
       .map(([k,v])=>`<tr><td class="k">${k}</td><td class="warn">${v.toFixed(3)}</td></tr>`).join("");
-    document.getElementById("telemetry").innerHTML = body + charges;
+    const brain = t.brain || {};
+    const extra = Object.entries(brain).filter(([k])=>!Array.isArray(brain[k]))
+      .map(([k,v])=>`<tr><td class="k">${k}</td><td>${v}</td></tr>`).join("");
+    document.getElementById("telemetry").innerHTML = body + charges + extra;
+    drawSenses(t); drawControls(t);
   }catch(e){}
   setTimeout(poll, 250);
+}
+function drawSenses(t){
+  const s = t.senses; if(!s || !s.values) return;
+  const c = document.getElementById("senses"), g = c.getContext("2d");
+  g.clearRect(0,0,c.width,c.height);
+  const rows = s.values.length, cols = s.columns;
+  const labelW = 120, cellW = (c.width-labelW)/cols, cellH = c.height/rows;
+  for(let r=0;r<rows;r++){
+    for(let k=0;k<cols;k++){
+      const v = Math.max(0, Math.min(1, s.values[r][k]));
+      // Dark where the channel is silent, bright where it is driving hard.
+      g.fillStyle = `rgb(${Math.round(20+200*v)},${Math.round(24+150*v)},${Math.round(30+60*v)})`;
+      g.fillRect(labelW+k*cellW, r*cellH, cellW-1, cellH-1);
+    }
+    g.fillStyle = "#8b8d96"; g.font = "10px ui-monospace,monospace";
+    g.fillText(s.rows[r], 4, r*cellH + cellH*0.7);
+  }
+}
+function drawControls(t){
+  const c = document.getElementById("controls"), g = c.getContext("2d");
+  g.clearRect(0,0,c.width,c.height);
+  const mid = c.width/2;
+  g.strokeStyle="#26272c"; g.beginPath(); g.moveTo(mid,0); g.lineTo(mid,c.height); g.stroke();
+  const ctl = t.controls || {steer:0,pedal:0};
+  g.fillStyle="#5ad48a"; g.fillRect(mid, 8, ctl.steer*mid, 18);
+  g.fillStyle= ctl.pedal>=0 ? "#5aa0d4" : "#ff8a7a";
+  g.fillRect(mid, 34, ctl.pedal*mid, 18);
+  g.fillStyle="#8b8d96"; g.font="10px ui-monospace,monospace";
+  g.fillText("steer "+ctl.steer.toFixed(2), 6, 21);
+  g.fillText("pedal "+ctl.pedal.toFixed(2), 6, 47);
 }
 poll();
 </script>
@@ -392,7 +549,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pedestrians", type=int, default=60)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default=None)
-    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("checkpoints/camera/driver.pt"),
+        help="the evolved driver to watch; falls back to a scripted cruise when it does not fit this eye",
+    )
     args = parser.parse_args(argv)
 
     shared = Shared()

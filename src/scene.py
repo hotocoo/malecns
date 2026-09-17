@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from lawreward import GREEN, RED, SignalTiming, signal_phase_numpy
-from roadlaw import UNKNOWN_LANES, ControlPoint, LegalProfile, parse_lanes
+from roadlaw import UNKNOWN_LANES, ControlPoint, LegalProfile, parse_lanes, parse_oneway
 
 # Classes a camera should see as road. Wider than the set a route is built on:
 # a service road beside the lap is still asphalt the driver looks at.
@@ -82,6 +82,11 @@ class SceneConfig:
     marking_width_m: float = 0.12
     dash_len_m: float = 3.0
     dash_gap_m: float = 6.0
+
+    # What a building is given when the survey measured neither its height nor
+    # its storeys. Malaysian shoplots are typically two or three storeys.
+    storey_m: float = 3.2
+    unknown_storeys: float = 3.0
 
     signal_height_m: float = 4.2  # head height above the road
     signal_offset_m: float = 0.6  # clear of the kerb, on the near side
@@ -274,6 +279,12 @@ def build_network(
         edge = half - cfg.shoulder_m
         marks.append(_open_ribbon(points, heights, edge - cfg.marking_width_m, edge, 0.01))
         marks.append(_open_ribbon(points, heights, -edge, -edge + cfg.marking_width_m, 0.01))
+        # A two-way street is divided down the middle, like every real one.
+        if parse_oneway(tags.get("oneway")) in (None, 0):
+            mark = cfg.marking_width_m
+            dashes = _dashed(points, heights, -mark / 2.0, mark / 2.0, 0.012, cfg)
+            if dashes.shape[0]:
+                marks.append(dashes)
 
     if not surfaces:
         empty = np.zeros((0, 3), dtype=np.float32)
@@ -288,6 +299,108 @@ def build_network(
         markings_colour=np.tile(np.array([0.88, 0.88, 0.84], dtype=np.float32), (markings.shape[0], 1)),
         halfwidth_m=np.zeros(0),
     )
+
+
+def build_buildings(
+    path,
+    proj,
+    cfg: SceneConfig | None = None,
+    ground_z: float = 0.0,
+    max_distance_m: float = 900.0,
+    centre: np.ndarray | None = None,
+) -> RoadMesh:
+    """Every surveyed building near the circuit, extruded to its own height.
+
+    A street with no buildings is a road in a field, and a camera driving it
+    sees only sky. OSM carries the footprint of nearly every building in a
+    Malaysian city, and a height or a storey count for many of them; a building
+    the survey leaves unmeasured is given `cfg.unknown_storeys` storeys, which
+    is declared here rather than inferred from nothing.
+
+    Only what stands within `max_distance_m` of the lap is built: a city's worth
+    of walls that the camera can never see costs memory and buys no pixels.
+    """
+    cfg = cfg or SceneConfig()
+    path = Path(path)
+    if not path.exists():
+        empty = np.zeros((0, 3), dtype=np.float32)
+        return RoadMesh(empty, empty, empty, empty, np.zeros(0))
+
+    data = json.loads(path.read_text())
+    walls: list[np.ndarray] = []
+    shades: list[np.ndarray] = []
+    for feature in data.get("features", []):
+        rings = (feature.get("geometry") or {}).get("coordinates") or []
+        if not rings or len(rings[0]) < 4:
+            continue
+        outline = proj.project(np.array(rings[0][:-1], dtype=np.float64))
+        if centre is not None:
+            near = np.linalg.norm(outline[:, None, :] - centre[None, :, :], axis=2).min()
+            if near > max_distance_m:
+                continue
+        height = float((feature.get("properties") or {}).get("height") or 0.0)
+        if height <= 0.0:
+            height = cfg.unknown_storeys * cfg.storey_m
+        wall, shade = _extrude(outline, ground_z, height, cfg)
+        if wall.shape[0]:
+            walls.append(wall)
+            shades.append(shade)
+
+    if not walls:
+        empty = np.zeros((0, 3), dtype=np.float32)
+        return RoadMesh(empty, empty, empty, empty, np.zeros(0))
+    surface = np.concatenate(walls)
+    return RoadMesh(
+        surface=surface,
+        surface_colour=np.concatenate(shades),
+        markings=np.zeros((0, 3), dtype=np.float32),
+        markings_colour=np.zeros((0, 3), dtype=np.float32),
+        halfwidth_m=np.zeros(0),
+    )
+
+
+def _extrude(outline: np.ndarray, base_z: float, height: float, cfg: SceneConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Walls and a flat roof for one footprint."""
+    if outline.shape[0] < 3:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+    lower = np.concatenate([outline, np.full((outline.shape[0], 1), base_z)], axis=1)
+    upper = lower.copy()
+    upper[:, 2] = base_z + height
+    nxt = np.roll(np.arange(outline.shape[0]), -1)
+    wall = np.stack(
+        [lower, lower[nxt], upper[nxt], lower, upper[nxt], upper], axis=1
+    ).reshape(-1, 3)
+    # A fan from the first vertex closes the roof. Malaysian footprints are
+    # mostly convex shoplots and blocks, where a fan is exact; on a concave one
+    # it overdraws slightly, which the camera cannot tell from a flat roof.
+    fan = np.stack([np.repeat(upper[:1], outline.shape[0] - 2, axis=0), upper[1:-1], upper[2:]], axis=1)
+    surface = np.concatenate([wall, fan.reshape(-1, 3)]).astype(np.float32)
+
+    # A steady tint per building, drawn from its own footprint so the street is
+    # not one colour, and darker on the walls than the roof.
+    seed = abs(float(outline[0, 0]) * 3.7 + float(outline[0, 1]) * 11.3)
+    tone = 0.42 + 0.30 * ((seed * 0.618) % 1.0)
+    warm = np.array([tone, tone * 0.97, tone * 0.92], dtype=np.float32)
+    colours = np.tile(warm, (surface.shape[0], 1))
+    colours[wall.shape[0] :] *= 0.86  # roofs read darker from the street
+    return surface, colours
+
+
+def _dashed(
+    points: np.ndarray, heights: np.ndarray, inner: float, outer: float, lift: float, cfg: SceneConfig
+) -> np.ndarray:
+    """A broken line down a way: painted for `dash_len_m`, blank for `dash_gap_m`."""
+    if points.shape[0] < 2:
+        return np.zeros((0, 3), dtype=np.float32)
+    run = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))])
+    period = max(cfg.dash_len_m + cfg.dash_gap_m, 1e-3)
+    painted = (run % period) < cfg.dash_len_m
+    full = _open_ribbon(points, heights, np.full(points.shape[0], inner), np.full(points.shape[0], outer), lift)
+    if not full.shape[0]:
+        return full
+    per_segment = full.shape[0] // max(points.shape[0] - 1, 1)
+    keep = np.repeat(painted[:-1], per_segment)
+    return full[: keep.shape[0]][keep]
 
 
 def _open_ribbon(
