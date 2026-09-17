@@ -433,7 +433,9 @@ class Traffic:
         def travelling(kind: str, size: np.ndarray, lateral: float, pace: float) -> Actor:
             progress = float(rng.uniform())
             i = min(int(progress * n), n - 1)
-            base = centerline[i] + normal[i] * side * lateral
+            offset = side * lateral
+            base = centerline[i] + normal[i] * offset
+            speed = float(limit[i] * pace)
             return Actor(
                 kind=kind,
                 pos=np.array([base[0], base[1], heights[i]], dtype=np.float64),
@@ -441,11 +443,15 @@ class Traffic:
                 size=size,
                 colour=rng.uniform(0.15, 0.85, size=3).astype(np.float32),
                 progress=progress,
-                speed_mps=float(limit[i] * pace),
+                speed_mps=speed,
+                # Without these the director would pull every vehicle onto the
+                # centreline and stack the whole population in one lane.
+                lane_offset_m=offset,
+                target_speed_mps=speed,
             )
 
         for _ in range(vehicles):
-            lane = half.mean() * rng.uniform(0.25, 0.6)
+            lane = half.mean() * rng.uniform(0.3, 0.75)
             actors.append(
                 travelling(
                     CLASS_CAR,
@@ -455,7 +461,8 @@ class Traffic:
                 )
             )
         for _ in range(motorcycles):
-            lane = half.mean() * rng.uniform(0.4, 0.8)
+            # Two-wheelers sit wide of the car line, which is where they ride.
+            lane = half.mean() * rng.uniform(0.75, 1.15)
             actors.append(
                 travelling(
                     CLASS_MOTORCYCLE,
@@ -473,7 +480,7 @@ class Traffic:
             else:
                 progress = float(rng.uniform())
             i = min(int(progress * n), n - 1)
-            across = float(rng.uniform(-1.0, 1.0)) * half[i]
+            across = float(rng.uniform(0.9, 1.5)) * half[i] * (1.0 if rng.uniform() < 0.5 else -1.0)
             base = centerline[i] + normal[i] * across
             actors.append(
                 Actor(
@@ -482,8 +489,12 @@ class Traffic:
                     heading=float(np.arctan2(normal[i, 1], normal[i, 0])),
                     size=np.array([cfg.person_width_m, cfg.person_width_m, cfg.person_height_m]),
                     colour=rng.uniform(0.2, 0.8, size=3).astype(np.float32),
-                    progress=progress,
-                    speed_mps=float(rng.uniform(0.8, 1.6)),
+                    # People stand where they are put, beside the road or at a
+                    # crossing; they do not travel down the lane like a vehicle.
+                    progress=-1.0,
+                    behaviour="free",
+                    velocity=np.zeros(3),
+                    speed_mps=0.0,
                 )
             )
         return cls(actors=actors, cfg=cfg)

@@ -196,8 +196,10 @@ class DriverCamera:
         self.program = self.ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
         self.fbo = self.ctx.simple_framebuffer((self.cfg.width, self.cfg.height), components=3)
         self._static: moderngl.VertexArray | None = None
+        self._static_buffer: moderngl.Buffer | None = None
         self._static_count = 0
         self._dynamic: moderngl.VertexArray | None = None
+        self._dynamic_buffer: moderngl.Buffer | None = None
         self.program["fog_colour"].value = self.cfg.sky_colour
         self.program["fog_start"].value = self.cfg.fog_start_m
         self.program["fog_end"].value = self.cfg.far_m
@@ -212,14 +214,31 @@ class DriverCamera:
 
     def _vertex_array(
         self, vertices: np.ndarray, colours: np.ndarray, normals: np.ndarray | None = None
-    ) -> moderngl.VertexArray:
+    ) -> tuple[moderngl.VertexArray, moderngl.Buffer]:
+        """A vertex array and the buffer behind it.
+
+        The buffer is handed back because releasing a `VertexArray` does not
+        free it: the dynamic geometry is rebuilt every frame, so a buffer left
+        behind each time is a leak measured in hundreds of megabytes a minute.
+        """
         if normals is None or normals.shape != vertices.shape:
             normals = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (vertices.shape[0], 1))
         data = np.concatenate([vertices, colours, normals], axis=1).astype("f4").tobytes()
         buffer = self.ctx.buffer(data)
-        return self.ctx.vertex_array(
+        array = self.ctx.vertex_array(
             self.program, [(buffer, "3f 3f 3f", "in_position", "in_colour", "in_normal")]
         )
+        return array, buffer
+
+    def _set_dynamic(self, vertices: np.ndarray, colours: np.ndarray, normals: np.ndarray) -> None:
+        """Replace the per-frame geometry, freeing what the last frame used."""
+        if self._dynamic is not None:
+            self._dynamic.release()
+            self._dynamic = None
+        if self._dynamic_buffer is not None:
+            self._dynamic_buffer.release()
+            self._dynamic_buffer = None
+        self._dynamic, self._dynamic_buffer = self._vertex_array(vertices, colours, normals)
 
     def set_static(
         self,
@@ -245,7 +264,7 @@ class DriverCamera:
         tints += [road.surface_colour, road.markings_colour]
         vertices = np.concatenate(parts)
         colours = np.concatenate(tints)
-        self._static = self._vertex_array(vertices, colours)
+        self._static, self._static_buffer = self._vertex_array(vertices, colours)
         self._static_count = vertices.shape[0]
 
     def visible(self, pos_xy: np.ndarray, heading: float, actors: list[Actor]) -> list[Actor]:
@@ -325,7 +344,9 @@ class DriverCamera:
             return False
         try:
             relative = pick(family, max(actor.node_id, 0) if actor.node_id >= 0 else self._variant(actor))
-            mesh = load_mesh(relative, fit=tuple(float(v) for v in actor.size))
+            # Rounded to the centimetre so two actors of the same nominal size
+            # share one cached mesh instead of each filling a cache slot.
+            mesh = load_mesh(relative, fit=tuple(round(float(v), 2) for v in actor.size))
         except (MissingAsset, Exception):
             return False
 
@@ -423,9 +444,7 @@ class DriverCamera:
 
         vertices, colours, normals = self._actor_geometry(self.visible(pos_xy, heading, actors))
         if vertices.shape[0]:
-            if self._dynamic is not None:
-                self._dynamic.release()
-            self._dynamic = self._vertex_array(vertices, colours, normals)
+            self._set_dynamic(vertices, colours, normals)
             self._dynamic.render(moderngl.TRIANGLES, vertices=vertices.shape[0])
 
         raw = self.fbo.read(components=3, dtype="f1")
@@ -461,6 +480,11 @@ class DriverCamera:
         self.program["mvp"].write((proj @ view).T.astype("f4").tobytes())
         self.program["fog_start"].value = cfg.far_m * 4.0
         self.program["fog_end"].value = cfg.far_m * 8.0
+        # The index pass must write the identity colour untouched. Lighting
+        # multiplies it, and an index of 1 is 1/255 in the blue channel, so a
+        # lit index pass rounds two different actors to the same byte and the
+        # labels silently collapse onto whichever one drew last.
+        self.program["ambient"].value = 1.0
 
         self.fbo.use()
         self.ctx.clear(0.0, 0.0, 0.0, depth=1.0)
@@ -476,9 +500,7 @@ class DriverCamera:
             offset += span
         boxes: list[tuple[str, int, int, int, int]] = []
         if vertices.shape[0]:
-            if self._dynamic is not None:
-                self._dynamic.release()
-            self._dynamic = self._vertex_array(vertices, colours)
+            self._set_dynamic(vertices, colours, np.zeros_like(vertices))
             self._dynamic.render(moderngl.TRIANGLES, vertices=vertices.shape[0])
             raw = self.fbo.read(components=3, dtype="f1")
             ids = np.frombuffer(raw, dtype=np.uint8).reshape(cfg.height, cfg.width, 3)
@@ -511,10 +533,11 @@ class DriverCamera:
 
         self.program["fog_start"].value = cfg.fog_start_m
         self.program["fog_end"].value = cfg.far_m
+        self.program["ambient"].value = cfg.ambient
         return frame, boxes
 
     def release(self) -> None:
-        for obj in (self._static, self._dynamic, self.fbo):
+        for obj in (self._static, self._static_buffer, self._dynamic, self._dynamic_buffer, self.fbo):
             if obj is not None:
                 obj.release()
         self.ctx.release()

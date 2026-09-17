@@ -72,8 +72,10 @@ def signal_phase(node_ids: torch.Tensor, elapsed_s: torch.Tensor, timing: Signal
     The offset within the cycle comes from the node id, so two junctions are
     not in lockstep and each one is reproducible across episodes.
     """
-    offset = (node_ids.to(torch.float64) % 997.0) / 997.0 * timing.cycle_s
-    t = torch.remainder(elapsed_s.to(torch.float64) + offset, timing.cycle_s)
+    # float32 throughout: MPS has no float64, and a signal cycle is tens of
+    # seconds, which float32 resolves to well under a millisecond.
+    offset = (node_ids.to(torch.float32) % 997.0) / 997.0 * timing.cycle_s
+    t = torch.remainder(elapsed_s.to(torch.float32) + offset, timing.cycle_s)
     phase = torch.full_like(t, RED, dtype=torch.long)
     phase = torch.where(t < timing.green_s + timing.amber_s, torch.full_like(phase, AMBER), phase)
     phase = torch.where(t < timing.green_s, torch.full_like(phase, GREEN), phase)
