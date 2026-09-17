@@ -297,7 +297,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--height", type=int, default=192)
     parser.add_argument("--columns", type=int, default=12)
     parser.add_argument("--perception-stride", type=int, default=3)
-    parser.add_argument("--max-speed", type=float, default=33.0, help="m/s; a street car, not an F1 car")
+    parser.add_argument(
+        "--max-speed",
+        type=float,
+        default=17.0,
+        help=(
+            "m/s. A street car, not an F1 car: 17 m/s is 61 km/h, so a 35 km/h "
+            "road can be exceeded but not by so much that the speeding charge "
+            "swamps every other term, and the car can still corner."
+        ),
+    )
     parser.add_argument(
         "--pace-fraction",
         type=float,

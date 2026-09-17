@@ -191,15 +191,25 @@ class LawEnforcer:
         return self.limit_mps[_progress_index(progress, self.n)]
 
     def _crossed(self, prev_progress: torch.Tensor, progress: torch.Tensor, marks: torch.Tensor) -> torch.Tensor:
-        """(batch, marks) True where a car passed that mark during this step."""
+        """(batch, marks) True where a car drove forward past that mark this step.
+
+        Only a forward pass counts. A car stopped at a junction has its progress
+        jitter by a few centimetres either side of the stop line, and treating
+        every one of those as a fresh crossing charged the one-off red-light
+        penalty sixty times a second - which is where a stationary car was
+        picking up hundreds of points of fines for doing nothing.
+        """
         if marks.numel() == 0:
             return torch.zeros(progress.shape[0], 0, dtype=torch.bool, device=self.device)
+        step = progress - prev_progress
+        wrapped = step < -0.5  # crossed the start/finish point going forward
+        forward = (step > 0.0) | wrapped
         lo = prev_progress.unsqueeze(1)
         hi = progress.unsqueeze(1)
-        wrapped = hi < lo
         within = (marks.unsqueeze(0) > lo) & (marks.unsqueeze(0) <= hi)
         over_wrap = (marks.unsqueeze(0) > lo) | (marks.unsqueeze(0) <= hi)
-        return torch.where(wrapped.expand_as(within), over_wrap, within)
+        crossed = torch.where(wrapped.unsqueeze(1).expand_as(within), over_wrap, within)
+        return crossed & forward.unsqueeze(1)
 
     def charge(
         self,
