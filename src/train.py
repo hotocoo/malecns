@@ -739,6 +739,21 @@ def main(argv: list[str] | None = None) -> int:
             best_eval = float(torch.load(args.best, map_location="cpu").get("best_eval", best_eval))
         except (RuntimeError, EOFError, KeyError):
             pass
+    # A bad resumed checkpoint must never erase a previously observed high-water
+    # mark just because `best.pt` itself was overwritten by an older guard bug.
+    # Recover the historical evaluation maximum from the training log before
+    # allowing a new best snapshot to replace the file.
+    if args.log.exists():
+        try:
+            historical_best = max(
+                (float(json.loads(line).get("eval_fitness_best_island"))
+                 for line in args.log.read_text().splitlines()
+                 if line.strip() and json.loads(line).get("eval_fitness_best_island") is not None),
+                default=-float("inf"),
+            )
+            best_eval = max(best_eval, historical_best)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
     args.log.parent.mkdir(parents=True, exist_ok=True)
     if args.checkpoint.exists():
