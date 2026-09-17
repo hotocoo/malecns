@@ -1426,11 +1426,27 @@ async function refreshMeta(frame) {
     state.ui = state.cfg.ui;
     initLists();
     renderParams();
+    await refreshTrackMesh();
   } catch (err) {
     console.warn("meta refresh failed", err);
   } finally {
     metaRefreshing = false;
   }
+}
+
+/* The curriculum changes the road width between stages. The drawn road comes
+ * from /api/track, fetched once at boot, so a page that stayed open kept the
+ * old barriers while the cars drove on the new width: the car appeared to go
+ * through the wall. The server stamps every track build with an epoch; when it
+ * moves, the mesh is rebuilt from the new payload. */
+async function refreshTrackMesh() {
+  const epoch = state.meta.track_epoch;
+  if (epoch === undefined || epoch === state.track.epoch) return;
+  const track = await (await fetch("/api/track", { cache: "no-store" })).json();
+  state.track = track;
+  if (state.drive) state.drive.load(track);
+  drawTrack(null);
+  console.info(`track mesh rebuilt: road ${(track.halfwidth * 2).toFixed(1)} m (epoch ${track.epoch})`);
 }
 
 function connect() {

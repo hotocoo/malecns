@@ -60,7 +60,11 @@ def drive(env: CarEnv, steer: float, pedal: float, steps: int) -> torch.Tensor:
 # --- 1, 17: reward -------------------------------------------------------------------
 def test_finish_line_oscillation_pays_the_lap_bonus_once(loop_track):
     # max_laps=0: completing the lap must not end (and freeze) the car, or it cannot drive back.
-    env = CarEnv(1, CPU, replace(FAST, max_laps=0.0), track=loop_track)
+    # `lap_bonus` is 0 by default (a flat finish bonus outweighed a whole
+    # episode of driving charges); the once-only accounting still has to hold
+    # for anyone who turns it back on.
+    cfg = replace(FAST, max_laps=0.0, lap_bonus=100.0)
+    env = CarEnv(1, CPU, cfg, track=loop_track)
     env.reset()
     cl = loop_track.centerline
     n = cl.shape[0]
@@ -77,7 +81,7 @@ def test_finish_line_oscillation_pays_the_lap_bonus_once(loop_track):
         env.pos = cl[n - 1].unsqueeze(0).clone()  # back over it
         env.step(torch.tensor([[0.0, 0.0]]))
     assert env.laps[0] < 1.0, "net progress is back below one lap"
-    assert FAST.lap_bonus * 0.9 < total_bonus < FAST.lap_bonus * 1.2, total_bonus
+    assert cfg.lap_bonus * 0.9 < total_bonus < cfg.lap_bonus * 1.2, total_bonus
 
 
 def test_progress_reward_is_a_potential(loop_track):
@@ -332,8 +336,8 @@ def test_agent_loom_channel_responds_to_approach():
     theta = agent.unpack(params.unsqueeze(0))
     theta["loom_gain"] = torch.ones_like(theta["loom_gain"])
     # road-relative eyes: 150 m reads as open road, 7.5 m as a wall closer than expected on every ray
-    far = torch.cat([torch.ones(1, 9), torch.tensor([[0.5]])], dim=1)
-    near = torch.cat([torch.full((1, 9), 0.05), torch.tensor([[0.5]])], dim=1)
+    far = torch.cat([torch.ones(1, agent.cfg.n_rays), torch.tensor([[0.5]])], dim=1)
+    near = torch.cat([torch.full((1, agent.cfg.n_rays), 0.05), torch.tensor([[0.5]])], dim=1)
     agent.reset()
     agent.sensory_rates(far, theta)
     approaching = agent.sensory_rates(near, theta)[0, :9]
@@ -349,7 +353,7 @@ def test_readout_keeps_a_steady_signal_and_is_not_saturated_at_init():
     brain = Brain(connectome, batch=1, config=LIFConfig(dt_ms=2.0), device=CPU, weight_scale=0.15)
     agent = ConnectomeAgent(brain, connectome.neurons, AgentConfig(substeps=4))
     theta = agent.unpack(agent.initial_params().unsqueeze(0))
-    obs = torch.cat([torch.ones(1, 9), torch.tensor([[0.3]])], dim=1)
+    obs = torch.cat([torch.ones(1, agent.cfg.n_rays), torch.tensor([[0.3]])], dim=1)
     obs[0, :4] = 0.1  # wall on the left
     agent.reset()
     agent.seed(1)

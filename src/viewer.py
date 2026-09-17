@@ -39,7 +39,7 @@ import numpy as np
 import torch
 
 import defaults
-from agent import AgentConfig, ConnectomeAgent
+from agent import AgentConfig, ConnectomeAgent, match_sensing
 from brain import Brain, LIFConfig, load_connectome, pick_device, synchronize
 from car_env import DONE_NAMES, CarConfig, CarEnv, GeoProjection, Track, build_centerline, load_geojson_centerline, monaco_config
 from terrain import Terrain, _aligned, _length, building_bases, heightfield, road_profile, tunnel_mask, tunnel_spans  # noqa: F401
@@ -368,6 +368,12 @@ class Source:
 
     # --- track and scenery -------------------------------------------------------------
     def build_track(self, layout: str, geojson: str, start_fraction: float, dt_s: float, halfwidth: float | None = None, episode_steps: int = 0) -> None:
+        # Bumped on every build so an open page can tell that the road it drew
+        # is no longer the road the cars drive on. The curriculum widens the
+        # road (stage 0 is 1.6x), and the page used to keep the mesh it booted
+        # with: the cars then drove legally on tarmac that was not drawn, which
+        # looks exactly like phasing through the barrier.
+        self.track_epoch = getattr(self, "track_epoch", 0) + 1
         if layout == "monaco":
             self.car_cfg = replace(monaco_config(dt_s, halfwidth=halfwidth), geojson_path=geojson)
             centerline, self.projection = load_geojson_centerline(
@@ -387,6 +393,11 @@ class Source:
         self.track = Track(centerline, self.car_cfg, self.device)
         cars = getattr(self, "cars", 1)
         fractions = [(start_fraction + k / cars) % 1.0 for k in range(cars)]
+        # Drive with the eye the checkpoint was evolved with, not this build's
+        # default: a 9-ray policy fed a 19-ray observation reads ray 9 as its
+        # speed input and never sees the rays past it.
+        if getattr(self, "agent", None) is not None:
+            self.car_cfg = match_sensing(self.car_cfg, self.agent.cfg)
         self.env = CarEnv(cars, self.device, self.car_cfg, track=self.track, start_fraction=fractions)
         # Read once here, on the thread that owns the GPU: /api/track is served
         # from HTTP threads and a device->host read there ran Metal from two
@@ -462,6 +473,7 @@ class Source:
         stride = self.config.track_stride
         return {
             "name": self.track_name,
+            "epoch": self.track_epoch,
             "properties": self.track_props,
             "centerline": centerline[::stride].round(2).tolist(),
             "stride": stride,
@@ -574,6 +586,7 @@ class Source:
             "role_names": self.role_names,
             "track": self.args.track,
             "track_name": self.track_name,
+            "track_epoch": self.track_epoch,
             "layout": self.layout,
             "done_names": {str(k): v for k, v in DONE_NAMES.items()},
             "config": self.config.as_payload(),
@@ -688,7 +701,7 @@ class Simulation(Source):
             if abs(hw - self.car_cfg.track_halfwidth) > 1e-6 or budget != self.car_cfg.episode_steps:
                 dt_s = defaults.control_dt_s(self.dt_ms, self.substeps)
                 self.build_track(self.args.layout, self.args.geojson, self.args.track / self.args.starts, dt_s, hw, budget)
-                print(f"[viewer] curriculum road half-width now {hw:.2f} m; reload the page for the new track mesh")
+                print(f"[viewer] curriculum road half-width now {hw:.2f} m; open pages rebuild the track mesh")
         return True
 
     def fleet_theta(self, mu_islands: torch.Tensor) -> dict[str, torch.Tensor]:

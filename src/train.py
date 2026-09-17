@@ -18,7 +18,9 @@ start points and the best such result is kept in `checkpoints/best.pt`.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import os
 import signal
 import time
 from dataclasses import asdict, fields as dataclass_fields, replace
@@ -54,6 +56,44 @@ CURRICULUM: tuple[tuple[float, int, float], ...] = (
     (1.25, 3000, 0.20),
     (1.0, 6000, float("inf")),
 )
+
+
+REWARD_FIELDS = (
+    "progress_per_m",
+    "lap_bonus",
+    "time_tax",
+    "wall_margin",
+    "wall_penalty",
+    "crash_penalty",
+    "unfinished_per_m",
+    "speed_penalty",
+    "speed_free_fraction",
+    "pace_penalty",
+    "pace_bonus",
+    "pace_cap",
+    "pace_margin",
+    "align_penalty",
+    "align_free_rad",
+    "align_lookahead_m",
+    "align_lookahead_s",
+    "stall_speed_mps",
+    "stall_steer_start",
+    "stall_steer_penalty",
+    "episode_steps",
+    "max_laps",
+)
+
+
+def reward_terms_changed(saved: dict | None, cfg: CarConfig, episode_steps: int) -> list[str]:
+    """Reward fields whose value in a checkpoint's `car_cfg` differs from this run's.
+
+    Fitness is only comparable within one reward, so a difference here means
+    the stored `best_eval` / `accepted_eval` must be thrown away.
+    """
+    if not saved:
+        return []
+    current = asdict(replace(cfg, episode_steps=episode_steps))
+    return [k for k in REWARD_FIELDS if k in saved and abs(float(saved[k]) - float(current[k])) > 1e-9]
 
 
 def episode_cap(episode_steps: int, stage: int) -> int:
@@ -381,6 +421,11 @@ def evaluate_mean(
     lap_steps_island = torch.where(first_lap > 0, first_lap, torch.full_like(first_lap, float("nan"))).nanmean(1)
     best_island = int(island_fit.argmax())
     return {
+        # Per island, so the acceptance guard can judge each search on its own
+        # result: one scalar for four independent islands reverted three good
+        # means whenever the fourth regressed.
+        "eval_fitness_island": [float(v) for v in island_fit],
+        "eval_laps_island": [float(v) for v in island_laps],
         "eval_fitness": float(per_start_fit.mean()),
         "eval_fitness_best_island": float(island_fit.max()),
         "eval_fitness_min": float(per_start_fit.min()),
@@ -517,6 +562,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="the mean is kept only if its evaluation fitness is within this of the last accepted evaluation; otherwise it reverts to the accepted mean, sigma shrinks and momentum clears (a verified-improvement guard; negative disables)",
     )
+    parser.add_argument(
+        "--guard-patience",
+        type=int,
+        default=5,
+        help="an island rejected by the guard this many evaluations in a row re-anchors on its current score and recovers its full search radius (0 disables the release, which can freeze a run under an unreachable high-water mark)",
+    )
     parser.add_argument("--seed", type=int, default=0, help="perturbations and sensory noise are seeded from this")
     parser.add_argument("--no-exploit-monitor", action="store_true", help="skip the per-step exploit detector")
     parser.add_argument(
@@ -534,6 +585,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def claim_checkpoint(path: Path) -> Path:
+    """Take the lock beside `path`, or refuse to start.
+
+    Two trainers pointed at one checkpoint do not share work: each saves its own
+    mean every generation, so each reads the other's back as if it were its own,
+    the acceptance guard compares scores from two different searches and the
+    accepted mean stops moving. This happened twice in one day and cost hours,
+    so a second trainer on the same checkpoint now exits instead.
+    """
+    lock = path.with_suffix(path.suffix + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if lock.exists():
+        try:
+            holder = int(lock.read_text().strip())
+        except (ValueError, OSError):
+            holder = None
+        if holder is not None and holder != os.getpid():
+            try:
+                os.kill(holder, 0)  # signal 0: does the process exist?
+            except ProcessLookupError:
+                holder = None  # stale lock from a killed trainer
+            except PermissionError:
+                pass  # alive, owned by another user
+            if holder is not None:
+                raise SystemExit(
+                    f"{path} is already being trained by pid {holder} ({lock}). "
+                    "Stop it first, or train into a different --checkpoint."
+                )
+    lock.write_text(str(os.getpid()))
+    atexit.register(lambda: lock.unlink(missing_ok=True))
+    return lock
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.popsize % 2:
@@ -541,6 +625,7 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
+    lock = claim_checkpoint(args.checkpoint)
 
     device = pick_device(args.device)
     connectome = load_connectome(args.graph)
@@ -569,9 +654,19 @@ def main(argv: list[str] | None = None) -> int:
             saved_agent_cfg = torch.load(args.checkpoint, map_location="cpu").get("agent_cfg")
         except (RuntimeError, EOFError, KeyError):
             saved_agent_cfg = None
-    agent_cfg = AgentConfig.from_saved(saved_agent_cfg, substeps=args.substeps)
-    agent = ConnectomeAgent(brain, neurons, agent_cfg)
+    # ... except the eye, which belongs to the environment: the observation has
+    # one column per ray plus speed, so an agent built with the checkpoint's old
+    # ray count reads a ray as its speed input and the population sits still.
+    # `ray_gain` is an angular profile and migrates by resampling, so a policy
+    # trained on a coarser eye keeps driving on the finer one.
     dt_s = defaults.control_dt_s(args.dt_ms, args.substeps)
+    eye = monaco_config(dt_s) if args.layout == "monaco" else CarConfig(dt_s=dt_s)
+    agent_cfg = AgentConfig.from_saved(
+        saved_agent_cfg, substeps=args.substeps, n_rays=eye.n_rays, eye_fov_deg=eye.fov_deg, eye_range_m=eye.max_range
+    )
+    if saved_agent_cfg and int(saved_agent_cfg.get("n_rays", eye.n_rays)) != eye.n_rays:
+        print(f"checkpoint eye has {saved_agent_cfg['n_rays']} rays, this build {eye.n_rays}: ray_gain is resampled onto the finer eye")
+    agent = ConnectomeAgent(brain, neurons, agent_cfg)
     if args.layout == "monaco":
         base_cfg = replace(monaco_config(dt_s), geojson_path=args.geojson)
     else:
@@ -585,6 +680,12 @@ def main(argv: list[str] | None = None) -> int:
         current = getattr(base_cfg, key)
         value = raw.lower() in ("1", "true", "yes") if isinstance(current, bool) else type(current)(raw)
         base_cfg = replace(base_cfg, **{key: value})
+    if (base_cfg.n_rays, base_cfg.fov_deg, base_cfg.max_range) != (agent_cfg.n_rays, agent_cfg.eye_fov_deg, agent_cfg.eye_range_m):
+        raise SystemExit(
+            f"eye mismatch: car sees {base_cfg.n_rays} rays over {base_cfg.fov_deg} deg to {base_cfg.max_range} m, "
+            f"agent expects {agent_cfg.n_rays}/{agent_cfg.eye_fov_deg}/{agent_cfg.eye_range_m}; "
+            "the observation would be read one column out of step"
+        )
     bank = TrackBank(base_cfg, args.layout, args.tracks, device)
     _, track0 = bank.get(len(CURRICULUM) - 1)
     tie_tol = args.tie_tol if args.tie_tol >= 0 else base_cfg.time_tax
@@ -604,7 +705,31 @@ def main(argv: list[str] | None = None) -> int:
     best_lap_steps: float | None = None
     accepted_mu: torch.Tensor | None = None
     accepted_eval: float | None = None
+    accepted_island_eval: torch.Tensor | None = None
+    # Consecutive rejections per island. The accepted score is a high-water
+    # mark that never decays, so an island that once evaluated high and then
+    # cannot beat that score again is reverted every evaluation forever, with
+    # sigma and the trust region pinned at their floors: the run freezes (seen
+    # at generation 201, 4/4 islands reverted, sigma 0.005, best 6.44 against
+    # an accepted 21.00). After `--guard-patience` rejections in a row the
+    # island re-anchors on where it actually is and gets its full search radius
+    # back, so the guard protects against drift without being able to stop the
+    # search outright.
+    reject_streak: torch.Tensor | None = None
     sigma = args.sigma
+    # Lower end of the search radius. The acceptance guard narrows sigma when it
+    # rejects a step, but the pull-back above floored it at `args.sigma` again
+    # every generation, so the narrowing never survived to the next sample and a
+    # run that started rejecting kept proposing steps of the same size forever
+    # (the mean sat at the same accepted score for ten generations). Each
+    # rejection now lowers the floor with it; an accepted step restores it.
+    sigma_floor = args.sigma
+    # Trust region, adaptive like sigma. The raw step is almost always larger
+    # than the cap, so the cap *is* the step length: leaving it fixed meant a
+    # rejecting run kept moving the same distance no matter how often it
+    # overshot, and only the sample radius shrank. Each rejection halves the
+    # distance towards a quarter of the base; an accepted step restores it.
+    step_frac = args.max_step_frac
     recent_laps: list[float] = []
     # best.pt is only ever overwritten by a better deterministic evaluation,
     # whatever the resumed checkpoint remembers: a resumed run that had lost
@@ -650,11 +775,29 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"{exc}: parameters restart from init, generation counter continues at {generation}")
         stage = int(state.get("stage", stage)) if not args.no_curriculum else stage
-        best_eval = max(best_eval, float(state.get("best_eval", -float("inf"))))
-        best_lap_steps = state.get("best_lap_steps", None)
-        accepted_eval = state.get("accepted_eval", None)
+        # Scores from a different reward are not comparable to scores from this
+        # one. Carrying them over freezes training: the acceptance guard below
+        # compares this generation's evaluation against `accepted_eval`, so
+        # after the lap bonus was removed every mean looked ~100 points worse
+        # than the stored one and was reverted, generation after generation.
+        # The mean itself is still a driver, so it is kept; only its stale
+        # scores are dropped and re-measured on the first evaluation.
+        changed = reward_terms_changed(state.get("car_cfg"), bank.get(stage)[0], episode_cap(args.episode_steps, stage))
+        if changed:
+            print(f"reward changed since the checkpoint ({', '.join(changed)}); dropping its stored scores and re-measuring the mean")
+        best_eval = -float("inf") if changed else max(best_eval, float(state.get("best_eval", -float("inf"))))
+        best_lap_steps = None if changed else state.get("best_lap_steps", None)
+        accepted_eval = None if changed else state.get("accepted_eval", None)
+        saved_island_eval = None if changed else state.get("accepted_island_eval", None)
+        accepted_island_eval = saved_island_eval.to(device) if saved_island_eval is not None else None
         accepted_mu = state["accepted_mu"].to(device) if state.get("accepted_mu") is not None else None
         if accepted_mu is not None and accepted_mu.shape != mu.shape:
+            accepted_mu, accepted_eval, accepted_island_eval = None, None, None
+        if accepted_island_eval is not None and accepted_island_eval.numel() != mu.shape[0]:
+            # island count changed (migration): the per-island scores no longer
+            # line up with the means, so they are re-measured
+            accepted_island_eval = None
+        if accepted_island_eval is None:
             accepted_mu, accepted_eval = None, None
         sigma = float(state.get("sigma", sigma))
         recent_laps = list(state.get("recent_laps", []))
@@ -670,6 +813,7 @@ def main(argv: list[str] | None = None) -> int:
                 "best_eval": best_eval,
                 "best_lap_steps": best_lap_steps,
                 "accepted_eval": accepted_eval,
+                "accepted_island_eval": accepted_island_eval.cpu() if accepted_island_eval is not None else None,
                 "accepted_mu": accepted_mu.cpu() if accepted_mu is not None else None,
                 "sigma": sigma,
                 "recent_laps": recent_laps[-args.curriculum_window :],
@@ -730,16 +874,17 @@ def main(argv: list[str] | None = None) -> int:
         # oscillation collapse). Do not turn that signal into an ES update.
         informative = rank_informative and not exploit_block
         grad = torch.zeros_like(mu)
+        step = torch.zeros_like(mu)
         if informative:
             grad = (perturb * advantage[:, :, None]).sum(1) / (args.popsize * sigma)
             momentum = args.momentum * momentum + grad
             step = args.lr * momentum
-            if args.max_step_frac > 0:
+            if step_frac > 0:
                 # Trust region: one generation may move an island's mean by at
                 # most this fraction of its norm. Generation 1 of the calibrated
                 # run moved it by 26 % (grad norm 37, lr 0.05) and the driver
                 # went from 1.3 laps to crawling at 8 km/h.
-                limit = args.max_step_frac * mu.norm(dim=1, keepdim=True).clamp(min=1e-6)
+                limit = step_frac * mu.norm(dim=1, keepdim=True).clamp(min=1e-6)
                 scale = (limit / step.norm(dim=1, keepdim=True).clamp(min=1e-12)).clamp(max=1.0)
                 step = step * scale
             mu = agent.clamp_params(mu + step)
@@ -752,7 +897,7 @@ def main(argv: list[str] | None = None) -> int:
         # exploit-contaminated), and pull back towards the base value when the
         # generation provides a trustworthy selection signal.
         if args.sigma_max > 0:
-            sigma = min(args.sigma_max, sigma * args.sigma_grow) if not informative else max(args.sigma, sigma * args.sigma_shrink)
+            sigma = min(args.sigma_max, sigma * args.sigma_grow) if not informative else max(sigma_floor, sigma * args.sigma_shrink)
 
         generation += 1
         recent_laps.append(float(laps.mean()))
@@ -815,9 +960,10 @@ def main(argv: list[str] | None = None) -> int:
             "at_bounds": agent.fraction_at_bounds(mu),
             "mu_norm": float(mu.norm()),
             "grad_norm": float(grad.norm()),
-        "step_norm": float((args.lr * momentum).norm()) if informative else 0.0,
+            "step_norm": float(step.norm()) if informative else 0.0,  # after the trust region, not before
             "momentum_norm": float(momentum.norm()),
             "sigma": sigma,
+            "step_frac": step_frac,
             "lr": args.lr,
             "popsize": args.popsize,
             "precision": brain.precision,
@@ -849,18 +995,63 @@ def main(argv: list[str] | None = None) -> int:
             # worse (fitness of the deterministic evaluation dropped by more
             # than the tolerance) is undone, so the checkpoint the viewer and
             # the lap gate read never drifts away from a driving policy.
-            current_eval = record["eval_fitness_best_island"]
-            if args.eval_tolerance >= 0 and accepted_eval is not None and current_eval < accepted_eval - args.eval_tolerance:
-                mu = accepted_mu.clone()
-                momentum.zero_()
-                sigma = max(args.sigma * 0.25, sigma * 0.7)
-                record["reverted"] = True
-                record["accepted_eval"] = accepted_eval
-                print(f"[guard] mean evaluation {current_eval:.2f} < accepted {accepted_eval:.2f} - {args.eval_tolerance}: reverted to the accepted mean, sigma {sigma:.4f}")
+            # Verified improvement per island. The islands are independent
+            # searches; judging all four on the best one's score reverted three
+            # improving means every time the fourth regressed, which is most
+            # generations (an island regresses whenever a perturbation flips one
+            # of its six evaluation starts into a crash).
+            island_eval = torch.tensor(record["eval_fitness_island"], device=mu.device)
+            current_eval = float(island_eval.max())
+            if args.eval_tolerance >= 0 and accepted_island_eval is not None:
+                if reject_streak is None or reject_streak.numel() != island_eval.numel():
+                    reject_streak = torch.zeros_like(island_eval)
+                worse = island_eval < accepted_island_eval - args.eval_tolerance
+                # Deadlock release: an island rejected `guard_patience` times in
+                # a row is not drifting, it is stuck under an unreachable
+                # high-water mark. Re-anchor it on its current score and let it
+                # search at full radius again.
+                stalled = worse & (reject_streak >= args.guard_patience - 1)
+                if args.guard_patience > 0 and bool(stalled.any()):
+                    worse = worse & ~stalled
+                    accepted_island_eval = torch.where(stalled, island_eval, accepted_island_eval)
+                    accepted_mu = torch.where(stalled.unsqueeze(1), mu, accepted_mu)
+                    sigma = args.sigma
+                    sigma_floor = args.sigma
+                    step_frac = args.max_step_frac
+                    record["guard_released"] = int(stalled.sum())
+                    print(
+                        f"[guard] {int(stalled.sum())}/{args.islands} islands stuck for "
+                        f"{args.guard_patience} evaluations: re-anchored at their current score, sigma {sigma:.4f}"
+                    )
+                reject_streak = torch.where(worse, reject_streak + 1, torch.zeros_like(reject_streak))
+                if bool(worse.any()):
+                    mu = torch.where(worse.unsqueeze(1), accepted_mu, mu)
+                    momentum = torch.where(worse.unsqueeze(1), torch.zeros_like(momentum), momentum)
+                    sigma = max(args.sigma * 0.25, sigma * 0.7)
+                    sigma_floor = sigma
+                    step_frac = max(args.max_step_frac * 0.25, step_frac * 0.7)
+                    record["reverted"] = int(worse.sum())
+                    print(
+                        f"[guard] {int(worse.sum())}/{args.islands} islands below their accepted score "
+                        f"(best {current_eval:.2f} vs accepted {float(accepted_island_eval.max()):.2f}): reverted those, sigma {sigma:.4f}"
+                    )
+                # `eval_tolerance` decides what is reverted; the accepted score
+                # is a high-water mark. Recording a within-tolerance *worse*
+                # score as the new one to beat let the mean drift down by up to
+                # one tolerance per generation and never trip the guard.
+                better = island_eval > accepted_island_eval
+                if bool(better.any()):
+                    accepted_mu = torch.where(better.unsqueeze(1), mu, accepted_mu)
+                    accepted_island_eval = torch.maximum(accepted_island_eval, island_eval)
+                    sigma_floor = args.sigma
+                    step_frac = args.max_step_frac
             else:
                 accepted_mu = mu.clone()
-                accepted_eval = current_eval
-                record["accepted_eval"] = accepted_eval
+                accepted_island_eval = island_eval.clone()
+                sigma_floor = args.sigma
+            accepted_eval = float(accepted_island_eval.max())
+            record["accepted_eval"] = accepted_eval
+            record["accepted_eval_island"] = [round(float(v), 3) for v in accepted_island_eval]
             lap_ok = record["eval_laps_min_best_island"] >= 1.0
             lap_steps = record["eval_lap_steps_best_island"]
             if lap_ok and lap_steps is not None:

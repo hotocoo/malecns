@@ -101,7 +101,8 @@ def test_reward_pays_progress_not_speed_and_ramps_near_wall():
 
 
 def test_completing_a_lap_pays_the_bonus():
-    cfg = CarConfig()
+    # Off by default; the payment path is still tested with it turned on.
+    cfg = CarConfig(lap_bonus=100.0)
     env = CarEnv(1, CPU, cfg, seed=2)
     env.reset()
     n = env.track.centerline.shape[0]

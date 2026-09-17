@@ -291,6 +291,17 @@ export class DriveView {
   }
 
   load(track) {
+    // Everything the track owns lives in one group so a curriculum road-width
+    // change can rebuild it: without this, a second load() stacked a second
+    // road, kerbs and barriers on top of the first.
+    if (this.trackGroup) {
+      this.scene.remove(this.trackGroup);
+      this.trackGroup.traverse((node) => {
+        if (node.geometry) node.geometry.dispose();
+      });
+    }
+    this.trackGroup = new THREE.Group();
+    this.scene.add(this.trackGroup);
     this.track = track;
     const frames = centerlineFrames(track.centerline, track.centerline_z);
     frames.grid = buildFrameGrid(frames);
@@ -308,7 +319,7 @@ export class DriveView {
     const st = this.style;
     const road = new THREE.Mesh(ribbon(frames, -hw, hw, 0.0, st.road_texture_m), asphalt);
     road.receiveShadow = true;
-    this.scene.add(road);
+    this.trackGroup.add(road);
 
     const kerbMaterial = new THREE.MeshStandardMaterial({ map: kerbTexture(), roughness: 0.75 });
     kerbMaterial.map.repeat.set(1, 1);
@@ -321,12 +332,12 @@ export class DriveView {
         kerbMaterial,
       );
       kerb.receiveShadow = true;
-      this.scene.add(kerb);
+      this.trackGroup.add(kerb);
       const line = new THREE.Mesh(
         ribbon(frames, side * (hw - st.line_width_m - st.line_inset_m), side * (hw - st.line_inset_m), 0.01, 1),
         new THREE.MeshStandardMaterial({ color: 0xe8e4d8, roughness: 0.6 }),
       );
-      this.scene.add(line);
+      this.trackGroup.add(line);
     });
 
     // Road-edge skirt: on a grade the carved ground beside the road sits under
@@ -337,7 +348,7 @@ export class DriveView {
       [-1, 1].forEach((side) => {
         const skirt = new THREE.Mesh(verticalRibbon(frames, side * hw, -3.0, 0.0), skirtMaterial);
         skirt.receiveShadow = true;
-        this.scene.add(skirt);
+        this.trackGroup.add(skirt);
       });
     }
 
@@ -363,7 +374,7 @@ export class DriveView {
       ground.rotation.x = -Math.PI / 2;
       ground.position.y = -0.03;
       ground.receiveShadow = true;
-      this.scene.add(ground);
+      this.trackGroup.add(ground);
     }
 
     this._loadScenery(frames, track);
@@ -378,19 +389,19 @@ export class DriveView {
       const scenery = await (await fetch("/api/scenery")).json();
       const t0 = performance.now();
       const sty = scenery.style;
-      this.scene.add(buildBarriers(frames, track.halfwidth + sty.rail_offset_m, sty));
+      this.trackGroup.add(buildBarriers(frames, track.halfwidth + sty.rail_offset_m, sty));
       if (scenery.terrain) {
         // surveyed ground: the hill the circuit climbs, carved flat under the road
         const ground = buildGround(scenery.terrain, this.groundMaterial);
-        this.scene.add(ground);
+        this.trackGroup.add(ground);
         this.terrain = scenery.terrain;
       }
       if (!track.has_scenery) return;
-      this.scene.add(buildBuildings(scenery.buildings, sty));
-      this.scene.add(buildTunnel(frames, scenery.tunnel_spans, track.halfwidth, sty, scenery.terrain || null));
-      this.scene.add(buildPiers(scenery.lines || [], scenery.water ? scenery.water.level : 0));
+      this.trackGroup.add(buildBuildings(scenery.buildings, sty));
+      this.trackGroup.add(buildTunnel(frames, scenery.tunnel_spans, track.halfwidth, sty, scenery.terrain || null));
+      this.trackGroup.add(buildPiers(scenery.lines || [], scenery.water ? scenery.water.level : 0));
       const water = buildWater(scenery.water, this.groundMaterial, sty, scenery.terrain);
-      this.scene.add(water.group);
+      this.trackGroup.add(water.group);
       this.waterMaterial = water.material;
       // the tunnel needs a longer shadow reach and a slightly darker fog inside
       console.info(

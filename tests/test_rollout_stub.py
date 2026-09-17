@@ -49,8 +49,11 @@ class StubBrain:
         self.batch = int(keep.sum())
 
 
+from car_env import CarConfig as _CarConfig  # noqa: E402
+
+
 class StubCfg:
-    n_rays = 9
+    n_rays = _CarConfig.n_rays
 
 
 class StubAgent:
@@ -69,7 +72,7 @@ class StubAgent:
         self.brain.reset(batch)
         b = self.brain.batch
         self.last_motor = torch.zeros(b, 2)
-        self.last_rates_hz = torch.zeros(b, 10)
+        self.last_rates_hz = torch.zeros(b, self.cfg.n_rays + 1)
         self.dn_rate_hz = torch.zeros(b, 4)
         self.noise = (torch.rand(b, 2, generator=self.gen) - 0.5) * 0.6
 
@@ -83,14 +86,16 @@ class StubAgent:
         self.brain.compact(keep)
 
     def sensory_rates(self, obs: torch.Tensor, theta: dict) -> torch.Tensor:
-        prox = (1.0 - obs[:, :9]).clamp(0.0, 1.0)
-        return torch.cat([prox * 100.0, obs[:, 9:10] * 100.0], dim=1)
+        n = self.cfg.n_rays
+        prox = (1.0 - obs[:, :n]).clamp(0.0, 1.0)
+        return torch.cat([prox * 100.0, obs[:, n : n + 1] * 100.0], dim=1)
 
     def act(self, obs: torch.Tensor, theta: dict) -> torch.Tensor:
         if obs.shape[0] != theta["ray_gain"].shape[0] or obs.shape[0] != self.brain.batch:
             raise AssertionError(f"obs {obs.shape[0]}, theta {theta['ray_gain'].shape[0]}, brain {self.brain.batch}")
-        prox = (1.0 - obs[:, :9]).clamp(0.0, 1.0)
-        action = (self.teacher.act(prox, obs[:, 9]) + self.noise * theta["ray_gain"][:, :2]).clamp(-1.0, 1.0)
+        n = self.cfg.n_rays
+        prox = (1.0 - obs[:, :n]).clamp(0.0, 1.0)
+        action = (self.teacher.act(prox, obs[:, n]) + self.noise * theta["ray_gain"][:, :2]).clamp(-1.0, 1.0)
         self.last_motor = action
         self.last_rates_hz = self.sensory_rates(obs, theta)
         return action
@@ -106,7 +111,7 @@ def test_compacted_rollout_then_smaller_rollout_keeps_every_tensor_in_step():
     agent = StubAgent(384)
     steps = 900
     env = make_env(track, FAST, 384, steps)
-    theta = {"ray_gain": torch.ones(384, 9)}
+    theta = {"ray_gain": torch.ones(384, agent.cfg.n_rays)}
     out = train.rollout(agent, env, theta, steps, seed=3, compact_min_drop=8)
     assert out["compactions"] > 0, "the noisy population must end at different times for this test to bite"
     assert out["fitness"].shape == (384,) and out["laps"].shape == (384,)
@@ -114,7 +119,7 @@ def test_compacted_rollout_then_smaller_rollout_keeps_every_tensor_in_step():
     # The next rollout is smaller (24 bodies, as `evaluate_mean` now runs): the agent must be
     # reset to *its* size, not to the leftover compacted batch and not to the full batch.
     small = make_env(track, FAST, 24, 300)
-    out2 = train.rollout(agent, small, {"ray_gain": torch.ones(24, 9)}, 300, seed=4)
+    out2 = train.rollout(agent, small, {"ray_gain": torch.ones(24, agent.cfg.n_rays)}, 300, seed=4)
     assert out2["fitness"].shape == (24,)
     assert agent.brain.batch <= 24
 
@@ -124,7 +129,7 @@ def test_monitor_accounting_is_exact_for_honest_driving_at_scale():
     agent = StubAgent(240)
     steps = 600
     env = make_env(track, FAST, 240, steps)
-    out = train.rollout(agent, env, {"ray_gain": torch.ones(240, 9)}, steps, seed=5, compact_min_drop=8)
+    out = train.rollout(agent, env, {"ray_gain": torch.ones(240, agent.cfg.n_rays)}, steps, seed=5, compact_min_drop=8)
     flags = out["exploits"]["flags"]
     assert flags["accounting"] == 0, flags
     assert flags["over_bound"] == 0 and flags["bonus_farming"] == 0 and flags["idle_reward"] == 0, flags

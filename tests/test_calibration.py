@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import calibrate  # noqa: E402
 from agent import AgentConfig, ConnectomeAgent  # noqa: E402
+from car_env import CarConfig  # noqa: E402
 from brain import Brain, LIFConfig, load_connectome  # noqa: E402
 from teacher import LinearTeacher  # noqa: E402
 
@@ -31,19 +32,19 @@ def agent():
 @needs_graph
 def test_road_eyes_read_each_ray_against_its_expected_distance(agent):
     # Centred on a straight 11 m road: side rays see 5.5 m, the 45 deg rays 7.8 m -> every group at 0.5.
-    angles = torch.linspace(math.pi / 2, -math.pi / 2, 9)
+    angles = torch.linspace(math.pi / 2, -math.pi / 2, agent.cfg.n_rays)
     cfg = agent.cfg
     centred = torch.minimum(cfg.eye_halfwidth_m / angles.sin().abs().clamp(min=1e-3), torch.tensor(cfg.eye_front_ref_m)) / cfg.eye_range_m
     prox = agent.proximity(centred.unsqueeze(0))[0]
-    assert torch.allclose(prox, torch.full((9,), 0.5), atol=1e-4)
+    assert torch.allclose(prox, torch.full((agent.cfg.n_rays,), 0.5), atol=1e-4)
     # Twice as close saturates (0.4/octave -> 0.9 at one octave, 1.0 at 1.25), twice as far goes quiet.
     assert float(agent.proximity((centred / 2).unsqueeze(0))[0, 0]) == pytest.approx(0.9, abs=1e-3)
     assert float(agent.proximity((centred * 4).unsqueeze(0))[0, 0]) == pytest.approx(0.0, abs=1e-6)
     # A wall nearer on the left than the right shows up as a left-minus-right difference of the *same* size at 4 vs 7 m.
     left_near = centred.clone()
-    left_near[0], left_near[8] = 4.0 / 150.0, 7.0 / 150.0
+    left_near[0], left_near[-1] = 4.0 / 150.0, 7.0 / 150.0
     p = agent.proximity(left_near.unsqueeze(0))[0]
-    assert float(p[0] - p[8]) > 0.3
+    assert float(p[0] - p[-1]) > 0.3
 
 
 @needs_graph
@@ -70,11 +71,12 @@ def test_calibrated_readout_roundtrips_through_a_checkpoint(agent):
 
 def test_linear_teacher_steers_away_from_the_nearer_wall_and_brakes_for_a_wall_ahead():
     teacher = LinearTeacher()
-    centred = torch.full((1, 9), 0.5)
+    n = CarConfig().n_rays
+    centred = torch.full((1, n), 0.5)
     left_wall = centred.clone()
-    left_wall[0, :4] = 0.9
+    left_wall[0, : n // 2] = 0.9
     right_wall = centred.clone()
-    right_wall[0, 5:] = 0.9
+    right_wall[0, n // 2 + 1 :] = 0.9
     slow = torch.tensor([0.1])
     assert float(teacher.act(left_wall, slow)[0, 0]) < -0.2  # steer right (negative)
     assert float(teacher.act(right_wall, slow)[0, 0]) > 0.2

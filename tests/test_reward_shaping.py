@@ -109,7 +109,7 @@ def test_ending_early_never_scores_above_driving_on(circle):
     steer = torch.tensor([1.0, circle_steer(cfg, circle)])  # car 0 turns into the barrier, car 1 holds the circle
     target = torch.tensor([30.0, 4.0])  # car 1 crawls: 14 km/h, just above the 3 m/s stuck floor
 
-    old_env = CarEnv(2, CPU, cfg, track=circle)
+    old_env = CarEnv(2, CPU, replace(cfg, episode_steps=0, unfinished_per_m=0.0), track=circle)
     old_env.reset()
     old = drive(old_env, budget, steer, target)
     new_env = CarEnv(2, CPU, replace(cfg, episode_steps=budget), track=circle)
@@ -119,7 +119,8 @@ def test_ending_early_never_scores_above_driving_on(circle):
     for run in (old, new):
         assert int(run["reason"][0]) == DONE_CRASH and int(run["end_step"][0]) > 0
         assert int(run["reason"][1]) == DONE_ALIVE and int(run["end_step"][1]) == -1
-    # The flaw: without the budget charge the crash on step ~60 outscored 2,000 steps of driving.
+    # The flaw: with neither the budget charge nor the unfinished-lap forfeit, the crash on
+    # step ~60 outscored 2,000 steps of driving.
     assert float(old["total"][0]) > float(old["total"][1])
     # Fixed: the survivor is ahead, and by the crash penalty plus its progress.
     assert float(new["total"][1]) > float(new["total"][0])
@@ -127,11 +128,16 @@ def test_ending_early_never_scores_above_driving_on(circle):
     terminal = float(new["rewards"][k - 1, 0])
     # The ended car is charged as standing still for the rest of the budget: time tax plus
     # the full pace and alignment penalties per unused step, on top of the crash penalty.
-    per_step = cfg.time_tax + cfg.pace_penalty + cfg.align_penalty
-    assert terminal == pytest.approx(-(cfg.crash_penalty + per_step * (budget - k)), abs=1e-3)
+    per_step = cfg.time_tax + cfg.pace_bonus + cfg.pace_penalty + cfg.align_penalty
+    # ...plus the metres of the lap it never drove, at `unfinished_per_m`.
+    laps_at_crash = float(new["deltas"][:k, 0].sum())
+    forfeit = cfg.unfinished_per_m * (cfg.max_laps - laps_at_crash) * new_env.track.length_m
+    assert terminal == pytest.approx(-(cfg.crash_penalty + forfeit + per_step * (budget - k)), abs=1e-2)
     # No survivor pays more per step than the standing-still rate, so the crasher's total
     # is below what any survivor with the same progress could score.
-    survivor_floor = float(new["deltas"][:, 1].sum()) * new_env.progress_scale - per_step * budget
+    survivor_driven = float(new["deltas"][:, 1].sum())
+    survivor_forfeit = cfg.unfinished_per_m * (cfg.max_laps - survivor_driven) * new_env.track.length_m
+    survivor_floor = survivor_driven * new_env.progress_scale - per_step * budget - survivor_forfeit
     assert float(new["total"][1]) >= survivor_floor - 1e-3
     # The crasher: progress minus the time tax while alive, the crash penalty, and the
     # standing-still rate for the unused budget (its pace/alignment terms while alive are <= 0).
@@ -142,13 +148,62 @@ def test_ending_early_never_scores_above_driving_on(circle):
     assert report["flags"]["accounting"] == 0 and report["flags"]["over_bound"] == 0 and report["flags"]["idle_reward"] == 0, report
 
 
-def test_budget_zero_keeps_fixed_crash_penalty(circle):
+def test_budget_zero_charges_the_unfinished_lap(circle):
     env = CarEnv(1, CPU, CIRCLE, track=circle)
     env.reset()
     run = drive(env, 400, torch.tensor([1.0]), torch.tensor([30.0]))
     k = int(run["end_step"][0])
-    assert k > 0 and float(run["rewards"][k - 1, 0]) == pytest.approx(-CIRCLE.crash_penalty)
-    assert float(env.last_terms["crash_cost"][0]) == pytest.approx(CIRCLE.crash_penalty)
+    laps_at_crash = float(run["deltas"][:k, 0].sum())
+    forfeit = CIRCLE.unfinished_per_m * (CIRCLE.max_laps - laps_at_crash) * env.track.length_m
+    assert k > 0 and float(run["rewards"][k - 1, 0]) == pytest.approx(-(CIRCLE.crash_penalty + forfeit), abs=1e-2)
+    assert float(env.last_terms["crash_cost"][0]) == pytest.approx(CIRCLE.crash_penalty + forfeit, abs=1e-2)
+
+
+def test_driving_one_more_metre_always_beats_ending_there(circle):
+    """Uncapped episodes: the forfeit must make every extra metre worth more than its charges."""
+    cfg = replace(CIRCLE, episode_steps=0)
+    steer = torch.tensor([circle_steer(cfg, circle)] * 2)
+    env = CarEnv(2, CPU, cfg, track=circle)
+    env.reset()
+    run = drive(env, 900, steer, torch.tensor([21.0, 21.0]))
+    # Score of ending at step i = reward banked so far, minus the crash charge owed there.
+    banked = run["rewards"][:, 0].cumsum(0)
+    driven = run["deltas"][:, 0].cumsum(0) * env.track.length_m
+    owed = cfg.crash_penalty + cfg.unfinished_per_m * (cfg.max_laps * env.track.length_m - driven)
+    score_if_ending_here = banked - owed
+    # The last recorded step is the crash itself (its reward is already the charge).
+    k = int(run["end_step"][0])
+    last = k - 1 if k > 0 else score_if_ending_here.shape[0]
+    gains = score_if_ending_here[1:last] - score_if_ending_here[: last - 1]
+    # Ignore the launch, where the car is below the pace the charges assume.
+    assert float(gains[60:].min()) > 0.0, float(gains[60:].min())
+
+
+def test_running_the_budget_out_owes_the_unfinished_lap(circle):
+    budget = 300
+    cfg = replace(CIRCLE, episode_steps=budget)
+    env = CarEnv(1, CPU, cfg, track=circle)
+    env.reset()
+    run = drive(env, budget, torch.tensor([circle_steer(cfg, circle)]), torch.tensor([20.0]))
+    assert int(run["end_step"][0]) == -1  # still driving when the budget ran out
+    laps = float(env.laps[0])
+    forfeit = cfg.unfinished_per_m * (cfg.max_laps - laps) * env.track.length_m
+    last, before = float(run["rewards"][-1, 0]), float(run["rewards"][-2, 0])
+    assert last == pytest.approx(before - forfeit, abs=0.2)
+
+
+def test_the_same_distance_driven_sooner_scores_higher(circle):
+    """Fastest-lap pressure: time is the only thing separating two cars that get equally far."""
+    cfg = replace(CIRCLE, episode_steps=0)
+    speeds = torch.tensor([15.0, 25.0, 35.0])
+    steer = torch.full((3,), circle_steer(cfg, circle))
+    env = CarEnv(3, CPU, cfg, track=circle)
+    env.reset()
+    run = drive(env, 4000, steer, speeds)
+    driven = run["deltas"].sum(0) * env.track.length_m
+    assert float(driven.std() / driven.mean()) < 0.05, driven  # same distance, different times
+    totals = run["total"]
+    assert float(totals[0]) < float(totals[1]) < float(totals[2]), totals
 
 
 def test_apex_margin_leaves_most_of_the_road_untaxed():
@@ -181,32 +236,46 @@ def test_ended_cars_are_frozen(circle):
     assert int(env.done_reason[0]) == DONE_ALIVE and float(env.speed[0]) == 0.0
 
 
-def test_pace_term_is_graded_and_vanishes_at_reference_pace(circle):
-    slow = replace(CIRCLE, max_speed=20.0)  # the circle's reference speed then caps at 20 m/s
+def test_pace_is_paid_and_rises_with_the_speed_the_road_allows(circle):
+    slow = replace(CIRCLE, max_speed=20.0)  # the circle's reference speed caps at 20 m/s
     track = Track(build_centerline(slow, 1), slow, CPU)
     assert float(track.speed_ref.min()) == pytest.approx(20.0, abs=0.5)
     env = CarEnv(1, CPU, slow, track=track)
     env.reset()
     steer = torch.tensor([circle_steer(slow, track)])
-    drive(env, 400, steer, torch.tensor([19.5]))
-    assert int(env.done_reason[0]) == DONE_ALIVE, "the scripted driver must hold the circle at 19.5 m/s"
-    # Re-run step by step to read the pace term against speed.
-    env.reset()
     seen = []
     for _ in range(400):
         pedal = torch.where(env.speed < 19.5, torch.ones(1), torch.full((1,), -0.2))
         env.step(torch.stack([steer, pedal], dim=1))
         seen.append((float(env.speed[0]), float(env.last_terms["pace"][0])))
-    early = [(v, p) for v, p in seen if v < 5.0]
-    mid = [(v, p) for v, p in seen if 8.0 < v < 12.0]
-    late = [(v, p) for v, p in seen if v >= 0.9 * 20.0]
+    assert int(env.done_reason[0]) == DONE_ALIVE, "the scripted driver must hold the circle at 19.5 m/s"
+    early = [p for v, p in seen if v < 5.0]
+    mid = [p for v, p in seen if 8.0 < v < 12.0]
+    late = [p for v, p in seen if v >= 0.9 * 20.0]
     assert early and mid and late
-    assert max(p for _, p in early) < min(p for _, p in mid) < 0.0, "slower must cost more"
-    assert all(abs(p) < 1e-6 for _, p in late), "at or above pace_margin of the reference speed the pace term is zero"
-    # Quadratic in the deficit, pinned at one sample.
-    v, p = mid[0]
-    deficit = 1.0 - v / (slow.pace_margin * float(track.speed_ref[0]))
-    assert p == pytest.approx(-slow.pace_penalty * deficit * deficit, abs=2e-3)
+    # Paid, not charged, and worth more the closer the car is to what the road allows.
+    assert 0.0 <= max(early) < min(mid) < max(mid) < min(late)
+    assert max(late) == pytest.approx(slow.pace_bonus, abs=5e-3)
+    # Standing still earns nothing: the pace term must never pay for idling.
+    env.reset()
+    env.step(torch.tensor([[0.0, 0.0]]))
+    assert float(env.last_terms["pace"][0]) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_beating_the_centerline_reference_pays_up_to_the_cap(circle):
+    """A car that straightens a corner with the full width of the road may pass the reference."""
+    cfg = replace(CIRCLE, max_speed=20.0)
+    track = Track(build_centerline(cfg, 1), cfg, CPU)
+    # The reference stays at the slow track's 20 m/s; the car itself may exceed it.
+    env = CarEnv(2, CPU, replace(cfg, max_speed=60.0), track=track)
+    env.reset()
+    ref = float(track.speed_ref[0])
+    env.speed = torch.tensor([ref, ref * (cfg.pace_cap + 0.4)])
+    env.step(torch.zeros(2, 2))
+    at_ref, above = (float(v) for v in env.last_terms["pace"])
+    assert above > at_ref == pytest.approx(cfg.pace_bonus, abs=5e-3)
+    assert above == pytest.approx(cfg.pace_bonus * cfg.pace_cap**2, abs=5e-3)
+
 
 
 def test_alignment_term_is_graded_in_heading_error(circle):
@@ -238,3 +307,49 @@ def test_monaco_reference_profile_is_a_plausible_pole_lap():
     assert 8.0 < float(v.min()) < 25.0, "the Fairmont hairpin is a 45-80 km/h corner"
     assert float(v.max()) <= cfg.max_speed and float(v.max()) > 60.0, "the tunnel run must be fast"
     assert bool((v > 0).all())
+
+
+# --- eye geometry -------------------------------------------------------------
+def test_rays_report_the_road_edge_not_the_coarse_sample_past_it():
+    """The march locates the wall to a sample; the refinement puts it on the edge."""
+    from dataclasses import replace as _replace
+
+    from car_env import CarEnv
+
+    cfg = CarConfig(grid_res=1024)
+    coarse = _replace(cfg, ray_refine_steps=0)
+    starts = torch.linspace(0.0, 0.9, 8)
+    fine_env = CarEnv(8, CPU, cfg, seed=0, start_fraction=starts)
+    obs = fine_env.reset()
+    coarse_env = CarEnv(8, CPU, coarse, seed=0, start_fraction=starts, track=fine_env.track)
+    obs_coarse = coarse_env.reset()
+
+    # ground truth: march the same rays at 2.5 cm
+    step = torch.arange(1, 4001).float() * 0.025
+    angles = fine_env.heading.unsqueeze(1) + fine_env.ray_angles.unsqueeze(0)
+    direction = torch.stack([angles.cos(), angles.sin()], dim=-1)
+    points = fine_env.pos[:, None, None, :] + direction[:, :, None, :] * step[None, None, :, None]
+    blocked = ~fine_env.track.is_drivable(points)
+    hit = torch.where(blocked.any(-1), blocked.float().argmax(-1), torch.full_like(blocked[..., 0], 3999, dtype=torch.long))
+    truth = step[hit]
+
+    n = cfg.n_rays
+    # only rays whose wall is inside the reference march's 100 m reach
+    seen = truth < 90.0
+    refined = (obs[:, :n] * cfg.max_range - truth).abs()[seen]
+    coarse_dist = (obs_coarse[:, :n] * cfg.max_range - truth)[seen]
+    assert seen.sum() > 50
+    # A grazing ray can still skip a thin off-road wedge between two march
+    # samples, so the tail is judged separately from the typical ray.
+    assert float(refined.median()) < 0.1, float(refined.median())
+    assert float(refined.median()) < float(coarse_dist.abs().median()) / 5
+    assert float(refined.mean()) < float(coarse_dist.abs().mean())
+    # the coarse march can only overshoot: it reports the first sample past the edge
+    assert float(coarse_dist.min()) > -0.05
+
+
+def test_the_eye_resolves_the_road_at_ten_degrees():
+    """19 rays over 180 degrees: neighbours are 10 degrees apart, not 22.5."""
+    cfg = CarConfig()
+    assert cfg.n_rays == 19
+    assert cfg.fov_deg / (cfg.n_rays - 1) == 10.0

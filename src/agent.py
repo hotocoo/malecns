@@ -55,7 +55,7 @@ from brain import Brain
 
 @dataclass(frozen=True)
 class AgentConfig:
-    n_rays: int = 9
+    n_rays: int = 19  # must match CarConfig.n_rays: one input group per ray
     input_role: str = "visual_projection"
     speed_role: str = "ascending"
     kick_mv: float = 8.0
@@ -152,6 +152,43 @@ def make_generator(device: torch.device, seed: int) -> torch.Generator | None:
             return torch.Generator().manual_seed(seed)
         except RuntimeError:
             return None
+
+
+# Blocks holding one value per ray: they describe a profile across the field of
+# view, so they are resampled rather than reset when the ray count changes.
+ANGULAR_BLOCKS = ("ray_gain",)
+
+
+def resample_profile(values: torch.Tensor, n: int) -> torch.Tensor:
+    """Linearly resample a per-ray profile onto `n` rays spanning the same field of view."""
+    src = values.detach().reshape(-1).cpu().to(torch.float32)
+    if src.numel() == n:
+        return src.clone()
+    at = torch.linspace(0.0, src.numel() - 1.0, n)
+    lo = at.floor().long().clamp(0, src.numel() - 1)
+    hi = (lo + 1).clamp(max=src.numel() - 1)
+    frac = at - lo.to(at.dtype)
+    return src[lo] * (1.0 - frac) + src[hi] * frac
+
+
+def match_sensing(car_cfg, agent_cfg):
+    """Return `car_cfg` with the eye geometry the agent was built for.
+
+    The agent's ray count comes from the checkpoint, the car's from this
+    build's defaults. When they drift apart nothing raises: `sensory_rates`
+    slices the first `n_rays` columns of the observation and reads the next one
+    as speed, so the brain is fed a ray as if it were speed and the last rays
+    are simply not seen. Callers that load a checkpoint must pass the car
+    config through here.
+    """
+    from dataclasses import replace as _replace
+
+    return _replace(
+        car_cfg,
+        n_rays=agent_cfg.n_rays,
+        fov_deg=agent_cfg.eye_fov_deg,
+        max_range=agent_cfg.eye_range_m,
+    )
 
 
 class ConnectomeAgent:
@@ -332,6 +369,10 @@ class ConnectomeAgent:
     LEGACY_SHAPES: dict[int, dict[str, tuple[int, ...]]] = {
         141: {"ray_gain": (9,), "bias_hz": (1,), "speed_gain": (1,), "w_out": (64, 2), "b_out": (2,)},
         142: {"ray_gain": (9,), "bias_hz": (1,), "speed_gain": (1,), "loom_gain": (1,), "w_out": (64, 2), "b_out": (2,)},
+        # The 9-ray eye, with g_out: every checkpoint trained before the eye
+        # went to 19 rays. `ray_gain` is resampled onto the finer eye, so those
+        # checkpoints keep driving instead of starting from init.
+        144: {"ray_gain": (9,), "bias_hz": (1,), "speed_gain": (1,), "loom_gain": (1,), "w_out": (64, 2), "g_out": (2,), "b_out": (2,)},
     }
 
     def migrate_params(
@@ -368,6 +409,14 @@ class ConnectomeAgent:
         for name, shape in self.param_shapes.items():
             if name in saved and saved[name].shape == shape:
                 blocks.append(saved[name].reshape(-1))
+            elif name in ANGULAR_BLOCKS and name in saved and saved[name].dim() == 1 and len(shape) == 1 and saved[name].numel() > 1:
+                # A per-ray block is a profile across the field of view, not a
+                # list of unrelated numbers: when the eye's resolution changes,
+                # resampling it keeps the trained shape (a driver that learned
+                # to weight its forward rays still does) instead of throwing the
+                # block away and turning a driver into a crasher.
+                blocks.append(resample_profile(saved[name], int(shape[0])))
+                notes.append(f"{name} resampled {saved[name].numel()} -> {int(shape[0])} rays")
             else:
                 blocks.append(init[name][0].reshape(-1).cpu())
                 notes.append(f"{name} from init" + (f" (saved shape {tuple(saved[name].shape)})" if name in saved else ""))

@@ -40,13 +40,23 @@ DONE_NAMES = {DONE_ALIVE: "alive", DONE_CRASH: "crash", DONE_REVERSE: "reverse",
 @dataclass(frozen=True)
 class CarConfig:
     # --- sensing -----------------------------------------------------------------
-    n_rays: int = 9
+    # 19 rays over 180 degrees: one every 10 degrees. At 9 rays the spacing was
+    # 22.5 degrees, which at 30 m ahead puts neighbouring rays 11 m apart, wider
+    # than the road: a barrier could sit entirely between two rays and never be
+    # seen, and the shape of a corner was not resolvable at all.
+    n_rays: int = 19
     fov_deg: float = 180.0
     max_range: float = 150.0
     march_steps: int = 96
     # Ray samples are spaced as (i/N)^march_power * max_range: fine near the
     # car, coarse far away, so 96 samples cover 150 m with 0.3 m near the body.
     march_power: float = 1.5
+    # The march only locates the sample where the ray first leaves the road, and
+    # its spacing grows to 2.4 m at the far end, so the reported distance was
+    # biased long by up to 4 m: the car was told it had room it did not have.
+    # Bisecting between the last free sample and the first blocked one this many
+    # times brings that under 0.2 m for four extra road lookups per ray.
+    ray_refine_steps: int = 4
     dt_s: float = 0.016
     # --- vehicle (Mercedes-AMG F1 W11, 2020; public figures) ---------------------
     wheelbase: float = 3.70
@@ -103,21 +113,63 @@ class CarConfig:
     max_laps: float = 1.0
     # --- reward ------------------------------------------------------------------
     # Progress along the track is the only thing paid for, at `progress_per_m`
-    # per metre, so different circuits pay the same for the same driving; each
-    # *newly* completed lap adds `lap_bonus` (crossing the line back and forth
-    # pays once). No speed bonus: it paid for speed in any direction. The wall
-    # term gives a smooth ramp inside `wall_margin` metres of the body's edge
-    # so the search sees a gradient before the cliff of a crash.
+    # per metre, so different circuits pay the same for the same driving. No
+    # speed bonus: it paid for speed in any direction. The wall term gives a
+    # smooth ramp inside `wall_margin` metres of the body's edge so the search
+    # sees a gradient before the cliff of a crash.
     progress_per_m: float = 0.10
-    lap_bonus: float = 100.0
-    time_tax: float = 0.02
+    # Flat reward for each *newly* completed lap (crossing the line back and
+    # forth pays once). Off by default, and it should stay off: at 100 it was
+    # 30 per cent of a Monaco lap's progress pay handed over at the line
+    # regardless of how the lap was driven, so an episode that accumulated -70
+    # of wall, pace, alignment and time charges still scored +30 and evolution
+    # read a scraped, 60 km/h, 197 s lap as a success. Crossing the line is
+    # already paid: the metres of it earn `progress_per_m` like any other
+    # metres, and finishing ends the episode, which under a step budget saves
+    # the full `time_tax + pace_penalty + align_penalty` charge on every unused
+    # step (about 0.09/step, hundreds of points) - an incentive that grows the
+    # faster the lap is, which a flat bonus is not.
+    lap_bonus: float = 0.0
+    # Per control step, so 1.75 points per second at a 16 ms step: once two
+    # cars both get round, this and the pace term are the whole difference
+    # between them. At 0.02 a lap 10 s quicker was worth about 20 points
+    # against a lap worth 657, inside the spread between start points, and the
+    # search had no reason to prefer it. The unfinished-lap forfeit is what
+    # keeps this from making driving on a losing move: an extra metre is worth
+    # `progress_per_m + unfinished_per_m` = 0.30 against roughly 0.12 of
+    # charges at racing pace.
+    time_tax: float = 0.035
     # 0.75 m from the body's edge: an 11 m road leaves 4.5 m of clearance at
     # the centre, and a Monaco line clips barriers at arm's length. The old
     # 1.5 m margin taxed the outer 3 m of usable road and kept the apex out of
     # reach; 0.75 m still gives the search a gradient before the crash cliff.
-    wall_margin: float = 0.75
-    wall_penalty: float = 0.03
+    # 0.4 m from the body's edge, half the old margin, at half the old rate: an
+    # F1 line puts the wheels on the kerb, and taxing the outer road taught the
+    # car to drive down the middle. What is left is a gradient in the last half
+    # metre before the barrier so the search feels the cliff coming.
+    wall_margin: float = 0.4
+    wall_penalty: float = 0.015
     crash_penalty: float = 20.0
+    # Forfeit for the lap not completed, per metre of it, charged at any ending
+    # that is not the finish (crash, reverse, stuck). Uncapped episodes
+    # (`episode_steps = 0`, the default) removed the budget charge below and
+    # with it the guarantee that driving on beats ending: at the trainer's
+    # 77 km/h cruise one control step paid +0.034 of progress and cost 0.041 of
+    # time tax, pace and alignment, so every extra metre driven *lowered* the
+    # score while an early crash cost a flat 20. Evolution stalled at 0.58 laps
+    # with a negative return. Charging the unfinished metres at
+    # `unfinished_per_m` restores the invariant without a clock: ending at
+    # fraction f of the lap forfeits `(1 - f) * length_m * unfinished_per_m`, so
+    # driving one more metre is worth `progress_per_m + unfinished_per_m` minus
+    # that metre's charges - positive by a wide margin at any sane pace. A
+    # completed lap pays the whole distance and forfeits nothing, so the only
+    # way left to score higher is to finish, and to finish sooner.
+    # At 0.10 (equal to `progress_per_m`) the margin was still thin: an extra
+    # metre was worth 0.2 against per-metre charges of about 0.17 at the pace
+    # the trainer actually drives. 0.20 makes finishing the dominant term and
+    # leaves the per-step charges as the tiebreaker between two laps that both
+    # get round, which is what "fastest lap" means here.
+    unfinished_per_m: float = 0.20
     # Step budget the caller runs the episode for (0 = uncapped). With a budget
     # a car that ends early (crash, reverse, stuck) is treated as standing still
     # for the steps it did not drive: it is charged the time tax plus the full
@@ -147,15 +199,54 @@ class CarConfig:
     # room to go faster (straights, corner exits), where a 56 km/h cruise on a
     # 250 km/h straight used to cost nothing beyond the flat time tax. A car
     # standing still pays `pace_penalty` per step, the most any survivor pays.
-    pace_penalty: float = 0.04
-    pace_margin: float = 0.9
+    # `pace_margin` is the fraction of that reference speed the car is charged
+    # against: at 0.9 a car already doing 90 per cent of what the road allows
+    # paid nothing more for going faster, so the only remaining pull towards a
+    # quicker lap was the flat time tax (1.25 points per second). Charging to
+    # 1.0 keeps a gradient all the way to the limit. With the finish bonus gone
+    # the pace term is the main thing separating a fast lap from a slow one, so
+    # it is worth more than a wall scrape per step: a Monaco lap at the limit
+    # now scores about 43 points above the same car 20 seconds slower.
+    # Cut from 0.06 to a third: at 0.06 the pace term alone charged 3.75 per
+    # second against a progress pay of 2.1 per second at the trainer's cruise,
+    # so the per-step return of driving was negative and the search had nothing
+    # to climb. It is a shaping term for where the road allows more speed, not
+    # the objective; the objective is finishing, then finishing sooner, and
+    # `time_tax` carries that everywhere while this only speaks where the road
+    # allows more. At 0.03 the two together still left a car cruising at a
+    # quarter of the reference pace marginally better off crashing.
+    # ...and at 0.02 it was too quiet to ask for speed at all: the population
+    # cruised at 77 km/h and never once saturated the throttle (pedal at the
+    # stop on 0.07 per cent of steps) on a circuit whose straights allow 290.
+    # A penalty for being slow and a bonus for being fast have the same
+    # gradient; only the bonus cannot make driving on a losing move, so the
+    # pace term is now paid, not charged, and `pace_penalty` stays at 0.
+    pace_penalty: float = 0.0
+    # Paid per step for the speed the road allows at the car's position,
+    # (speed / speed_ref)^2, so it is worth the most on the straights, where a
+    # 290 km/h section used to pay exactly what a 90 km/h one did.
+    pace_bonus: float = 0.06
+    # The reference is the fastest pass over the *centerline*. A car that uses
+    # the full width straightens the corner and can legitimately beat it, so
+    # the ratio is clamped above 1: this is what pays for an out-in-out line
+    # and an apex instead of tracking the middle of the road.
+    pace_cap: float = 1.3
+    pace_margin: float = 1.0
     # Alignment: heading error to a look-ahead point on the centerline,
     # max(`align_lookahead_m`, `align_lookahead_s` of travel) ahead. Graded, not
     # a fixed fee: 0 when pointed at it, one `align_penalty` at 90 degrees off,
     # twice that facing backwards, so steering 0.8 of what a corner needs is
     # paid between steering it fully and not at all. The look-ahead grows with
     # speed, so an apex a few metres off the centerline costs a few degrees.
-    align_penalty: float = 0.03
+    # Cut from 0.03 and given a dead zone: a racing line points across the road
+    # on corner entry and exit, so charging every degree off the centerline
+    # look-ahead is charging for the only line that is quick. What is left is
+    # an anti-wandering term: free inside `align_free_rad`, then graded, so
+    # facing sideways or backwards is still worse than pointing down the road.
+    align_penalty: float = 0.012
+    # 35 degrees: wider than any racing line's yaw against the centerline
+    # heading at Monaco, narrower than a spin.
+    align_free_rad: float = 0.61
     align_lookahead_m: float = 15.0
     align_lookahead_s: float = 1.0
     stall_speed_mps: float = 5.0
@@ -671,12 +762,23 @@ class CarEnv:
             None, None, :, None
         ]
         blocked = ~self.track.is_drivable(points)
+        hit_any = blocked.any(dim=-1)
         first_hit = torch.where(
-            blocked.any(dim=-1),
+            hit_any,
             blocked.float().argmax(dim=-1),
             torch.full_like(blocked[..., 0], self.cfg.march_steps - 1, dtype=torch.long),
         )
-        dist = self.march[first_hit] / self.cfg.max_range
+        # Bisect between the last sample still on the road and the first one off
+        # it, so the reported distance is the road edge, not the coarse sample
+        # that happened to land past it.
+        near = torch.where(first_hit > 0, self.march[(first_hit - 1).clamp(min=0)], torch.zeros_like(self.march[first_hit]))
+        far = self.march[first_hit]
+        for _ in range(self.cfg.ray_refine_steps):
+            mid = 0.5 * (near + far)
+            free = self.track.is_drivable(self.pos[:, None, :] + direction * mid.unsqueeze(-1))
+            near = torch.where(free, mid, near)
+            far = torch.where(free, far, mid)
+        dist = torch.where(hit_any, far, torch.full_like(far, self.cfg.max_range)) / self.cfg.max_range
         speed = (self.speed / self.cfg.max_speed).unsqueeze(1)
         return torch.cat([dist, speed], dim=1)
 
@@ -800,15 +902,19 @@ class CarEnv:
         stall_term = -cfg.stall_steer_penalty * low_speed * steer_excess * steer_excess
         n_ref = self.track.speed_ref.shape[0]
         speed_ref = self.track.speed_ref[(self.last_progress * n_ref).long().clamp(0, n_ref - 1)]
+        pace_ratio = (self.speed / (cfg.pace_margin * speed_ref).clamp(min=1.0)).clamp(0.0, cfg.pace_cap)
         pace_deficit = torch.relu(1.0 - self.speed / (cfg.pace_margin * speed_ref).clamp(min=1.0))
-        pace_term = -cfg.pace_penalty * pace_deficit * pace_deficit
+        pace_term = cfg.pace_bonus * pace_ratio * pace_ratio - cfg.pace_penalty * pace_deficit * pace_deficit
         ref_index = (self.last_progress * n_ref).long().clamp(0, n_ref - 1)
         lookahead_m = torch.maximum(torch.full_like(self.speed, cfg.align_lookahead_m), self.speed * cfg.align_lookahead_s)
         ahead = (lookahead_m / self.track.spacing_m).clamp(min=1.0).long()
         to_target = self.track.centerline[(ref_index + ahead) % n_ref] - self.pos
         align_err = torch.atan2(to_target[:, 1], to_target[:, 0]) - self.heading
         align_err = torch.atan2(align_err.sin(), align_err.cos())
-        align_term = -cfg.align_penalty * (1.0 - align_err.cos())
+        # Dead zone first: the yaw a racing line needs against the centerline
+        # is free, everything past it is graded as before.
+        align_excess = torch.relu(align_err.abs() - cfg.align_free_rad)
+        align_term = -cfg.align_penalty * (1.0 - align_excess.cos())
         reward = progress_term + bonus_term + wall_term + speed_term + stall_term + pace_term + align_term - cfg.time_tax
         # Keep the terminal event a fixed cost. Making the crash penalty depend
         # on impact speed adds a large, orthogonal gradient whose easiest local
@@ -826,8 +932,29 @@ class CarEnv:
             remaining = (cfg.episode_steps - self.step_count).clamp(min=0).to(reward.dtype)
         else:
             remaining = torch.zeros_like(reward)
-        crash_cost = cfg.crash_penalty + (cfg.time_tax + cfg.pace_penalty + cfg.align_penalty) * remaining
+        # Metres of the lap left undriven at an ending that is not the finish.
+        # `laps` is the net lap fraction, so a car that ends at 0.58 of the lap
+        # forfeits 0.42 of it. Clamped at 0 so a finisher forfeits nothing.
+        unfinished_m = (cfg.max_laps - self.laps).clamp(min=0.0) * self.track.length_m if cfg.max_laps > 0 else torch.zeros_like(self.laps)
+        crash_cost = (
+            cfg.crash_penalty
+            + cfg.unfinished_per_m * unfinished_m
+            # A standing car earns no pace bonus, so the bonus counts as a
+            # charge here: an ended body must never be cheaper per step than
+            # the worst survivor.
+            + (cfg.time_tax + cfg.pace_bonus + cfg.pace_penalty + cfg.align_penalty) * remaining
+        )
         reward = torch.where(alive | finished, reward, -crash_cost)
+        # Running the budget out without finishing owes the same unfinished
+        # metres as ending early does, minus the crash penalty. Without this a
+        # car that survives to the last step pays nothing for the lap it never
+        # completed while one that crashes at 0.9 laps pays for the last tenth,
+        # and the safest way to score is to potter around inside the budget.
+        expiry_term = torch.zeros_like(reward)
+        if cfg.episode_steps > 0:
+            expired = alive & ~finished & (self.step_count >= cfg.episode_steps)
+            expiry_term = torch.where(expired, -cfg.unfinished_per_m * unfinished_m, expiry_term)
+        reward = reward + expiry_term
         # A crashed car stays at its last legal pose: the crash frame shows the
         # body against the barrier, not one step's travel through it.
         self.pos = torch.where(crashed.unsqueeze(1), self.prev_pos, self.pos)
@@ -850,6 +977,7 @@ class CarEnv:
             "align": align_term,
             "align_err": align_err,
             "time_tax": torch.full_like(reward, -cfg.time_tax),
+            "expiry": expiry_term,
             "crash_cost": crash_cost,
             "delta": delta,
             "raw_delta": raw_delta,

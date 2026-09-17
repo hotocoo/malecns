@@ -201,9 +201,9 @@ distance covered in the budget: average speed. The terms (`CarConfig`):
 | term | per step | why |
 |---|---|---|
 | progress | `progress_per_m` x metres along the centerline (sub-sample: nearest sample plus the signed offset along its tangent, `Track.progress_at`) | pays every moving step; the old nearest-sample lookup paid nothing on 86 % of steps at 54 km/h and 1.6 m lumps on the rest |
-| lap bonus | `lap_bonus` per *new* lap | crossing back and forth pays once |
+| lap bonus | `lap_bonus` per *new* lap, **0 by default** | a flat finish bonus is paid whatever the lap looked like: at 100 it was 30 % of a Monaco lap's progress pay, enough to turn a -70 episode of wall, pace and time charges into +30, so a scraped 197 s lap read as a success. Crossing the line already pays its metres, and finishing ends the episode, which saves the whole unused-budget charge - an incentive that grows the faster the lap is |
 | time tax | `-time_tax` | lap time pressure; only finishing the lap early saves any of it |
-| pace | `-pace_penalty x max(0, 1 - v / (pace_margin x v_ref))^2` | `v_ref` is `Track.speed_ref`, the fastest this vehicle's grip circle, power, drag and brakes can pass that point (`speed_profile`: cornering speed, backward braking pass, forward traction pass, road grade). Zero at 90 % of pace, so slowness is charged where there is room to go faster, not in the hairpin |
+| pace | `-pace_penalty x max(0, 1 - v / (pace_margin x v_ref))^2` | `v_ref` is `Track.speed_ref`, the fastest this vehicle's grip circle, power, drag and brakes can pass that point (`speed_profile`: cornering speed, backward braking pass, forward traction pass, road grade). charged all the way to the reference speed (`pace_margin` 1.0), so a car already at 90 % of what the road allows still gains by going faster; slowness is charged where there is room for it, not in the hairpin |
 | alignment | `-align_penalty x (1 - cos(heading error to a point max(15 m, 1 s) ahead))` | graded steering feedback: pointed down the road costs nothing, 90 degrees off costs one penalty, backwards two |
 | wall | `-wall_penalty x near^2` inside `wall_margin` (0.75 m from the body edge) | a gradient before the crash cliff that still lets the line brush the barrier |
 | stall | low-speed near-full-lock penalty | the stationary steering attractor seen in an earlier collapse |
@@ -224,10 +224,13 @@ in 4 s (`stuck`, a 3 m/s pace floor) or completes `max_laps` (default one lap,
 `finished`, paid normally). `--episode-steps 0` restores the curriculum's step
 caps, `>0` a fixed cap; `defaults.EPISODE_HARD_CAP` (250,000 steps, 67 min of
 sim time) is a safety ceiling only. Fitness is therefore bounded by driving:
-getting round pays the progress and the lap bonus, and the per-step time tax
-(1.25 per second) makes the faster lap the better one. The lap bonus is paid
-once per newly completed lap; progress reward is a potential, so nothing is
-earned by oscillating. An exploit detector runs in every generation and flags
+getting round pays the progress, and the per-step time tax (1.25 per second)
+plus the pace deficit make the faster lap the better one: on Monaco a lap at
+the reference pace scores about 220, the same car 20 s slower about 180, and a
+197 s crawl about 30. There is no flat finish bonus (`lap_bonus` is 0); a
+finisher's advantage is the unused budget it no longer pays for, which is
+worth more the earlier it crosses. Progress reward is a potential, so nothing
+is earned by oscillating. An exploit detector runs in every generation and flags
 reward above the distance bound, bonus farming, oscillation, teleports, wall
 phasing, spinning and more (see [docs/AUDIT.md](docs/AUDIT.md)).
 

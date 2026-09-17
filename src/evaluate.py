@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 import defaults
-from agent import AgentConfig, ConnectomeAgent
+from agent import AgentConfig, ConnectomeAgent, match_sensing
 from brain import Brain, LIFConfig, load_connectome, pick_device
 from car_env import DONE_NAMES, CarConfig, CarEnv, Track, build_centerline, curvature_radius, monaco_config
 from exploits import ExploitMonitor
@@ -262,6 +262,11 @@ def main(argv: list[str] | None = None) -> int:
         weight_scale=args.weight_scale,
     )
     agent = ConnectomeAgent(brain, connectome.neurons, agent_config_from(state, substeps))
+    # The eye geometry travels with the checkpoint: a policy evolved on 9 rays
+    # must be driven with 9 rays even after the default changed, or the agent
+    # reads a ray as its speed input and never sees the outer rays.
+    # The track geometry does not depend on the eye, so only the config changes.
+    plan = [(name, match_sensing(cfg, agent.cfg), track, starts) for name, cfg, track, starts in plan]
     mu = None
     if state is not None:
         agent.load_readout(state)

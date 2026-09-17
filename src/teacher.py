@@ -26,7 +26,7 @@ FALLBACK = [1.47, 0.56, 0.50, 0.57, 1.65, 1.30, 0.13, 0.12, 3.93]
 
 
 class LinearTeacher:
-    """`act(prox, speed)` -> (batch, 2) steer/pedal from road-relative proximities (batch, 9) and speed/max_speed (batch,)."""
+    """`act(prox, speed)` -> (batch, 2) steer/pedal from road-relative proximities (batch, n_rays >= 9) and speed/max_speed (batch,)."""
 
     def __init__(self, params: list[float] | torch.Tensor | None = None, path: Path | str = DEFAULT_PATH) -> None:
         if params is None:
@@ -37,8 +37,14 @@ class LinearTeacher:
             raise ValueError(f"linear teacher takes 9 weights, got {self.params.numel()}")
 
     def act(self, prox: torch.Tensor, speed: torch.Tensor) -> torch.Tensor:
+        # The weights were found on a 9-ray eye. They describe angular
+        # positions, not ray indices, so a finer eye is resampled onto the same
+        # nine directions across the same field of view and the teacher drives
+        # exactly as it did before.
         if prox.shape[-1] != 9:
-            raise ValueError(f"linear teacher expects 9 rays, got {prox.shape[-1]}")
+            if prox.shape[-1] < 9:
+                raise ValueError(f"linear teacher needs at least 9 rays, got {prox.shape[-1]}")
+            prox = torch.nn.functional.interpolate(prox.unsqueeze(1), size=9, mode="linear", align_corners=True).squeeze(1)
         p = self.params.to(prox.device)
         asym = prox[:, :4] - prox[:, [8, 7, 6, 5]]  # left minus right
         steer = -(asym * p[:4]).sum(1)

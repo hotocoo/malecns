@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,14 +31,18 @@ def agent():
 
 @needs_graph
 def test_legacy_141_param_checkpoint_keeps_trained_blocks(agent):
-    assert agent.n_params == 144
+    n = agent.cfg.n_rays
+    assert agent.n_params == n + 135
     legacy = torch.arange(141, dtype=torch.float32) / 100.0
     state = {"mu": legacy, "momentum": torch.ones(141), "agent_cfg": asdict(agent.cfg)}
     mu, momentum, notes = agent.migrate_state(state)
-    assert mu.numel() == 144 and momentum.numel() == 144
-    assert notes == ["loom_gain from init", "g_out from init"]
+    assert mu.numel() == agent.n_params and momentum.numel() == agent.n_params
+    assert notes == [f"ray_gain resampled 9 -> {n} rays", "loom_gain from init", "g_out from init"]
     theta = agent.unpack(mu.unsqueeze(0))
-    assert torch.equal(theta["ray_gain"][0], legacy[:9])
+    # the saved 9-ray profile spans the same field of view: the edges land on
+    # the edges and everything between is the linear interpolation of it
+    expected = torch.from_numpy(np.interp(np.linspace(0, 8, n), np.arange(9), legacy[:9].numpy())).float()
+    assert torch.allclose(theta["ray_gain"][0], expected, atol=1e-6)
     assert torch.equal(theta["bias_hz"][0], legacy[9:10])
     assert torch.equal(theta["speed_gain"][0], legacy[10:11])
     assert torch.equal(theta["w_out"][0].reshape(-1), legacy[11:139])
@@ -45,7 +50,7 @@ def test_legacy_141_param_checkpoint_keeps_trained_blocks(agent):
     assert float(theta["loom_gain"][0]) == 0.0  # init value
     # no momentum on the block that was never trained
     m = agent.unpack(momentum.unsqueeze(0))
-    assert float(m["loom_gain"][0]) == 0.0 and float(m["ray_gain"][0].sum()) == 9.0
+    assert float(m["loom_gain"][0]) == 0.0 and float(m["ray_gain"][0].sum()) == float(agent.cfg.n_rays)
 
 
 @needs_graph
@@ -55,7 +60,9 @@ def test_named_layout_migration_reorders_and_drops(agent):
     mu, notes = agent.migrate_params(saved, shapes)
     theta = agent.unpack(mu.unsqueeze(0))
     assert torch.equal(theta["b_out"][0], torch.tensor([7.0, 8.0]))
-    assert torch.equal(theta["ray_gain"][0], torch.full((9,), 3.0))
+    # the 9-ray profile is resampled onto this build's eye, value for value
+    assert torch.equal(theta["ray_gain"][0], torch.full((agent.cfg.n_rays,), 3.0))
+    assert any("ray_gain resampled" in n for n in notes)
     assert "extra dropped" in notes
     assert any(n.startswith("w_out from init") for n in notes)
 
@@ -95,7 +102,7 @@ def test_readout_from_another_configuration_is_reset(agent):
     ):
         mu, momentum, notes = agent.migrate_state(state)
         theta = agent.unpack(mu.unsqueeze(0))
-        assert torch.equal(theta["ray_gain"][0], torch.full((9,), 2.0))
+        assert torch.equal(theta["ray_gain"][0], torch.full((agent.cfg.n_rays,), 2.0))
         # w_out is drawn fresh (small random), b_out is the fixed init: neither is the saved 2.0
         assert float(theta["w_out"][0].abs().mean()) < 0.3 and not (theta["w_out"][0] == 2.0).any()
         assert torch.equal(theta["b_out"][0], torch.tensor([0.0, 0.3]))
@@ -109,7 +116,7 @@ def test_explicit_reset_blocks(agent):
     state = {"mu": mu0, "momentum": torch.ones_like(mu0), "param_shapes": {k: list(v) for k, v in agent.param_shapes.items()}, "agent_cfg": asdict(agent.cfg)}
     mu, _, notes = agent.migrate_state(state, reset=("ray_gain",))
     theta = agent.unpack(mu.unsqueeze(0))
-    assert torch.equal(theta["ray_gain"][0], torch.full((9,), 0.5))  # init
+    assert torch.equal(theta["ray_gain"][0], torch.full((agent.cfg.n_rays,), 0.5))  # init
     assert torch.equal(theta["bias_hz"][0], agent.unpack(mu0.unsqueeze(0))["bias_hz"][0])
     assert notes == ["ray_gain (reset)"]
 
@@ -118,3 +125,34 @@ def test_explicit_reset_blocks(agent):
 def test_unknown_size_without_layout_is_an_error(agent):
     with pytest.raises(ValueError):
         agent.migrate_params(torch.zeros(77), None)
+
+
+# --- reward changes invalidate stored scores -----------------------------------
+def test_reward_change_is_detected_so_stale_scores_are_dropped():
+    """A checkpoint scored under a different reward must not anchor the acceptance guard."""
+    from dataclasses import replace as _replace
+
+    from car_env import CarConfig
+    from train import reward_terms_changed
+
+    cfg = CarConfig()
+    saved = asdict(_replace(cfg, episode_steps=6000))
+    assert reward_terms_changed(saved, cfg, 6000) == []
+    assert reward_terms_changed(None, cfg, 6000) == []
+    saved["lap_bonus"] = 100.0
+    saved["pace_penalty"] = 0.04
+    assert reward_terms_changed(saved, cfg, 6000) == ["lap_bonus", "pace_penalty"]
+    # the step budget scales every per-step charge, so it counts as a reward change
+    assert "episode_steps" in reward_terms_changed(asdict(_replace(cfg, episode_steps=6000)), cfg, 12000)
+
+
+def test_vehicle_changes_do_not_count_as_reward_changes():
+    """Only the reward fields matter: a wider road is a curriculum stage, not a new scale."""
+    from dataclasses import replace as _replace
+
+    from car_env import CarConfig
+    from train import reward_terms_changed
+
+    cfg = CarConfig()
+    saved = asdict(_replace(cfg, episode_steps=6000, track_halfwidth=cfg.track_halfwidth + 2.0))
+    assert reward_terms_changed(saved, cfg, 6000) == []
