@@ -19,6 +19,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from lawreward import AMBER, GREEN, RED, SignalTiming  # noqa: E402
 from perceive import (  # noqa: E402
     CHANNELS,
+    EDGE_CHANNELS,
+    LANE_CHANNELS,
     PHASE_CHANNELS,
     ROAD_CHANNELS,
     Detection,
@@ -26,6 +28,8 @@ from perceive import (  # noqa: E402
     EyeConfig,
     classify_lens,
     describe,
+    lane_geometry,
+    road_edges,
     road_profile,
 )
 from roadlaw import ControlPoint, LegalProfile  # noqa: E402
@@ -190,21 +194,28 @@ class TestDetectionEye:
 
     def test_width_matches_the_declared_layout(self):
         eye = DetectionEye(EyeConfig(columns=8))
-        assert eye.width == 8 * (len(CHANNELS) + len(PHASE_CHANNELS) + len(ROAD_CHANNELS))
+        grid = 8 * (len(CHANNELS) + len(PHASE_CHANNELS) + len(ROAD_CHANNELS))
+        assert eye.width == grid + len(EDGE_CHANNELS) + len(LANE_CHANNELS)
+
+    def test_the_measured_blocks_can_be_dropped(self):
+        grid_only = DetectionEye(EyeConfig(columns=8, include_edges=False, include_lane=False))
+        assert grid_only.width == 8 * (len(CHANNELS) + len(PHASE_CHANNELS) + len(ROAD_CHANNELS))
 
     def test_dropping_a_channel_group_shrinks_the_view(self):
         full = DetectionEye(EyeConfig(columns=8))
-        bare = DetectionEye(EyeConfig(columns=8, include_phase=False, include_road=False))
+        bare = DetectionEye(
+            EyeConfig(columns=8, include_phase=False, include_road=False, include_edges=False, include_lane=False)
+        )
         assert bare.width == 8 * len(CHANNELS) < full.width
 
     def test_no_detections_is_an_empty_view(self):
-        eye = DetectionEye(EyeConfig(columns=6, include_road=False))
+        eye = DetectionEye(EyeConfig(columns=6, include_road=False, include_edges=False, include_lane=False))
         assert not eye.encode([], self.frame()).any()
 
 
 
     def test_a_car_lights_its_own_channel_and_column(self):
-        eye = DetectionEye(EyeConfig(columns=4, include_phase=False, include_road=False))
+        eye = DetectionEye(EyeConfig(columns=4, include_phase=False, include_road=False, include_edges=False, include_lane=False))
         found = Detection(CLASS_CAR, 0.9, 480.0, 150.0, 560.0, 250.0)  # right of centre
         vector = eye.encode([found], self.frame()).reshape(len(CHANNELS), 4)
         assert vector[CHANNELS.index(CLASS_CAR), 3] > 0.0
@@ -212,7 +223,7 @@ class TestDetectionEye:
         assert vector[CHANNELS.index(CLASS_PERSON)].sum() == 0.0
 
     def test_a_nearer_object_reads_stronger(self):
-        eye = DetectionEye(EyeConfig(columns=4, include_phase=False, include_road=False))
+        eye = DetectionEye(EyeConfig(columns=4, include_phase=False, include_road=False, include_edges=False, include_lane=False))
         far = Detection(CLASS_CAR, 1.0, 300.0, 180.0, 330.0, 200.0)
         near = Detection(CLASS_CAR, 1.0, 260.0, 100.0, 380.0, 300.0)
         f = eye.encode([far], self.frame()).max()
@@ -225,13 +236,13 @@ class TestDetectionEye:
         assert not eye.encode([weak], self.frame()).any()
 
     def test_columns_run_left_to_right(self):
-        eye = DetectionEye(EyeConfig(columns=4, include_phase=False, include_road=False))
+        eye = DetectionEye(EyeConfig(columns=4, include_phase=False, include_road=False, include_edges=False, include_lane=False))
         left = Detection(CLASS_CAR, 1.0, 10.0, 100.0, 90.0, 300.0)
         vector = eye.encode([left], self.frame()).reshape(len(CHANNELS), 4)
         assert vector[CHANNELS.index(CLASS_CAR), 0] > 0.0
 
     def test_a_red_light_is_read_from_the_pixels(self):
-        eye = DetectionEye(EyeConfig(columns=3, include_road=False))
+        eye = DetectionEye(EyeConfig(columns=3, include_road=False, include_edges=False, include_lane=False))
         frame = self.frame()
         frame[150:200, 300:340] = (235, 30, 30)
         found = Detection(CLASS_TRAFFIC_LIGHT, 0.9, 300.0, 150.0, 340.0, 200.0)
@@ -241,7 +252,7 @@ class TestDetectionEye:
         assert vector[names.index("signal_green"), 1] == 0.0
 
     def test_a_light_with_no_lit_lens_sets_no_phase(self):
-        eye = DetectionEye(EyeConfig(columns=3, include_road=False))
+        eye = DetectionEye(EyeConfig(columns=3, include_road=False, include_edges=False, include_lane=False))
         frame = self.frame()
         frame[150:200, 300:340] = (40, 40, 42)
         found = Detection(CLASS_TRAFFIC_LIGHT, 0.9, 300.0, 150.0, 340.0, 200.0)
@@ -250,7 +261,7 @@ class TestDetectionEye:
         assert vector[len(CHANNELS) :].sum() == 0.0
 
     def test_batch_encoding_is_per_body(self):
-        eye = DetectionEye(EyeConfig(columns=4, include_phase=False, include_road=False))
+        eye = DetectionEye(EyeConfig(columns=4, include_phase=False, include_road=False, include_edges=False, include_lane=False))
         frames = [self.frame(), self.frame()]
         found = [[Detection(CLASS_CAR, 1.0, 300.0, 100.0, 380.0, 300.0)], []]
         out = eye.encode_batch(found, frames)
@@ -373,8 +384,71 @@ class TestRoadInTheEye:
         assert eye.encode([], self.road_frame()).any()
 
     def test_the_road_channels_carry_it(self):
-        eye = DetectionEye(EyeConfig(columns=6))
+        eye = DetectionEye(EyeConfig(columns=6, include_edges=False, include_lane=False))
         names = eye._rows()
         grid = eye.encode([], self.road_frame()).reshape(len(names), 6)
         assert grid[names.index("road_extent")].max() > 0.0
         assert grid[: len(CHANNELS)].sum() == 0.0  # no objects were detected
+
+
+class TestRoadEdges:
+    """What the eye measures about where the carriageway ends."""
+
+    def road_frame(self, left: int = 120, right: int = 520) -> np.ndarray:
+        frame = np.zeros((384, 640, 3), dtype=np.uint8)
+        frame[:, :] = (150, 180, 210)  # sky, and off-grey so it is not road
+        frame[200:, left:right] = (60, 60, 62)  # asphalt between two edges
+        return frame
+
+    def test_the_edges_bracket_the_road(self):
+        edges = road_edges(self.road_frame())
+        assert edges[0] < 0.0 < edges[1]
+
+    def test_a_road_shifted_right_moves_both_edges_right(self):
+        centred = road_edges(self.road_frame(240, 400))
+        shifted = road_edges(self.road_frame(300, 460))
+        assert shifted[0] > centred[0] and shifted[1] > centred[1]
+
+    def test_no_road_reads_as_nothing(self):
+        sky = np.tile(np.array([150, 180, 210], dtype=np.uint8), (384, 640, 1))
+        assert not road_edges(sky).any()
+
+    def test_one_value_per_side_per_row(self):
+        from perceive import EDGE_ROWS
+
+        assert road_edges(self.road_frame()).shape == (2 * len(EDGE_ROWS),)
+
+
+class TestLaneGeometry:
+    """The lane the car is in, read off the paint that brackets it."""
+
+    def lane_frame(self, left: int = 240, right: int = 400) -> np.ndarray:
+        frame = np.zeros((384, 640, 3), dtype=np.uint8)
+        frame[:, :] = (150, 180, 210)
+        frame[200:, 80:560] = (60, 60, 62)  # carriageway
+        frame[200:, left : left + 8] = (240, 240, 238)  # left lane line
+        frame[200:, right : right + 8] = (240, 240, 238)  # right lane line
+        return frame
+
+    def test_a_centred_lane_reads_no_offset(self):
+        out = lane_geometry(self.lane_frame())
+        assert abs(float(out[0])) < 0.05
+
+    def test_drifting_left_reads_as_a_positive_offset(self):
+        # The car is left of the lane centre, so the lane's paint sits right
+        # of the frame centre and the measured offset is positive.
+        out = lane_geometry(self.lane_frame(280, 440))
+        assert float(out[0]) > 0.1
+
+    def test_a_wider_lane_reads_wider(self):
+        narrow = lane_geometry(self.lane_frame(280, 360))
+        wide = lane_geometry(self.lane_frame(200, 440))
+        assert float(wide[len(wide) // 2 - 1]) >= 0.0
+        assert float(wide[6]) > float(narrow[6])
+
+    def test_no_paint_is_reported_as_unseen(self):
+        bare = np.zeros((384, 640, 3), dtype=np.uint8)
+        bare[:, :] = (150, 180, 210)
+        bare[200:, 80:560] = (60, 60, 62)
+        out = lane_geometry(bare)
+        assert float(out[-1]) == 0.0

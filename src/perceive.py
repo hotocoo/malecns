@@ -52,6 +52,20 @@ PHASE_CHANNELS = ("signal_red", "signal_amber", "signal_green")
 # and where its painted markings are.
 ROAD_CHANNELS = ("road_extent", "lane_marking")
 
+# Rows of the frame, as fractions of its height, where the road's left and
+# right boundary are measured. Near rows carry lateral offset, far rows carry
+# heading error; together they are what a driver reads off the kerb line.
+EDGE_ROWS = (0.96, 0.88, 0.78, 0.68)
+EDGE_CHANNELS = tuple(f"{side}_edge[{k}]" for k in range(len(EDGE_ROWS)) for side in ("left", "right"))
+
+# Rows where the lane the car sits in is measured, near to far. The lane is
+# read from the paint that brackets the frame centre, so what comes out is the
+# lane the car is in rather than the carriageway it belongs to.
+LANE_ROWS = (0.97, 0.90, 0.83, 0.76, 0.69, 0.62)
+LANE_CHANNELS = tuple(f"lane_offset[{k}]" for k in range(len(LANE_ROWS))) + tuple(
+    f"lane_width[{k}]" for k in range(len(LANE_ROWS))
+) + ("lane_heading", "lane_curvature", "lane_seen")
+
 DEFAULT_WEIGHTS = "yolo26n.pt"
 
 
@@ -90,6 +104,10 @@ class EyeConfig:
     # fraction of frame height, so it holds at any resolution.
     near_height_fraction: float = 0.45
     include_phase: bool = True
+    include_edges: bool = True
+    edge_rows: tuple[float, ...] = EDGE_ROWS
+    include_lane: bool = True
+    lane_rows: tuple[float, ...] = LANE_ROWS
 
     @property
     def width(self) -> int:
@@ -98,7 +116,124 @@ class EyeConfig:
             channels += len(PHASE_CHANNELS)
         if self.include_road:
             channels += len(ROAD_CHANNELS)
-        return self.columns * channels
+        extra = len(EDGE_CHANNELS) if self.include_edges else 0
+        extra += len(LANE_CHANNELS) if self.include_lane else 0
+        return self.columns * channels + extra
+
+
+def surface_mask(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Which pixels look like road, and which of those look painted.
+
+    Asphalt is dark and close to grey; paint is bright and close to grey.
+    Everything else in the scene - render, glass, pavers, kerb paint, grass -
+    is kept off neutral grey by the renderer so that it cannot be mistaken
+    for road here.
+    """
+    rgb = frame.astype(np.float32) / 255.0
+    high = rgb.max(axis=2)
+    low = rgb.min(axis=2)
+    saturation = np.where(high > 0.0, (high - low) / np.maximum(high, 1e-6), 0.0)
+    grey = saturation < 0.18
+    asphalt = grey & (high > 0.06) & (high < 0.55)
+    paint = grey & (high >= 0.55)
+    return asphalt | paint, paint
+
+
+def road_edges(frame: np.ndarray, rows: tuple[float, ...] = EDGE_ROWS) -> np.ndarray:
+    """The road's left and right boundary at each row, in [-1, 1] of frame width.
+
+    The scan starts at the road pixel nearest the frame centre and walks out
+    either way while the row stays road-like, so what comes back is the
+    carriageway the car is on rather than the widest run in the row. A row
+    with no road under the centre reports both edges at the centre, which is
+    what the driver has when the road has gone from view.
+    """
+    height, width = frame.shape[:2]
+    surface, _paint = surface_mask(frame)
+    centre = width // 2
+    reach = max(width // 3, 1)
+    out = np.zeros(2 * len(rows), dtype=np.float32)
+    for k, fraction in enumerate(rows):
+        y = int(np.clip(fraction * height, 0, height - 1))
+        line = surface[y]
+        start = -1
+        if line[centre]:
+            start = centre
+        else:
+            for step in range(1, reach):
+                if centre - step >= 0 and line[centre - step]:
+                    start = centre - step
+                    break
+                if centre + step < width and line[centre + step]:
+                    start = centre + step
+                    break
+        if start < 0:
+            continue
+        left = start
+        while left > 0 and line[left - 1]:
+            left -= 1
+        right = start
+        while right < width - 1 and line[right + 1]:
+            right += 1
+        out[2 * k] = (left / max(width - 1, 1)) * 2.0 - 1.0
+        out[2 * k + 1] = (right / max(width - 1, 1)) * 2.0 - 1.0
+    return out
+
+
+def lane_geometry(frame: np.ndarray, rows: tuple[float, ...] = LANE_ROWS) -> np.ndarray:
+    """The lane the car is in, measured from the paint at each row.
+
+    At every row the nearest painted pixel either side of the frame centre is
+    found, inside the road surface. Their midpoint is where the lane centre
+    projects, and their distance is how wide the lane looks, both in units of
+    half the frame width. From the midpoints across rows come a heading error
+    (how fast the lane centre slides across the frame) and a curvature (how
+    that slide itself changes). A row with no paint either side reports zero,
+    and `lane_seen` says what share of rows were measured, so the driver can
+    tell "lane dead ahead" from "no paint found".
+    """
+    height, width = frame.shape[:2]
+    surface, paint = surface_mask(frame)
+    centre = width // 2
+    half = max(width / 2.0, 1.0)
+    offsets = np.zeros(len(rows), dtype=np.float32)
+    widths = np.zeros(len(rows), dtype=np.float32)
+    seen = np.zeros(len(rows), dtype=bool)
+    for k, fraction in enumerate(rows):
+        y = int(np.clip(fraction * height, 0, height - 1))
+        line = paint[y] & surface[y]
+        # Paint comes in runs several pixels wide, and a run can straddle the
+        # frame centre, so the runs are found first and then the nearest one
+        # either side is taken by its own centre. Taking the nearest painted
+        # pixel instead reported one run as both edges of the lane.
+        edges = np.flatnonzero(np.diff(np.concatenate(([False], line, [False])).astype(np.int8)))
+        starts, ends = edges[0::2], edges[1::2]
+        if starts.size == 0:
+            continue
+        middles = (starts + ends - 1) / 2.0
+        to_left = middles[middles < centre]
+        to_right = middles[middles > centre]
+        if to_left.size == 0 or to_right.size == 0:
+            continue
+        left, right = float(to_left.max()), float(to_right.min())
+        offsets[k] = ((left + right) / 2.0 - centre) / half
+        widths[k] = (right - left) / half
+        seen[k] = True
+
+    # Heading is the slope of the lane centre across the measured rows, and
+    # curvature its change: a straight lane slides linearly up the frame, a
+    # bend does not.
+    heading = 0.0
+    curvature = 0.0
+    index = np.flatnonzero(seen)
+    if index.size >= 2:
+        fit = np.polyfit(index.astype(np.float64), offsets[index].astype(np.float64), 1)
+        heading = float(np.clip(fit[0], -1.0, 1.0))
+    if index.size >= 3:
+        fit = np.polyfit(index.astype(np.float64), offsets[index].astype(np.float64), 2)
+        curvature = float(np.clip(fit[0] * 4.0, -1.0, 1.0))
+    share = float(seen.mean())
+    return np.concatenate([offsets, widths, np.array([heading, curvature, share], dtype=np.float32)])
 
 
 def road_profile(frame: np.ndarray, columns: int) -> tuple[np.ndarray, np.ndarray]:
@@ -116,28 +251,29 @@ def road_profile(frame: np.ndarray, columns: int) -> tuple[np.ndarray, np.ndarra
     road, exactly as a camera-only vehicle's would be.
     """
     height, width = frame.shape[:2]
-    rgb = frame.astype(np.float32) / 255.0
-    high = rgb.max(axis=2)
-    low = rgb.min(axis=2)
-    saturation = np.where(high > 0.0, (high - low) / np.maximum(high, 1e-6), 0.0)
-    grey = (saturation < 0.18)
-    asphalt = grey & (high > 0.06) & (high < 0.55)
-    paint = grey & (high >= 0.55)
-    surface = asphalt | paint
+    surface, paint = surface_mask(frame)
 
-    # One pass over the whole image rather than one per column: this runs once
+    # The road can only lie below the horizon, which for a level camera at
+    # eye height is the middle row. Counting above it let a grey building
+    # wall continue the run to the top of the frame, and a column with a
+    # tower in it read as road all the way. Measured against the horizon the
+    # extent also uses the whole 0..1 range: 1.0 is road to the skyline.
+    horizon = height // 2
+    below = surface[horizon:]
+    # One pass over the whole image instead of one per column: this runs once
     # per body per control step, and the per-column loop cost more than the
     # detector did.
-    run = np.cumprod(surface[::-1], axis=0).sum(axis=0)  # road pixels up from the bottom
+    run = np.cumprod(below[::-1], axis=0).sum(axis=0)  # road pixels up from the bottom
     band = np.minimum((np.arange(width) * columns) // max(width, 1), columns - 1)
     extent = np.zeros(columns, dtype=np.float32)
     marking = np.zeros(columns, dtype=np.float32)
+    rows_below = max(height - horizon, 1)
     for c in range(columns):
         take = band == c
         if not take.any():
             continue
-        extent[c] = min(float(np.median(run[take])) / height, 1.0)
-        marking[c] = float(paint[:, take].mean())
+        extent[c] = min(float(np.median(run[take])) / rows_below, 1.0)
+        marking[c] = float(paint[horizon:, take].mean())
     return extent, marking
 
 
@@ -218,9 +354,11 @@ class DetectionEye:
         return self.config.width
 
     def channel_names(self) -> tuple[str, ...]:
-        return tuple(
+        grid = tuple(
             f"{name}[{column}]" for name in self._rows() for column in range(self.config.columns)
         )
+        grid += EDGE_CHANNELS if self.config.include_edges else ()
+        return grid + (LANE_CHANNELS if self.config.include_lane else ())
 
     def _rows(self) -> list[str]:
         names = list(CHANNELS)
@@ -267,7 +405,12 @@ class DetectionEye:
                     prow = index[phase]
                     grid[prow, column] = max(grid[prow, column], nearness)
 
-        return grid.reshape(-1)
+        measured = [grid.reshape(-1)]
+        if cfg.include_edges:
+            measured.append(road_edges(frame, cfg.edge_rows))
+        if cfg.include_lane:
+            measured.append(lane_geometry(frame, cfg.lane_rows))
+        return np.concatenate(measured) if len(measured) > 1 else measured[0]
 
     def encode_batch(self, detections: list[list[Detection]], frames: list[np.ndarray]) -> np.ndarray:
         """(batch, width) for a population of cars."""

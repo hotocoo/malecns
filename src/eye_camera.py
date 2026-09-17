@@ -150,17 +150,36 @@ def agent_config_for(sensor: CameraSensor, base=None):
     """An `AgentConfig` whose visual groups match this sensor's channels.
 
     The agent splits its visual projection neurons evenly across `n_rays`
-    input groups and reads the observation's first `n_rays` columns, with the
-    car's own speed last. The camera eye keeps that contract - it simply has
-    more columns than a ray fan, one per class per view column - so pointing
-    `n_rays` at the eye's width is the whole of the swap on the brain's side.
+    input groups and reads the observation's first `n_rays` columns, the
+    car's own speed last. The camera eye keeps that contract - its columns
+    are the ray fan, one per class per view column - so pointing `n_rays` at
+    the eye's width is the whole swap on the brain's side. The eye's values are
+    already nearness in [0, 1], so they are read directly rather than through
+    the lidar distance mapping (`eye_encoding="direct"`).
+
+    The camera eye also drives the brain harder than the ray eye does. With
+    the ray eye's defaults (300 Hz, 8 mV) a readout fitted by imitation
+    recovered R^2 0.04 on steering where the eye vector itself carried 0.29:
+    the camera eye spreads its channels over many more input groups, so each
+    group fires few spikes per 16 ms control step and the difference between
+    two channels is lost in the Poisson noise. Raising the group rate and the
+    per-spike kick recovers most of that (measured: 0.04 at 300 Hz/8 mV, 0.09
+    at 1200 Hz/8 mV, 0.14 at 1200 Hz/48 mV, falling again by 2400 Hz).
     """
     from dataclasses import replace
 
     from agent import AgentConfig
 
     base = base or AgentConfig()
-    return replace(base, n_rays=sensor.eye.width)
+    tweaks = {"n_rays": sensor.eye.width, "eye_encoding": "direct"}
+    # A checkpoint that recorded its own drive keeps it; only the ray eye's
+    # defaults are replaced, so a saved readout still means what it meant.
+    ray_defaults = AgentConfig()
+    if base.max_input_hz == ray_defaults.max_input_hz:
+        tweaks["max_input_hz"] = 1200.0
+    if base.kick_mv == ray_defaults.kick_mv:
+        tweaks["kick_mv"] = 48.0
+    return replace(base, **tweaks)
 
 
 def build_sensor(
