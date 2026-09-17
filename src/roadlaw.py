@@ -181,6 +181,8 @@ class ControlPoint:
     rules: tuple[str, ...]  # rule ids from the law corpus this node triggers
     pos: np.ndarray  # (2,) metres in the track frame
     tags: dict
+    progress: float = -1.0  # where along the lap it sits, 0..1; -1 when not placed
+    offset_m: float = float("inf")  # how far it stands from the centerline
 
 
 def parse_selector(selector: str) -> tuple[str, str | None] | None:
@@ -214,25 +216,60 @@ def rules_triggered_by(tags: dict, corpus) -> tuple[str, ...]:
     return tuple(hits)
 
 
-def control_points_for_circuit(geojson: str | Path, proj, corpus) -> tuple[ControlPoint, ...]:
+def control_points_for_circuit(
+    geojson: str | Path,
+    proj,
+    corpus,
+    centerline: np.ndarray | None = None,
+    max_offset_m: float = 25.0,
+) -> tuple[ControlPoint, ...]:
     """The rule-bearing nodes of the survey, projected into the track frame.
 
     A node the law corpus has no rule for is dropped: the driver can only be
-    judged by rules the corpus carries.
+    judged by rules the corpus carries. With a `centerline`, the region's nodes
+    are cut down to those standing within `max_offset_m` of the lap and each
+    one is placed at the fraction of the lap it governs, which is what lets the
+    reward know a signal is ahead rather than merely somewhere in the city.
     """
     path = highways_path(geojson)
     if not path.exists() or proj is None:
         return ()
     data = json.loads(path.read_text())
-    points: list[ControlPoint] = []
+    raw: list[tuple[int, tuple[str, ...], np.ndarray, dict]] = []
     for node in data.get("control_nodes", []):
         tags = node.get("tags") or {}
         rules = rules_triggered_by(tags, corpus)
         if not rules or node.get("lat") is None:
             continue
         pos = proj.project(np.array([[node["lon"], node["lat"]]], dtype=np.float64))[0]
-        points.append(ControlPoint(node_id=int(node.get("id", -1)), rules=rules, pos=pos, tags=tags))
-    return tuple(points)
+        raw.append((int(node.get("id", -1)), rules, pos, tags))
+    if not raw:
+        return ()
+    if centerline is None:
+        return tuple(ControlPoint(node_id=i, rules=r, pos=p, tags=t) for i, r, p, t in raw)
+
+    line = np.asarray(centerline, dtype=np.float64)
+    positions = np.stack([p for _, _, p, _ in raw])
+    nearest = np.empty(positions.shape[0], dtype=np.int64)
+    offsets = np.empty(positions.shape[0])
+    for lo in range(0, positions.shape[0], 512):
+        chunk = positions[lo : lo + 512]
+        dist = np.linalg.norm(chunk[:, None, :] - line[None, :, :], axis=-1)
+        nearest[lo : lo + 512] = dist.argmin(axis=1)
+        offsets[lo : lo + 512] = dist.min(axis=1)
+    n = line.shape[0]
+    return tuple(
+        ControlPoint(
+            node_id=node_id,
+            rules=rules,
+            pos=pos,
+            tags=tags,
+            progress=float(nearest[i]) / n,
+            offset_m=float(offsets[i]),
+        )
+        for i, (node_id, rules, pos, tags) in enumerate(raw)
+        if offsets[i] <= max_offset_m
+    )
 
 
 def highways_path(geojson: str | Path) -> Path:

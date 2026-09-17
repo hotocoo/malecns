@@ -655,7 +655,41 @@ class CarEnv:
         self.body_offsets = torch.cat(
             [torch.stack([along, torch.full_like(along, side * self.cfg.car_halfwidth)], dim=1) for side in (-1.0, 1.0)]
         )
+        # Set by `attach_sensor` when the car drives on a camera instead of
+        # rays. Until then the eye is the ray march below.
+        self.sensor = None
+        # Set by `attach_law` when the circuit has a road-law survey. Without
+        # one no legal charge is made: the driver cannot break a rule the
+        # survey does not record.
+        self.law = None
         self.reset()
+
+    def attach_law(self, law) -> None:
+        """Charge this population under the road law of the circuit.
+
+        `law` is a `lawreward.LawEnforcer` built from the survey beside the
+        track. Its charges are added to the step reward and appear in
+        `last_terms` under their own names, so the exploit monitor and the
+        telemetry can see what the driver is paying for.
+        """
+        self.law = law
+
+    def attach_sensor(self, sensor) -> None:
+        """Drive on a camera and a detector instead of the ray march.
+
+        With a sensor attached the observation is whatever the detector made of
+        the rendered frame; the track's geometry stops reaching the brain
+        entirely. The physics, the endings and the law are unchanged: only what
+        the driver can see is different.
+        """
+        self.sensor = sensor
+        if sensor is not None:
+            sensor.reset()
+
+    @property
+    def elapsed_s(self) -> torch.Tensor:
+        """Seconds of driving each body has done this episode."""
+        return self.step_count.to(torch.float32) * self.cfg.dt_s
 
     @property
     def start_fraction(self) -> torch.Tensor:
@@ -665,6 +699,8 @@ class CarEnv:
 
     @property
     def obs_dim(self) -> int:
+        if getattr(self, "sensor", None) is not None:
+            return self.sensor.width
         return self.cfg.n_rays + 1
 
     def _start_pose(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -756,6 +792,16 @@ class CarEnv:
         return self.track.clearance_at(self.body_points(pos, heading), bilinear=True).min(dim=1).values
 
     def observe(self) -> torch.Tensor:
+        sensor = getattr(self, "sensor", None)
+        if sensor is not None:
+            return sensor.observe(
+                self.pos,
+                self.heading,
+                self.speed,
+                self.last_progress,
+                float(self.step_count.max()) * self.cfg.dt_s,
+                self.cfg.max_speed,
+            )
         angles = self.heading.unsqueeze(1) + self.ray_angles.unsqueeze(0)
         direction = torch.stack([angles.cos(), angles.sin()], dim=-1)
         points = self.pos[:, None, None, :] + direction[:, :, None, :] * self.march[
@@ -916,6 +962,20 @@ class CarEnv:
         align_excess = torch.relu(align_err.abs() - cfg.align_free_rad)
         align_term = -cfg.align_penalty * (1.0 - align_excess.cos())
         reward = progress_term + bonus_term + wall_term + speed_term + stall_term + pace_term + align_term - cfg.time_tax
+        # The road law, charged from the survey's own numbers. A circuit with
+        # no survey attached contributes nothing here rather than a guess.
+        law_terms: dict[str, torch.Tensor] = {}
+        if self.law is not None:
+            law_terms = self.law.charge(
+                progress=progress,
+                # `last_progress` has already advanced to `progress` by here;
+                # the step's start is one clamped delta behind it.
+                prev_progress=torch.remainder(progress - delta, 1.0),
+                speed=self.speed,
+                pos=self.pos,
+                elapsed_s=self.step_count.to(reward.dtype) * cfg.dt_s,
+            )
+            reward = reward + law_terms["law_total"]
         # Keep the terminal event a fixed cost. Making the crash penalty depend
         # on impact speed adds a large, orthogonal gradient whose easiest local
         # solution is to slow down rather than learn the steering response.
@@ -984,6 +1044,12 @@ class CarEnv:
             "clearance": clearance,
             "alive": alive,
         }
+        # Charges are zeroed for a body that had already ended, the way every
+        # other term is. The two diagnostics (`law_limit_mps`, `law_offset_m`)
+        # are measurements rather than charges and are reported as they were.
+        for name, value in law_terms.items():
+            diagnostic = name in ("law_limit_mps", "law_offset_m")
+            self.last_terms[name] = value if diagnostic else torch.where(was_done, torch.zeros_like(value), value)
         return self.observe(), reward, ~alive
 
     def telemetry(self) -> dict[str, float]:
