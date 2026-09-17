@@ -20,27 +20,68 @@ import moderngl
 import numpy as np
 
 from scene import (
+    CLASS_BUS,
+    CLASS_CAR,
     CLASS_MOTORCYCLE,
     CLASS_PERSON,
     CLASS_STOP_SIGN,
     CLASS_TRAFFIC_LIGHT,
+    CLASS_TRUCK,
     Actor,
     RoadMesh,
     SceneConfig,
 )
+from assets import (
+    BUS_MODELS,
+    CAR_MODELS,
+    MOTORCYCLE_MODELS,
+    PERSON_MODELS,
+    STOP_SIGN_MODELS,
+    TRAFFIC_LIGHT_MODELS,
+    TRUCK_MODELS,
+    MissingAsset,
+    available,
+    load_mesh,
+    pick,
+    place,
+)
+
+# Which published models stand in for each class, and how long each is in the
+# world. The lengths are real vehicle dimensions; the models are scaled to them
+# so a car in frame is the size a car is.
+MODELS_FOR = {
+    CLASS_CAR: CAR_MODELS,
+    CLASS_TRUCK: TRUCK_MODELS,
+    CLASS_BUS: BUS_MODELS,
+    CLASS_MOTORCYCLE: MOTORCYCLE_MODELS,
+    CLASS_PERSON: PERSON_MODELS,
+    CLASS_TRAFFIC_LIGHT: TRAFFIC_LIGHT_MODELS,
+    CLASS_STOP_SIGN: STOP_SIGN_MODELS,
+}
+
+
+def assets_available() -> bool:
+    """True when the published models are installed and can be drawn."""
+    return any(available(m) for family in MODELS_FOR.values() for m in family)
 from lawreward import AMBER, GREEN, RED
 
 VERTEX_SHADER = """
 #version 330
 uniform mat4 mvp;
+uniform vec3 sun;
+uniform float ambient;
 in vec3 in_position;
 in vec3 in_colour;
+in vec3 in_normal;
 out vec3 v_colour;
 out float v_depth;
 void main() {
     vec4 clip = mvp * vec4(in_position, 1.0);
     gl_Position = clip;
-    v_colour = in_colour;
+    // Flat sun plus ambient. Without it every face of a car is one colour and
+    // the shape disappears; with it the roof, bonnet and flanks separate.
+    float lit = ambient + (1.0 - ambient) * max(dot(normalize(in_normal), sun), 0.0);
+    v_colour = in_colour * lit;
     v_depth = clip.w;
 }
 """
@@ -73,6 +114,10 @@ class CameraConfig:
     sky_colour: tuple[float, float, float] = (0.62, 0.71, 0.82)
     ground_colour: tuple[float, float, float] = (0.30, 0.33, 0.26)
     fog_start_m: float = 120.0
+    # A high sun a little behind the driver's left shoulder: near noon, which
+    # is what a tropical street looks like for most of the day.
+    sun_direction: tuple[float, float, float] = (-0.35, 0.25, 0.90)
+    ambient: float = 0.45
 
 
 SIGNAL_LENS = {
@@ -156,22 +201,50 @@ class DriverCamera:
         self.program["fog_colour"].value = self.cfg.sky_colour
         self.program["fog_start"].value = self.cfg.fog_start_m
         self.program["fog_end"].value = self.cfg.far_m
+        sun = np.array(self.cfg.sun_direction, dtype=np.float32)
+        self.program["sun"].value = tuple(sun / np.linalg.norm(sun))
+        self.program["ambient"].value = self.cfg.ambient
+        self._meshes_ready = assets_available()
 
     @property
     def renderer_name(self) -> str:
         return str(self.ctx.info["GL_RENDERER"])
 
-    def _vertex_array(self, vertices: np.ndarray, colours: np.ndarray) -> moderngl.VertexArray:
-        data = np.concatenate([vertices, colours], axis=1).astype("f4").tobytes()
+    def _vertex_array(
+        self, vertices: np.ndarray, colours: np.ndarray, normals: np.ndarray | None = None
+    ) -> moderngl.VertexArray:
+        if normals is None or normals.shape != vertices.shape:
+            normals = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (vertices.shape[0], 1))
+        data = np.concatenate([vertices, colours, normals], axis=1).astype("f4").tobytes()
         buffer = self.ctx.buffer(data)
-        return self.ctx.vertex_array(self.program, [(buffer, "3f 3f", "in_position", "in_colour")])
+        return self.ctx.vertex_array(
+            self.program, [(buffer, "3f 3f 3f", "in_position", "in_colour", "in_normal")]
+        )
 
-    def set_static(self, road: RoadMesh, ground_height_m: float = -0.05, extent_m: float = 4000.0) -> None:
-        """Upload the geometry that does not change: ground, road, markings."""
+    def set_static(
+        self,
+        road: RoadMesh,
+        ground_height_m: float = -0.05,
+        extent_m: float = 12_000.0,
+        network: RoadMesh | None = None,
+    ) -> None:
+        """Upload the geometry that does not change: ground, roads, markings.
+
+        `network` is every other surveyed road in the region. It is drawn under
+        the lap's own surface, so a junction the driver reaches has the streets
+        that really lead off it.
+        """
         ground = ground_plane(extent_m, ground_height_m)
         ground_colour = np.tile(np.array(self.cfg.ground_colour, dtype=np.float32), (ground.shape[0], 1))
-        vertices = np.concatenate([ground, road.surface, road.markings])
-        colours = np.concatenate([ground_colour, road.surface_colour, road.markings_colour])
+        parts = [ground]
+        tints = [ground_colour]
+        if network is not None and network.surface.shape[0]:
+            parts += [network.surface, network.markings]
+            tints += [network.surface_colour, network.markings_colour]
+        parts += [road.surface, road.markings]
+        tints += [road.surface_colour, road.markings_colour]
+        vertices = np.concatenate(parts)
+        colours = np.concatenate(tints)
         self._static = self._vertex_array(vertices, colours)
         self._static_count = vertices.shape[0]
 
@@ -201,8 +274,14 @@ class DriverCamera:
 
     def _actor_geometry(
         self, actors: list[Actor], with_spans: bool = False
-    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, list[int]]:
-        """Triangles and colours for `actors`, optionally with each actor's vertex count.
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, list[int]]:
+        """Triangles, colours and normals for `actors`, optionally with per-actor spans.
+
+        Each actor is drawn as its published model, scaled to the real size the
+        scene gave it and tinted by its own colour so a street is not eight
+        identical cars. Where a model is not installed the actor falls back to a
+        plain box, which keeps the simulator runnable before `fetch_assets.py`
+        has been run.
 
         The label pass needs to know which vertices belong to which actor, and
         rebuilding the geometry per actor to find out costs more than the draw
@@ -210,72 +289,123 @@ class DriverCamera:
         """
         chunks: list[np.ndarray] = []
         colours: list[np.ndarray] = []
+        normals: list[np.ndarray] = []
         spans: list[int] = []
+
+        def emit(vertices: np.ndarray, colour: np.ndarray, normal: np.ndarray | None = None) -> None:
+            chunks.append(vertices)
+            colours.append(colour if colour.ndim == 2 else np.tile(colour, (vertices.shape[0], 1)))
+            normals.append(
+                normal
+                if normal is not None
+                else np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (vertices.shape[0], 1))
+            )
+
         for actor in actors:
             before = sum(c.shape[0] for c in chunks)
-            if actor.kind == CLASS_TRAFFIC_LIGHT:
-                # Pole, housing, then the lit lens as a separate bright face so
-                # the phase is visible from the road rather than implied.
-                pole = box_triangles(
-                    np.array([actor.pos[0], actor.pos[1], 0.0]),
-                    actor.heading,
-                    np.array([0.12, 0.12, actor.pos[2]]),
-                )
-                chunks.append(pole)
-                colours.append(np.tile(np.array([0.35, 0.35, 0.35], dtype=np.float32), (pole.shape[0], 1)))
-                housing = box_triangles(actor.pos - np.array([0.0, 0.0, actor.size[2]]), actor.heading, actor.size)
-                chunks.append(housing)
-                colours.append(np.tile(actor.colour, (housing.shape[0], 1)))
-                lens_size = np.array([0.06, actor.size[1] * 0.7, actor.size[2] * 0.28])
-                lens_pos = actor.pos - np.array([0.0, 0.0, actor.size[2] * 0.45])
-                offset = np.array([np.cos(actor.heading), np.sin(actor.heading), 0.0]) * (actor.size[0] / 2.0)
-                lens = box_triangles(lens_pos + offset, actor.heading, lens_size)
-                chunks.append(lens)
-                colours.append(
-                    np.tile(np.array(SIGNAL_LENS.get(actor.state, SIGNAL_LENS[RED]), dtype=np.float32), (lens.shape[0], 1))
-                )
-                spans.append(sum(c.shape[0] for c in chunks) - before)
-                continue
-            if actor.kind == CLASS_STOP_SIGN:
-                pole = box_triangles(
-                    np.array([actor.pos[0], actor.pos[1], 0.0]),
-                    actor.heading,
-                    np.array([0.09, 0.09, actor.pos[2]]),
-                )
-                chunks.append(pole)
-                colours.append(np.tile(np.array([0.45, 0.45, 0.45], dtype=np.float32), (pole.shape[0], 1)))
-                plate = box_triangles(actor.pos - np.array([0.0, 0.0, actor.size[2] / 2.0]), actor.heading, actor.size)
-                chunks.append(plate)
-                colours.append(np.tile(actor.colour, (plate.shape[0], 1)))
-                spans.append(sum(c.shape[0] for c in chunks) - before)
-                continue
-
-            body = box_triangles(actor.pos, actor.heading, actor.size)
-            chunks.append(body)
-            colours.append(np.tile(actor.colour, (body.shape[0], 1)))
-            if actor.kind == CLASS_PERSON:
-                head = box_triangles(
-                    actor.pos + np.array([0.0, 0.0, actor.size[2]]),
-                    actor.heading,
-                    np.array([0.22, 0.22, 0.24]),
-                )
-                chunks.append(head)
-                colours.append(np.tile(np.array([0.72, 0.58, 0.48], dtype=np.float32), (head.shape[0], 1)))
-            elif actor.kind == CLASS_MOTORCYCLE:
-                rider = box_triangles(
-                    actor.pos + np.array([0.0, 0.0, actor.size[2]]),
-                    actor.heading,
-                    np.array([0.4, 0.45, 0.85]),
-                )
-                chunks.append(rider)
-                colours.append(np.tile(np.array([0.18, 0.18, 0.22], dtype=np.float32), (rider.shape[0], 1)))
+            drawn = False
+            if self._meshes_ready:
+                drawn = self._emit_model(actor, emit)
+            if not drawn:
+                self._emit_box(actor, emit)
             spans.append(sum(c.shape[0] for c in chunks) - before)
 
         if not chunks:
             empty = np.zeros((0, 3), dtype=np.float32)
-            return (empty, empty, spans) if with_spans else (empty, empty)
-        vertices, colours_out = np.concatenate(chunks), np.concatenate(colours)
-        return (vertices, colours_out, spans) if with_spans else (vertices, colours_out)
+            return (empty, empty, empty, spans) if with_spans else (empty, empty, empty)
+        vertices = np.concatenate(chunks)
+        colour_out = np.concatenate(colours)
+        normal_out = np.concatenate(normals)
+        return (vertices, colour_out, normal_out, spans) if with_spans else (vertices, colour_out, normal_out)
+
+    def _emit_model(self, actor: Actor, emit) -> bool:
+        """Draw `actor` as its published model. False when none is installed."""
+        family = MODELS_FOR.get(actor.kind)
+        if not family:
+            return False
+        try:
+            relative = pick(family, max(actor.node_id, 0) if actor.node_id >= 0 else self._variant(actor))
+            mesh = load_mesh(relative, fit=tuple(float(v) for v in actor.size))
+        except (MissingAsset, Exception):
+            return False
+
+        if actor.kind == CLASS_TRAFFIC_LIGHT:
+            # The model is a light head; it stands at the height the scene set,
+            # on a pole reaching the road.
+            base = np.array([actor.pos[0], actor.pos[1], 0.0])
+            pole = box_triangles(base, actor.heading, np.array([0.12, 0.12, max(actor.pos[2], 0.1)]))
+            emit(pole, np.array([0.33, 0.33, 0.35], dtype=np.float32))
+            head_pos = np.array([actor.pos[0], actor.pos[1], actor.pos[2] - mesh.height_m])
+            vertices, tint, normals = place(mesh, head_pos, actor.heading)
+            emit(vertices, tint, normals)
+            emit(*self._signal_lens(actor, mesh))
+            return True
+
+        if actor.kind == CLASS_STOP_SIGN:
+            base = np.array([actor.pos[0], actor.pos[1], 0.0])
+            pole = box_triangles(base, actor.heading, np.array([0.09, 0.09, max(actor.pos[2], 0.1)]))
+            emit(pole, np.array([0.45, 0.45, 0.47], dtype=np.float32))
+            plate = np.array([actor.pos[0], actor.pos[1], actor.pos[2] - mesh.height_m])
+            vertices, tint, normals = place(mesh, plate, actor.heading)
+            emit(vertices, tint, normals)
+            return True
+
+        tint = None if actor.kind == CLASS_PERSON else actor.colour * 1.3
+        vertices, colour, normals = place(mesh, actor.pos, actor.heading, tint)
+        emit(vertices, colour, normals)
+        return True
+
+    def _signal_lens(self, actor: Actor, mesh) -> tuple[np.ndarray, np.ndarray]:
+        """The lit lens, drawn proud of the head so the phase reads from the road."""
+        forward = np.array([np.cos(actor.heading), np.sin(actor.heading), 0.0])
+        centre = np.array([actor.pos[0], actor.pos[1], actor.pos[2] - mesh.height_m * 0.5]) + forward * (
+            mesh.length_m * 0.55
+        )
+        size = np.array([0.05, max(mesh.width_m * 0.55, 0.12), max(mesh.height_m * 0.22, 0.12)])
+        lens = box_triangles(centre - np.array([0.0, 0.0, size[2] / 2.0]), actor.heading, size)
+        colour = np.array(SIGNAL_LENS.get(actor.state, SIGNAL_LENS[RED]), dtype=np.float32)
+        return lens, colour
+
+    def _variant(self, actor: Actor) -> int:
+        """A stable model choice for an actor with no surveyed identity."""
+        return int(abs(actor.pos[0]) * 7.0 + abs(actor.pos[1]) * 13.0) % 97
+
+    def _emit_box(self, actor: Actor, emit) -> None:
+        """The fallback shape, used only where a published model is missing."""
+        if actor.kind == CLASS_TRAFFIC_LIGHT:
+            pole = box_triangles(
+                np.array([actor.pos[0], actor.pos[1], 0.0]), actor.heading, np.array([0.12, 0.12, actor.pos[2]])
+            )
+            emit(pole, np.array([0.35, 0.35, 0.35], dtype=np.float32))
+            housing = box_triangles(actor.pos - np.array([0.0, 0.0, actor.size[2]]), actor.heading, actor.size)
+            emit(housing, actor.colour)
+            lens_size = np.array([0.06, actor.size[1] * 0.7, actor.size[2] * 0.28])
+            offset = np.array([np.cos(actor.heading), np.sin(actor.heading), 0.0]) * (actor.size[0] / 2.0)
+            lens = box_triangles(
+                actor.pos - np.array([0.0, 0.0, actor.size[2] * 0.45]) + offset, actor.heading, lens_size
+            )
+            emit(lens, np.array(SIGNAL_LENS.get(actor.state, SIGNAL_LENS[RED]), dtype=np.float32))
+            return
+        if actor.kind == CLASS_STOP_SIGN:
+            pole = box_triangles(
+                np.array([actor.pos[0], actor.pos[1], 0.0]), actor.heading, np.array([0.09, 0.09, actor.pos[2]])
+            )
+            emit(pole, np.array([0.45, 0.45, 0.45], dtype=np.float32))
+            plate = box_triangles(actor.pos - np.array([0.0, 0.0, actor.size[2] / 2.0]), actor.heading, actor.size)
+            emit(plate, actor.colour)
+            return
+
+        emit(box_triangles(actor.pos, actor.heading, actor.size), actor.colour)
+        if actor.kind == CLASS_PERSON:
+            head = box_triangles(
+                actor.pos + np.array([0.0, 0.0, actor.size[2]]), actor.heading, np.array([0.22, 0.22, 0.24])
+            )
+            emit(head, np.array([0.72, 0.58, 0.48], dtype=np.float32))
+        elif actor.kind == CLASS_MOTORCYCLE:
+            rider = box_triangles(
+                actor.pos + np.array([0.0, 0.0, actor.size[2]]), actor.heading, np.array([0.4, 0.45, 0.85])
+            )
+            emit(rider, np.array([0.18, 0.18, 0.22], dtype=np.float32))
 
     def render(self, pos_xy: np.ndarray, heading: float, road_z: float, actors: list[Actor]) -> np.ndarray:
         """One frame from the car's eye point, as (height, width, 3) uint8 RGB."""
@@ -291,11 +421,11 @@ class DriverCamera:
         if self._static is not None:
             self._static.render(moderngl.TRIANGLES, vertices=self._static_count)
 
-        vertices, colours = self._actor_geometry(self.visible(pos_xy, heading, actors))
+        vertices, colours, normals = self._actor_geometry(self.visible(pos_xy, heading, actors))
         if vertices.shape[0]:
             if self._dynamic is not None:
                 self._dynamic.release()
-            self._dynamic = self._vertex_array(vertices, colours)
+            self._dynamic = self._vertex_array(vertices, colours, normals)
             self._dynamic.render(moderngl.TRIANGLES, vertices=vertices.shape[0])
 
         raw = self.fbo.read(components=3, dtype="f1")
@@ -334,7 +464,7 @@ class DriverCamera:
 
         self.fbo.use()
         self.ctx.clear(0.0, 0.0, 0.0, depth=1.0)
-        vertices, _, spans = self._actor_geometry(actors, with_spans=True)
+        vertices, _, _, spans = self._actor_geometry(actors, with_spans=True)
         colours = np.zeros_like(vertices)
         offset = 0
         for index, span in enumerate(spans, start=1):

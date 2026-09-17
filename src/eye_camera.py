@@ -58,7 +58,7 @@ class CameraSensor:
         self.traffic = traffic
         self.cfg = sensor_cfg or SensorConfig()
         self.camera = DriverCamera(camera_cfg or CameraConfig(), scene_cfg or SceneConfig())
-        self.camera.set_static(scene.road)
+        self.camera.set_static(scene.road, network=getattr(scene, "network", None))
         self.eye = DetectionEye(eye_cfg or EyeConfig())
         # A caller may pass its own detector, which is how the tests run the
         # whole chain without loading weights.

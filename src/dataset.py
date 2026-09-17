@@ -29,11 +29,12 @@ import numpy as np
 from camera import CameraConfig, DriverCamera
 from law import load_law
 from lawreward import SignalTiming
-from roadlaw import control_points_for_circuit, legal_profile_for_circuit
+from roadlaw import control_points_for_circuit, highways_path, legal_profile_for_circuit
 from scene import (
     SCENE_CLASSES,
     SceneConfig,
     Traffic,
+    build_network,
     build_road,
     frame_at,
     lane_halfwidth,
@@ -81,6 +82,7 @@ class SceneBundle:
     profile: object
     control_points: tuple
     road: object
+    network: object  # every other surveyed road in the region
     fixtures: list
     halfwidth: np.ndarray
 
@@ -98,6 +100,10 @@ def load_scene(track: Path, scene_cfg: SceneConfig | None = None) -> SceneBundle
     control_points = control_points_for_circuit(track, proj, load_law(), centerline=centerline)
     heights = surveyed_heights_or_flat(track, centerline)
     road = build_road(centerline, heights, profile, scene_cfg)
+    # Every other road in the survey, so a junction has streets leading off it
+    # instead of ending in grass.
+    survey = highways_path(track)
+    network = build_network(survey, proj, scene_cfg) if survey.exists() else None
     fixtures = place_signals(control_points, centerline, heights, profile, profile.driving_side, scene_cfg)
     fixtures += place_signs(control_points, centerline, heights, profile, profile.driving_side, scene_cfg)
     return SceneBundle(
@@ -106,6 +112,7 @@ def load_scene(track: Path, scene_cfg: SceneConfig | None = None) -> SceneBundle
         profile=profile,
         control_points=control_points,
         road=road,
+        network=network,
         fixtures=fixtures,
         halfwidth=lane_halfwidth(profile, scene_cfg),
     )
@@ -169,9 +176,18 @@ def capture(
     )
 
     camera = DriverCamera(camera_cfg, scene_cfg)
-    camera.set_static(bundle.road)
+    camera.set_static(bundle.road, network=bundle.network)
     tangent, normal = frame_at(bundle.centerline)
     n = bundle.centerline.shape[0]
+
+    # The detector should meet the same street the driver will: people stepping
+    # off kerbs, bikes filtering, a lorry stopped in lane. Events are staged
+    # around a camera walking the lap, so they appear in the training frames.
+    from events import Director
+
+    director = Director(
+        bundle.centerline, bundle.heights, bundle.profile, traffic, seed=seed, cfg=scene_cfg
+    )
 
     for split in ("train", "val"):
         (out / "images" / split).mkdir(parents=True, exist_ok=True)
@@ -184,10 +200,16 @@ def capture(
     empty = 0
     for index in range(frames):
         elapsed = index * capture_cfg.traffic_step_s
-        traffic.step(capture_cfg.traffic_step_s, bundle.centerline, bundle.heights, bundle.profile)
         update_signals(bundle.fixtures, elapsed, SignalTiming())
 
         i = _camera_sample(rng, bundle, traffic, capture_cfg, n)
+        walking = i / n
+        director.step(
+            capture_cfg.traffic_step_s,
+            walking,
+            bundle.centerline[i],
+            float(rng.uniform(8.0, 18.0)),
+        )
         lateral = float(rng.uniform(-1.0, 1.0)) * bundle.halfwidth[i] * capture_cfg.lateral_fraction
         pos = bundle.centerline[i] + normal[i] * lateral
         heading = float(np.arctan2(tangent[i, 1], tangent[i, 0]))
@@ -239,6 +261,7 @@ def capture(
         "frames_written": written,
         "frames_requested": frames,
         "boxes": counts,
+        "events": director.summary(),
         "camera": {"width": camera_cfg.width, "height": camera_cfg.height, "fov_deg": camera_cfg.fov_deg},
         "classes": list(SCENE_CLASSES),
     }

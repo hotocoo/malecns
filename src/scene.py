@@ -18,12 +18,37 @@ rather than buried in the geometry.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
 from lawreward import GREEN, RED, SignalTiming, signal_phase_numpy
-from roadlaw import UNKNOWN_LANES, ControlPoint, LegalProfile
+from roadlaw import UNKNOWN_LANES, ControlPoint, LegalProfile, parse_lanes
+
+# Classes a camera should see as road. Wider than the set a route is built on:
+# a service road beside the lap is still asphalt the driver looks at.
+DRIVABLE_CLASSES = frozenset(
+    {
+        "motorway", "motorway_link", "trunk", "trunk_link",
+        "primary", "primary_link", "secondary", "secondary_link",
+        "tertiary", "tertiary_link", "unclassified", "residential",
+        "living_street", "service", "road", "busway",
+    }
+)
+
+# Lanes to assume for a class the survey did not tag. Malaysian federal and
+# state roads are dual-lane as a rule, a residential street single.
+LANES_BY_CLASS = {
+    "motorway": 4, "motorway_link": 2,
+    "trunk": 4, "trunk_link": 2,
+    "primary": 4, "primary_link": 2,
+    "secondary": 2, "secondary_link": 2,
+    "tertiary": 2, "tertiary_link": 2,
+    "unclassified": 2, "residential": 2, "living_street": 1,
+    "service": 1, "road": 2, "busway": 2,
+}
 
 # Object classes the detector is asked to find. These are COCO class names,
 # because the detector is a COCO model; the scene builds objects that really
@@ -98,6 +123,14 @@ class Actor:
     speed_mps: float = 0.0
     node_id: int = -1  # the surveyed node it belongs to, when it has one
     state: int = -1  # signal phase, for a traffic light
+    # Free motion in world metres per second, used by actors that leave the
+    # lane: someone stepping off a kerb, a ball rolling, a car turning across.
+    velocity: np.ndarray | None = None
+    behaviour: str = "lane"  # "lane" follows the lap, "free" integrates velocity
+    hazard: str = ""  # the event that owns this actor, for telemetry
+    lane_offset_m: float = 0.0
+    target_speed_mps: float = 0.0
+    ttl_s: float = -1.0  # seconds left before the actor is removed; -1 never
 
 
 def lane_halfwidth(profile: LegalProfile, cfg: SceneConfig) -> np.ndarray:
@@ -196,6 +229,88 @@ def build_road(
         markings_colour=np.concatenate(colours).astype(np.float32),
         halfwidth_m=half,
     )
+
+
+def build_network(
+    survey_path,
+    proj,
+    cfg: SceneConfig | None = None,
+    ground_z: float = 0.0,
+    classes: frozenset[str] | None = None,
+) -> RoadMesh:
+    """Every surveyed road in the region, not only the lap the car drives.
+
+    A single ribbon looks nothing like a city: the junctions the driver meets
+    have roads leading off them, and a camera sees those. This meshes every way
+    in the survey at the width its own lane count implies, which is what turns
+    the view from a track into a street.
+
+    Ways are drawn flat at `ground_z`; the lap's own surface is drawn over them
+    by `build_road`, so the road under the car keeps its surveyed height.
+    """
+    cfg = cfg or SceneConfig()
+    classes = classes or DRIVABLE_CLASSES
+    data = json.loads(Path(survey_path).read_text())
+
+    surfaces: list[np.ndarray] = []
+    marks: list[np.ndarray] = []
+    for way in data.get("elements", []):
+        tags = way.get("tags") or {}
+        if tags.get("highway") not in classes:
+            continue
+        geometry = way.get("geometry") or []
+        if len(geometry) < 2:
+            continue
+        lonlat = np.array([[p["lon"], p["lat"]] for p in geometry], dtype=np.float64)
+        points = proj.project(lonlat)
+        if points.shape[0] < 2:
+            continue
+        lanes = parse_lanes(tags.get("lanes"))
+        if lanes is None:
+            lanes = LANES_BY_CLASS.get(str(tags.get("highway")), cfg.default_lanes)
+        half = np.full(points.shape[0], lanes * cfg.lane_width_m / 2.0 + cfg.shoulder_m)
+        heights = np.full(points.shape[0], ground_z)
+        surfaces.append(_open_ribbon(points, heights, -half, half, 0.0))
+        edge = half - cfg.shoulder_m
+        marks.append(_open_ribbon(points, heights, edge - cfg.marking_width_m, edge, 0.01))
+        marks.append(_open_ribbon(points, heights, -edge, -edge + cfg.marking_width_m, 0.01))
+
+    if not surfaces:
+        empty = np.zeros((0, 3), dtype=np.float32)
+        return RoadMesh(empty, empty, empty, empty, np.zeros(0))
+
+    surface = np.concatenate(surfaces)
+    markings = np.concatenate(marks) if marks else np.zeros((0, 3), dtype=np.float32)
+    return RoadMesh(
+        surface=surface,
+        surface_colour=np.tile(np.array([0.22, 0.22, 0.23], dtype=np.float32), (surface.shape[0], 1)),
+        markings=markings,
+        markings_colour=np.tile(np.array([0.88, 0.88, 0.84], dtype=np.float32), (markings.shape[0], 1)),
+        halfwidth_m=np.zeros(0),
+    )
+
+
+def _open_ribbon(
+    points: np.ndarray, heights: np.ndarray, inner: np.ndarray, outer: np.ndarray, lift: float
+) -> np.ndarray:
+    """`_ribbon` for a way that does not close on itself.
+
+    The lap wraps, so its last sample joins its first; an ordinary street ends,
+    and joining its ends would draw a road across the city.
+    """
+    ahead = np.diff(points, axis=0, append=points[-1:])
+    ahead[-1] = points[-1] - points[-2]
+    norm = np.linalg.norm(ahead, axis=1, keepdims=True).clip(min=1e-6)
+    tangent = ahead / norm
+    normal = np.stack([-tangent[:, 1], tangent[:, 0]], axis=1)
+
+    left = points + normal * outer[:, None]
+    right = points + normal * inner[:, None]
+    z = heights + lift
+    a = np.concatenate([left, z[:, None]], axis=1)
+    b = np.concatenate([right, z[:, None]], axis=1)
+    tris = np.stack([a[:-1], b[:-1], b[1:], a[:-1], b[1:], a[1:]], axis=1)
+    return tris.reshape(-1, 3).astype(np.float32)
 
 
 def place_signals(

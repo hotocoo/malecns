@@ -33,8 +33,15 @@ import torch
 EARTH_RADIUS_M = 6_371_000.0
 G = 9.81
 
-DONE_ALIVE, DONE_CRASH, DONE_REVERSE, DONE_STUCK, DONE_FINISH = 0, 1, 2, 3, 4
-DONE_NAMES = {DONE_ALIVE: "alive", DONE_CRASH: "crash", DONE_REVERSE: "reverse", DONE_STUCK: "stuck", DONE_FINISH: "finished"}
+DONE_ALIVE, DONE_CRASH, DONE_REVERSE, DONE_STUCK, DONE_FINISH, DONE_COLLIDE = 0, 1, 2, 3, 4, 5
+DONE_NAMES = {
+    DONE_ALIVE: "alive",
+    DONE_CRASH: "crash",
+    DONE_REVERSE: "reverse",
+    DONE_STUCK: "stuck",
+    DONE_FINISH: "finished",
+    DONE_COLLIDE: "collision",
+}
 
 
 @dataclass(frozen=True)
@@ -662,7 +669,20 @@ class CarEnv:
         # one no legal charge is made: the driver cannot break a rule the
         # survey does not record.
         self.law = None
+        # Set by `attach_traffic` when there are other road users to hit. Until
+        # then the only way to end badly is to leave the road.
+        self.traffic_obstacles = None
         self.reset()
+
+    def attach_traffic(self, provider) -> None:
+        """Let other road users end an episode by being driven into.
+
+        `provider` is called each step and returns (positions, radii) for
+        everything solid on the road: an (m, 2) array of world metres and an
+        (m,) array of how wide each is. Hitting one ends the episode as
+        `DONE_COLLIDE`, which is what the reward then charges for.
+        """
+        self.traffic_obstacles = provider
 
     def attach_law(self, law) -> None:
         """Charge this population under the road law of the circuit.
@@ -778,6 +798,21 @@ class CarEnv:
             for k, v in self.last_terms.items()
         }
         self.batch = int(idx.numel())
+
+    def _hit_traffic(self) -> torch.Tensor:
+        """Which bodies are touching another road user this step."""
+        if self.traffic_obstacles is None:
+            return torch.zeros(self.batch, dtype=torch.bool, device=self.device)
+        positions, radii = self.traffic_obstacles()
+        if positions is None or len(positions) == 0:
+            return torch.zeros(self.batch, dtype=torch.bool, device=self.device)
+        other = torch.as_tensor(positions, dtype=self.pos.dtype, device=self.device)
+        reach = torch.as_tensor(radii, dtype=self.pos.dtype, device=self.device)
+        # The car is a rectangle; its outline samples already exist for the
+        # road-edge test, so the same points serve here.
+        points = self.body_points(self.pos, self.heading)
+        gap = torch.cdist(points, other.unsqueeze(0).expand(self.batch, -1, -1))
+        return (gap < reach.view(1, 1, -1)).any(dim=2).any(dim=1)
 
     def body_points(self, pos: torch.Tensor, heading: torch.Tensor) -> torch.Tensor:
         """World coordinates of the body outline samples, (batch, points, 2)."""
@@ -919,6 +954,7 @@ class CarEnv:
 
         clearance = self.body_clearance(self.pos, self.heading)
         crashed = clearance <= 0.0
+        collided = self._hit_traffic()
         reversed_ = self.laps <= cfg.reverse_limit_laps
         window_over = (self.step_count - self.anchor_step) >= self.stuck_steps
         moved_m = (self.laps - self.anchor_laps) * self.track.length_m
@@ -930,6 +966,7 @@ class CarEnv:
 
         reason = torch.zeros_like(self.done_reason)
         reason = torch.where(finished, torch.full_like(reason, DONE_FINISH), reason)
+        reason = torch.where(collided, torch.full_like(reason, DONE_COLLIDE), reason)
         reason = torch.where(stuck, torch.full_like(reason, DONE_STUCK), reason)
         reason = torch.where(reversed_, torch.full_like(reason, DONE_REVERSE), reason)
         reason = torch.where(crashed, torch.full_like(reason, DONE_CRASH), reason)
