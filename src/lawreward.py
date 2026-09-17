@@ -51,14 +51,21 @@ class SignalTiming:
 
 @dataclass(frozen=True)
 class LawWeights:
-    """How hard each breach is charged. Reward tuning, not law."""
+    """How hard each breach is charged. Reward tuning, not law.
 
-    speeding: float = 0.6  # per (fraction over the posted limit) squared
+    The continuing offences are charged *per second*, not per step: at a 16 ms
+    control period a per-step charge is paid 62.5 times a second, which made a
+    metre on the wrong side cost fifty points a second while driving well paid
+    one. The one-off offences - running a red, crossing a stop line - are
+    charged once, when they happen.
+    """
+
+    speeding: float = 4.0  # per second, per (fraction over the posted limit) squared
     speeding_free: float = 0.0  # fraction of the limit tolerated before charging
-    wrong_side: float = 0.8  # per metre on the wrong half of a two-way road
-    red_signal: float = 12.0  # for entering the junction against a red
-    stop_line: float = 8.0  # for crossing a stop line without stopping
-    crossing_speed: float = 0.4  # for carrying speed across a pedestrian crossing
+    wrong_side: float = 1.5  # per second, per metre onto the wrong half
+    red_signal: float = 12.0  # once, for entering the junction against a red
+    stop_line: float = 8.0  # once, for crossing a stop line without stopping
+    crossing_speed: float = 3.0  # per second of speed carried over a crossing
 
     # How close counts as "at" a control point, and how slow counts as stopped.
     control_reach_m: float = 8.0
@@ -129,8 +136,10 @@ class LawEnforcer:
         device: torch.device,
         weights: LawWeights | None = None,
         timing: SignalTiming | None = None,
+        dt_s: float = 0.016,
     ) -> None:
         self.weights = weights or LawWeights()
+        self.dt_s = dt_s
         self.timing = timing or SignalTiming()
         self.device = device
         self.centerline = centerline.to(device)
@@ -213,7 +222,7 @@ class LawEnforcer:
         limit = self.limit_mps[index]
         allowed = limit * (1.0 + weights.speeding_free)
         over = torch.where(torch.isfinite(allowed), torch.relu(speed - allowed) / allowed.clamp(min=1e-6), zero)
-        speeding = -weights.speeding * over * over
+        speeding = -weights.speeding * over * over * self.dt_s
 
         # Rule 3, Road Traffic Rules 1959: keep to the surveyed side. Only on a
         # two-way road, and only where the survey states a side.
@@ -226,7 +235,7 @@ class LawEnforcer:
             # product is positive exactly when the car is where it should not
             # be; where traffic keeps right (+1) the same expression flips.
             wrong = torch.relu(offset * self.side_sign)
-            wrong_side = -weights.wrong_side * wrong * self.two_way[index].to(speed.dtype)
+            wrong_side = -weights.wrong_side * wrong * self.two_way[index].to(speed.dtype) * self.dt_s
 
         # Second Schedule item (iii): entering against a red. Charged on the
         # step the car passes the junction, not while it waits at it.
@@ -257,7 +266,13 @@ class LawEnforcer:
             crossing = zero
         else:
             carried = (speed / weights.crossing_speed_ref_mps).clamp(min=0.0)
-            crossing = -weights.crossing_speed * crossed_crossing.any(dim=1).to(speed.dtype) * carried * carried
+            crossing = (
+                -weights.crossing_speed
+                * crossed_crossing.any(dim=1).to(speed.dtype)
+                * carried
+                * carried
+                * self.dt_s
+            )
 
         total = speeding + wrong_side + red_signal + stop_line + crossing
         return {

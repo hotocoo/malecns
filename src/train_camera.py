@@ -98,9 +98,42 @@ def build_env(args, scene, device: torch.device, batch: int) -> tuple[CarEnv, La
     centerline = points.numpy()
     profile = legal_profile_for_circuit(args.track, centerline, proj)
     control_points = control_points_for_circuit(args.track, proj, load_law(), centerline=centerline)
-    law = LawEnforcer(profile, control_points, env.track.centerline.cpu().to(device), device)
+    law = LawEnforcer(
+        profile, control_points, env.track.centerline.cpu().to(device), device, dt_s=cfg.dt_s
+    )
     env.attach_law(law)
+
+    # The pace term references a quasi-steady racing speed, which on a city
+    # street is 119 km/h. Asking for that while the law charges for exceeding
+    # 35 km/h leaves no speed that scores well, and the population sits at a
+    # constant penalty whatever it does. On a street the reference is the
+    # posted limit, a little under it so obeying the law is what pays best.
+    reference = law.limit_mps.clone()
+    posted = torch.isfinite(reference)
+    if posted.any():
+        street = torch.where(posted, reference * args.pace_fraction, env.track.speed_ref)
+        env.track.speed_ref = torch.minimum(env.track.speed_ref, street)
     return env, law
+
+
+def clear_starts(traffic, env, radius_m: float = 14.0) -> int:
+    """Take traffic off the start line.
+
+    Bodies are placed around the lap; a vehicle already standing there means a
+    collision on the first step, which teaches nothing about driving. Actors
+    within `radius_m` of any start are removed before the episode begins.
+    """
+    if not traffic.actors:
+        return 0
+    starts = env.track.centerline[env.start_index].detach().cpu().numpy()
+    keep = []
+    for actor in traffic.actors:
+        gap = float(np.linalg.norm(starts - actor.pos[:2], axis=1).min())
+        if gap > radius_m:
+            keep.append(actor)
+    removed = len(traffic.actors) - len(keep)
+    traffic.actors = keep
+    return removed
 
 
 def obstacle_provider(traffic, fixtures):
@@ -192,6 +225,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--columns", type=int, default=12)
     parser.add_argument("--perception-stride", type=int, default=3)
     parser.add_argument("--max-speed", type=float, default=33.0, help="m/s; a street car, not an F1 car")
+    parser.add_argument(
+        "--pace-fraction",
+        type=float,
+        default=0.92,
+        help="the share of the posted limit the pace term asks for",
+    )
     parser.add_argument("--vehicles", type=int, default=120)
     parser.add_argument("--motorcycles", type=int, default=100)
     parser.add_argument("--pedestrians", type=int, default=40)
@@ -219,7 +258,9 @@ def main(argv: list[str] | None = None) -> int:
     agent = ConnectomeAgent(brain, neurons, agent_cfg)
 
     env, law = build_env(args, scene, device, args.popsize)
+    removed = clear_starts(traffic, env)
     env.attach_traffic(obstacle_provider(traffic, scene.fixtures))
+    print(f"[world] {removed} actors moved off the start line")
     print(f"[world] {law.summary()}")
 
     mu = agent.initial_params().to(device)
