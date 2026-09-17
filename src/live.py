@@ -57,6 +57,8 @@ class Shared:
     lock: threading.Lock = field(default_factory=threading.Lock)
     jpeg: bytes | None = None
     telemetry: dict = field(default_factory=dict)
+    world: dict | None = None
+    moving: dict | None = None
     frame_index: int = 0
     running: bool = True
 
@@ -120,6 +122,7 @@ class Simulation:
         seed: int,
         device: str | None,
         checkpoint: Path | None = None,
+        detect_every: int = 4,
     ) -> None:
         from car_env import CarConfig, CarEnv, load_geojson_centerline
         from dataset import load_scene
@@ -145,7 +148,7 @@ class Simulation:
             self.traffic,
             camera_cfg,
             eye_cfg,
-            SensorConfig(stride=1, weights=weights, device=device),
+            SensorConfig(stride=detect_every, weights=weights, device=device),
             scene_cfg,
         )
         self.detector: Detector = self.sensor.detector
@@ -170,6 +173,7 @@ class Simulation:
             track, cfg.track_scale, cfg.n_points, cfg.smooth_m, cfg.mirror, return_projection=True
         )
         centerline = points.numpy()
+        self.projection = proj
         profile = legal_profile_for_circuit(track, centerline, proj)
         control_points = control_points_for_circuit(track, proj, load_law(), centerline=centerline)
         self.law = LawEnforcer(profile, control_points, self.env.track.centerline.cpu(), self.device)
@@ -181,6 +185,9 @@ class Simulation:
         self.timing = SignalTiming()
         self.agent = None
         self.brain = None
+        self.frame_index = 0
+        self.last_detections = None
+        self.detect_every = detect_every
         self.last_observation = None
         self.last_action = None
         self.driver_note = ""
@@ -216,7 +223,10 @@ class Simulation:
         from brain import Brain, LIFConfig, load_connectome, pick_device
 
         connectome = load_connectome(Path("data/graph"))
-        device = pick_device("cpu")
+        # The brain is the slow link in this loop: on CPU one control step of
+        # the full connectome costs hundreds of milliseconds and pins the page
+        # at a couple of frames a second.
+        device = pick_device("auto")
         brain = Brain(connectome, batch=1, config=LIFConfig(), device=device, weight_scale=defaults.WEIGHT_SCALE)
         saved_cfg = saved.get("agent_cfg") or {}
         cfg = AgentConfig(
@@ -232,7 +242,8 @@ class Simulation:
         self.driver_note = f"connectome, generation {saved.get('generation', 0)}"
 
         def drive(observation: torch.Tensor) -> torch.Tensor:
-            return agent.act(observation.to(device), theta)
+            # The environment lives on the CPU; the brain may not.
+            return agent.act(observation.to(device), theta).to(observation.device)
 
         return drive
 
@@ -288,6 +299,102 @@ class Simulation:
                 "steer": float(self.last_action[0]) if self.last_action is not None else 0.0,
                 "pedal": float(self.last_action[1]) if self.last_action is not None else 0.0,
             },
+        }
+
+    def world(self) -> dict:
+        """The static city, in track metres, for a browser to build once.
+
+        The same surveyed geometry the camera renders: the lap, every other
+        street in the region with its width, and the building footprints with
+        their heights. Sent once; only the moving things are polled after that.
+        """
+        scene = self.scene
+        roads = []
+        import json as _json
+
+        from roadlaw import highways_path
+        from scene import LANES_BY_CLASS, SceneConfig, lane_halfwidth
+        from roadlaw import parse_lanes
+
+        cfg = SceneConfig()
+        survey = highways_path(self.track)
+        if survey.exists():
+            data = _json.loads(survey.read_text())
+            for way in data.get("elements", []):
+                tags = way.get("tags") or {}
+                geometry = way.get("geometry") or []
+                if len(geometry) < 2 or "highway" not in tags:
+                    continue
+                lonlat = np.array([[p["lon"], p["lat"]] for p in geometry], dtype=np.float64)
+                points = self.projection.project(lonlat)
+                if float(np.abs(points).max()) > 3000.0:
+                    continue  # far outside the lap; the view never reaches it
+                lanes = parse_lanes(tags.get("lanes")) or LANES_BY_CLASS.get(str(tags.get("highway")), 2)
+                roads.append(
+                    {
+                        "points": [[round(float(x), 2), round(float(y), 2)] for x, y in points],
+                        "width": round(lanes * cfg.lane_width_m + 2 * cfg.shoulder_m, 2),
+                        "oneway": bool(tags.get("oneway") in ("yes", "1", "true")),
+                        "name": tags.get("name"),
+                    }
+                )
+
+        buildings = []
+        footprints = self.track.with_name(self.track.stem + "_buildings.geojson")
+        if footprints.exists():
+            data = _json.loads(footprints.read_text())
+            lap = scene.centerline
+            for feature in data.get("features", []):
+                ring = (feature.get("geometry") or {}).get("coordinates", [[]])[0]
+                if len(ring) < 4:
+                    continue
+                outline = self.projection.project(np.array(ring[:-1], dtype=np.float64))
+                near = np.linalg.norm(outline[:, None, :] - lap[None, :, :], axis=2).min()
+                if near > 700.0:
+                    continue
+                height = float((feature.get("properties") or {}).get("height") or 0.0)
+                buildings.append(
+                    {
+                        "outline": [[round(float(x), 2), round(float(y), 2)] for x, y in outline],
+                        "height": round(height if height > 0 else cfg.unknown_storeys * cfg.storey_m, 1),
+                    }
+                )
+
+        return {
+            "lap": [[round(float(x), 2), round(float(y), 2)] for x, y in scene.centerline],
+            "lap_width": round(float(scene.halfwidth.mean() * 2.0), 2),
+            "roads": roads,
+            "buildings": buildings,
+            "driving_side": self.law.driving_side or "left",
+            "attribution": "(c) OpenStreetMap contributors, ODbL 1.0",
+        }
+
+    def moving(self) -> dict:
+        """Where everything is right now, for the 3D view to move its objects."""
+        env = self.env
+        actors = []
+        for actor in self.scene.fixtures + self.traffic.actors:
+            actors.append(
+                {
+                    "kind": actor.kind,
+                    "x": round(float(actor.pos[0]), 2),
+                    "y": round(float(actor.pos[1]), 2),
+                    "z": round(float(actor.pos[2]), 2),
+                    "heading": round(float(actor.heading), 3),
+                    "size": [round(float(v), 2) for v in actor.size],
+                    "state": int(actor.state),
+                    "hazard": actor.hazard,
+                }
+            )
+        return {
+            "car": {
+                "x": round(float(env.pos[0][0]), 2),
+                "y": round(float(env.pos[0][1]), 2),
+                "heading": round(float(env.heading[0]), 3),
+                "speed_kmh": round(float(env.speed[0]) * 3.6, 1),
+            },
+            "actors": actors,
+            "frame": self.frame_index,
         }
 
     def senses(self) -> dict:
@@ -363,13 +470,22 @@ class Simulation:
             )
             update_signals(self.scene.fixtures, elapsed, self.timing)
             actors = self.scene.fixtures + self.traffic.actors
-            road_z = float(self.sensor.road_height_at(self.env.last_progress.numpy())[0])
-            frame = self.sensor.camera.render(
-                self.env.pos[0].numpy(), float(self.env.heading[0]), road_z, actors
-            )
-            detections = self.detector.detect([frame], self.sensor.cfg.detector_confidence)[0]
+            # The driver already rendered its view and ran the detector over it
+            # inside `env.step`. Doing either again here would double the cost
+            # of the loop for the same picture, so the page shows exactly what
+            # the driver saw.
+            self.frame_index += 1
+            frame = self.sensor.last_frames[0] if self.sensor.last_frames else None
+            if frame is None:
+                road_z = float(self.sensor.road_height_at(self.env.last_progress.numpy())[0])
+                frame = self.sensor.camera.render(
+                    self.env.pos[0].numpy(), float(self.env.heading[0]), road_z, actors
+                )
+            detections = self.sensor.last_detections[0] if self.sensor.last_detections else []
             telemetry = self.telemetry(detections)
             shared.publish(encode_jpeg(draw_overlay(frame, detections, telemetry)), telemetry)
+            with shared.lock:
+                shared.moving = self.moving()
 
             rest = period - (time.time() - started)
             if rest > 0:
@@ -392,7 +508,7 @@ PAGE = """<!doctype html>
  .warn{color:#ff8a7a}
 </style></head>
 <body>
-<header>driver camera &mdash; real frames, real detector, real charges</header>
+<header>driver camera &mdash; real frames, real detector, real charges &nbsp;|&nbsp; <a href="/3d" style="color:#7fc6ff">3D world view</a></header>
 <main>
   <div>
     <img id="feed" src="/stream.mjpg" alt="driver camera">
@@ -474,6 +590,195 @@ poll();
 """
 
 
+WORLD_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>malecns - 3D world</title>
+<style>
+ body{margin:0;background:#0b0c0f;color:#e8e8ea;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden}
+ #hud{position:fixed;top:0;left:0;padding:10px 14px;z-index:5;text-shadow:0 1px 3px #000}
+ #hud a{color:#7fc6ff}
+ #keys{position:fixed;bottom:0;left:0;padding:10px 14px;color:#8b8d96;z-index:5}
+ canvas{display:block}
+</style></head>
+<body>
+<div id="hud">loading the city&hellip; &nbsp;<a href="/">camera view</a></div>
+<div id="keys">1 chase &middot; 2 overhead &middot; 3 driver &middot; drag to orbit, wheel to zoom</div>
+<script type="module">
+import * as THREE from "/vendor/three/three.module.js";
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9fb4cc);
+scene.fog = new THREE.Fog(0x9fb4cc, 250, 1400);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.5, 4000);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+addEventListener("resize", () => {
+  camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+scene.add(new THREE.HemisphereLight(0xdfe8f5, 0x3a3f33, 1.0));
+const sun = new THREE.DirectionalLight(0xfff2dd, 1.15);
+sun.position.set(-260, 420, 320);
+scene.add(sun);
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(9000, 9000),
+  new THREE.MeshLambertMaterial({color:0x3f4a36})
+);
+ground.rotation.x = -Math.PI/2; ground.position.y = -0.06; scene.add(ground);
+
+const ROAD = new THREE.MeshLambertMaterial({color:0x2b2c2f});
+const PAINT = new THREE.MeshBasicMaterial({color:0xe8e6dc});
+const WALL = new THREE.MeshLambertMaterial({color:0x9a958c});
+
+// World metres are x east, y north, z up; three.js is x, z ground with y up.
+function ribbon(points, width, y, material) {
+  const half = width/2, vertices = [];
+  for (let i=0;i<points.length-1;i++){
+    const [ax, ay] = points[i], [bx, by] = points[i+1];
+    let dx = bx-ax, dy = by-ay;
+    const len = Math.hypot(dx,dy) || 1; dx/=len; dy/=len;
+    const nx = -dy*half, ny = dx*half;
+    const p1=[ax+nx, ay+ny], p2=[ax-nx, ay-ny], p3=[bx-nx, by-ny], p4=[bx+nx, by+ny];
+    vertices.push(p1[0],y,-p1[1], p2[0],y,-p2[1], p3[0],y,-p3[1]);
+    vertices.push(p1[0],y,-p1[1], p3[0],y,-p3[1], p4[0],y,-p4[1]);
+  }
+  if (!vertices.length) return null;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(vertices, 3));
+  g.computeVertexNormals();
+  return new THREE.Mesh(g, material);
+}
+
+function buildingMesh(outline, height) {
+  const shape = new THREE.Shape();
+  outline.forEach(([x,y], i) => i ? shape.lineTo(x, -y) : shape.moveTo(x, -y));
+  shape.closePath();
+  const g = new THREE.ExtrudeGeometry(shape, {depth: height, bevelEnabled:false});
+  g.rotateX(-Math.PI/2);
+  return new THREE.Mesh(g, WALL);
+}
+
+const COLOURS = {
+  "car":0xc8452f, "motorcycle":0x2b2b30, "person":0xe0b357,
+  "truck":0x4a6fa5, "bus":0x4a6fa5, "traffic light":0x1d1f22, "stop sign":0xb3202a
+};
+const SIGNAL = {0:0x22cc55, 1:0xffbb11, 2:0xee2222};
+
+let actorPool = [], carMesh = null, mode = 1;
+addEventListener("keydown", e => { if ("123".includes(e.key)) mode = +e.key; });
+
+let orbit = {on:false, x:0, y:0, yaw:0.6, pitch:0.5, dist:90};
+addEventListener("mousedown", e => { orbit.on=true; orbit.x=e.clientX; orbit.y=e.clientY; });
+addEventListener("mouseup", () => orbit.on=false);
+addEventListener("mousemove", e => {
+  if(!orbit.on) return;
+  orbit.yaw += (e.clientX-orbit.x)*0.005; orbit.pitch += (e.clientY-orbit.y)*0.005;
+  orbit.pitch = Math.max(0.08, Math.min(1.4, orbit.pitch));
+  orbit.x=e.clientX; orbit.y=e.clientY;
+});
+addEventListener("wheel", e => {
+  orbit.dist = Math.max(12, Math.min(900, orbit.dist * (1 + e.deltaY*0.001)));
+}, {passive:true});
+
+async function buildWorld(){
+  const w = await (await fetch("/world.json")).json();
+  for (const road of w.roads){
+    const m = ribbon(road.points, road.width, 0, ROAD);
+    if (m) scene.add(m);
+    const e = ribbon(road.points, 0.16, 0.02, PAINT);
+    if (e) { e.scale.set(1,1,1); scene.add(e); }
+  }
+  const lap = ribbon(w.lap, w.lap_width, 0.01, ROAD);
+  if (lap) scene.add(lap);
+  const centre = ribbon(w.lap, 0.16, 0.03, PAINT);
+  if (centre) scene.add(centre);
+  for (const b of w.buildings){
+    try { scene.add(buildingMesh(b.outline, b.height)); } catch (err) {}
+  }
+  document.getElementById("hud").innerHTML =
+    `${w.roads.length} streets &middot; ${w.buildings.length} buildings &middot; keeps ${w.driving_side}` +
+    ` &nbsp;<a href="/">camera view</a><br><span id="live"></span>`;
+}
+
+function actorMesh(a){
+  const [l, wdt, h] = a.size;
+  const colour = a.kind === "traffic light" && a.state >= 0 ? SIGNAL[a.state] : (COLOURS[a.kind] || 0x888888);
+  const m = new THREE.Mesh(
+    new THREE.BoxGeometry(Math.max(l,0.2), Math.max(h,0.2), Math.max(wdt,0.2)),
+    new THREE.MeshLambertMaterial({color: colour})
+  );
+  return m;
+}
+
+async function poll(){
+  try {
+    const s = await (await fetch("/state.json")).json();
+    if (s.actors){
+      while (actorPool.length < s.actors.length){
+        const m = actorMesh(s.actors[actorPool.length]);
+        scene.add(m); actorPool.push(m);
+      }
+      s.actors.forEach((a, i) => {
+        const m = actorPool[i];
+        m.visible = true;
+        m.position.set(a.x, a.z + a.size[2]/2, -a.y);
+        m.rotation.y = -a.heading;
+        const colour = a.kind === "traffic light" && a.state >= 0 ? SIGNAL[a.state] : (COLOURS[a.kind] || 0x888888);
+        m.material.color.setHex(colour);
+        m.scale.set(Math.max(a.size[0],0.2)/m.geometry.parameters.width,
+                    Math.max(a.size[2],0.2)/m.geometry.parameters.height,
+                    Math.max(a.size[1],0.2)/m.geometry.parameters.depth);
+      });
+      for (let i=s.actors.length;i<actorPool.length;i++) actorPool[i].visible = false;
+    }
+    if (s.car){
+      if (!carMesh){
+        carMesh = new THREE.Mesh(new THREE.BoxGeometry(4.4, 1.45, 1.8),
+                                 new THREE.MeshLambertMaterial({color:0x27d07a}));
+        scene.add(carMesh);
+      }
+      carMesh.position.set(s.car.x, 0.73, -s.car.y);
+      carMesh.rotation.y = -s.car.heading;
+      const live = document.getElementById("live");
+      if (live) live.textContent = `${s.car.speed_kmh.toFixed(0)} km/h`;
+    }
+  } catch (e) {}
+  setTimeout(poll, 60);
+}
+
+function frame(){
+  if (carMesh){
+    const h = carMesh.rotation.y;
+    if (mode === 1){
+      const back = new THREE.Vector3(Math.cos(h+Math.PI)*14, 7, -Math.sin(h+Math.PI)*14*-1);
+      camera.position.set(carMesh.position.x - Math.cos(-h)*16, 8, carMesh.position.z + Math.sin(-h)*16);
+      camera.lookAt(carMesh.position);
+    } else if (mode === 2){
+      camera.position.set(
+        carMesh.position.x + Math.sin(orbit.yaw)*orbit.dist*Math.cos(orbit.pitch),
+        orbit.dist*Math.sin(orbit.pitch) + 6,
+        carMesh.position.z + Math.cos(orbit.yaw)*orbit.dist*Math.cos(orbit.pitch)
+      );
+      camera.lookAt(carMesh.position);
+    } else {
+      camera.position.set(carMesh.position.x, 1.5, carMesh.position.z);
+      camera.rotation.set(0, h + Math.PI/2, 0);
+    }
+  }
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+buildWorld().then(() => { poll(); frame(); });
+</script>
+</body></html>
+"""
+
+
 def make_handler(shared: Shared):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -504,7 +809,50 @@ def make_handler(shared: Shared):
             if self.path.startswith("/stream.mjpg"):
                 self.stream()
                 return
+            if self.path.startswith("/world.json"):
+                self.json_reply(shared.world or {})
+                return
+            if self.path.startswith("/state.json"):
+                self.json_reply(shared.moving or {})
+                return
+            if self.path.startswith("/3d"):
+                self.html_reply(WORLD_PAGE)
+                return
+            if self.path.startswith("/vendor/"):
+                self.serve_vendor(self.path[len("/vendor/") :])
+                return
             self.send_error(404)
+
+        def json_reply(self, payload: dict) -> None:
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def html_reply(self, page: str) -> None:
+            body = page.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def serve_vendor(self, relative: str) -> None:
+            """The bundled three.js build, so the 3D view needs no network."""
+            root = (Path("web") / "vendor").resolve()
+            target = (root / relative).resolve()
+            if not str(target).startswith(str(root)) or not target.is_file():
+                self.send_error(404)
+                return
+            body = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def stream(self) -> None:
             """Multipart JPEG: one part per newly published frame."""
@@ -540,7 +888,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--weights", default=DEFAULT_WEIGHTS, help="detector weights; the fine-tuned ones by default")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8808)
-    parser.add_argument("--fps", type=float, default=20.0)
+    parser.add_argument("--fps", type=float, default=60.0)
+    parser.add_argument(
+        "--detect-every",
+        type=int,
+        default=4,
+        help="frames between detector passes; the stream runs at --fps regardless",
+    )
     parser.add_argument("--width", type=int, default=CameraConfig.width)
     parser.add_argument("--height", type=int, default=CameraConfig.height)
     parser.add_argument("--columns", type=int, default=EyeConfig.columns)
@@ -577,6 +931,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.seed,
                 args.device,
                 args.checkpoint,
+                args.detect_every,
             )
         except Exception as exc:  # the page would otherwise sit blank forever
             print(f"[live] simulation failed to start: {exc}")
@@ -584,6 +939,10 @@ def main(argv: list[str] | None = None) -> int:
             raise
         built["simulation"] = simulation
         print(f"[live] {simulation.law.summary()}")
+        world = simulation.world()
+        with shared.lock:
+            shared.world = world
+        print(f"[live] 3D world: {len(world['roads'])} streets, {len(world['buildings'])} buildings")
         simulation.run(shared, args.fps)
 
     thread = threading.Thread(target=drive, daemon=True)

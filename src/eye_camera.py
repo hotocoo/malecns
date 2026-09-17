@@ -70,6 +70,11 @@ class CameraSensor:
         self.timing = timing or SignalTiming()
         self._last: np.ndarray | None = None
         self._step = 0
+        # The frames and detections of the most recent look. A viewer wants the
+        # same picture the driver saw, and rendering it a second time doubles
+        # the cost of the whole loop for an identical image.
+        self.last_frames: list[np.ndarray] = []
+        self.last_detections: list = []
         self.frames_rendered = 0
         self.detector_calls = 0
 
@@ -120,6 +125,8 @@ class CameraSensor:
             self.detector_calls += 1
             detections = self.detector.detect(frames, self.cfg.detector_confidence)
             self._last = self.eye.encode_batch(detections, frames)
+            self.last_frames = frames
+            self.last_detections = detections
 
         vector = torch.from_numpy(self._last).to(device=device, dtype=speed.dtype)
         own_speed = (speed / max_speed).unsqueeze(1)

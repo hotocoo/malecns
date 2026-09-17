@@ -125,21 +125,19 @@ def road_profile(frame: np.ndarray, columns: int) -> tuple[np.ndarray, np.ndarra
     paint = grey & (high >= 0.55)
     surface = asphalt | paint
 
+    # One pass over the whole image rather than one per column: this runs once
+    # per body per control step, and the per-column loop cost more than the
+    # detector did.
+    run = np.cumprod(surface[::-1], axis=0).sum(axis=0)  # road pixels up from the bottom
+    band = np.minimum((np.arange(width) * columns) // max(width, 1), columns - 1)
     extent = np.zeros(columns, dtype=np.float32)
     marking = np.zeros(columns, dtype=np.float32)
-    edges = np.linspace(0, width, columns + 1).astype(int)
     for c in range(columns):
-        band = surface[:, edges[c] : max(edges[c] + 1, edges[c + 1])]
-        if band.size == 0:
+        take = band == c
+        if not take.any():
             continue
-        # A column of the band is road up to the first row from the bottom that
-        # is not; taking the median across the band ignores a single stray pixel.
-        rows = band[::-1]  # bottom row first
-        run = np.cumprod(rows, axis=0).sum(axis=0)
-        reach = float(np.median(run))
-        extent[c] = min(reach / height, 1.0)
-        painted = paint[:, edges[c] : max(edges[c] + 1, edges[c + 1])]
-        marking[c] = float(painted.mean())
+        extent[c] = min(float(np.median(run[take])) / height, 1.0)
+        marking[c] = float(paint[:, take].mean())
     return extent, marking
 
 
