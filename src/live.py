@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import threading
+from urllib.parse import unquote
 import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,6 +59,7 @@ class Shared:
     jpeg: bytes | None = None
     telemetry: dict = field(default_factory=dict)
     world: dict | None = None
+    world_bin: bytes = b""
     moving: dict | None = None
     frame_index: int = 0
     running: bool = True
@@ -71,6 +73,16 @@ class Shared:
     def latest(self) -> tuple[bytes | None, dict, int]:
         with self.lock:
             return self.jpeg, dict(self.telemetry), self.frame_index
+
+
+# What the driver's own car looks like on the 3D page.
+EGO_MODEL = "kenney_car_kit/Models/GLB format/sedan-sports.glb"
+
+
+def _asset_available(relative: str) -> bool:
+    from assets import available
+
+    return available(relative)
 
 
 def encode_jpeg(frame: np.ndarray, quality: int = 80) -> bytes:
@@ -124,7 +136,7 @@ class Simulation:
         checkpoint: Path | None = None,
         detect_every: int = 4,
     ) -> None:
-        from car_env import CarConfig, CarEnv, load_geojson_centerline
+        from car_env import CarEnv, load_geojson_centerline, street_car_config
         from dataset import load_scene
         from eye_camera import CameraSensor, SensorConfig
         from scene import SceneConfig, Traffic
@@ -160,11 +172,11 @@ class Simulation:
             self.scene.centerline, self.scene.heights, self.scene.profile, self.traffic, seed=seed
         )
 
-        cfg = CarConfig(
+        cfg = street_car_config(
             layout="geojson",
             geojson_path=str(track),
             max_laps=0,
-            max_speed=17.0,  # a street car; the F1 default cannot corner here
+            max_speed=17.0,  # 61 km/h: a street car under a 35-60 km/h limit
             lane_offset_m=-1.9,  # start in the left lane, as Malaysia drives
         )
         self.device = torch.device("cpu")
@@ -228,18 +240,26 @@ class Simulation:
         # at a couple of frames a second.
         device = pick_device("auto")
         brain = Brain(connectome, batch=1, config=LIFConfig(), device=device, weight_scale=defaults.WEIGHT_SCALE)
+        # The interface the checkpoint was evolved against: its eye encoding,
+        # readout normalisation and, when calibrated, the fitted readout
+        # itself. Built to this build's defaults instead, a fitted readout
+        # reads as noise and the car drives into the kerb.
+        from eye_camera import agent_config_for
+
         saved_cfg = saved.get("agent_cfg") or {}
-        cfg = AgentConfig(
-            n_rays=self.eye.width,
-            substeps=int(saved_cfg.get("substeps", defaults.SUBSTEPS)),
-        )
+        base = AgentConfig.from_saved(saved_cfg, substeps=int(saved_cfg.get("substeps", defaults.SUBSTEPS)))
+        cfg = agent_config_for(self.sensor, base)
         agent = ConnectomeAgent(brain, connectome.neurons, cfg)
-        theta = agent.unpack(saved["mu"].to(device).unsqueeze(0))
+        calibrated = agent.load_readout(saved)
+        theta = agent.unpack(saved["mu"].reshape(-1).to(device).unsqueeze(0))
         agent.reset(batch=1)
         agent.seed(0)
         self.agent = agent
         self.brain = brain
-        self.driver_note = f"connectome, generation {saved.get('generation', 0)}"
+        self.driver_note = (
+            f"connectome, generation {saved.get('generation', 0)}, eyes {cfg.eye_encoding}"
+            + (", calibrated readout" if calibrated else "")
+        )
 
         def drive(observation: torch.Tensor) -> torch.Tensor:
             # The environment lives on the CPU; the brain may not.
@@ -301,73 +321,36 @@ class Simulation:
             },
         }
 
-    def world(self) -> dict:
-        """The static city, in track metres, for a browser to build once.
+    def world(self) -> tuple[dict, bytes]:
+        """The static city for the browser to build once: a header and one binary mesh.
 
-        The same surveyed geometry the camera renders: the lap, every other
-        street in the region with its width, and the building footprints with
-        their heights. Sent once; only the moving things are polled after that.
+        The very triangles the camera renders (`camera.assemble_static`):
+        joined carriageways, kerbs, pavements, paint, buildings, ground, each
+        vertex with its material so the page textures it the same way. The
+        header carries the counts and the lap; the bytes are float32 positions
+        (x, y east-north, z up), uint8 colours and uint8 materials.
         """
+        from camera import assemble_static
+
         scene = self.scene
-        roads = []
-        import json as _json
-
-        from roadlaw import highways_path
-        from scene import LANES_BY_CLASS, SceneConfig, lane_halfwidth
-        from roadlaw import parse_lanes
-
-        cfg = SceneConfig()
-        survey = highways_path(self.track)
-        if survey.exists():
-            data = _json.loads(survey.read_text())
-            for way in data.get("elements", []):
-                tags = way.get("tags") or {}
-                geometry = way.get("geometry") or []
-                if len(geometry) < 2 or "highway" not in tags:
-                    continue
-                lonlat = np.array([[p["lon"], p["lat"]] for p in geometry], dtype=np.float64)
-                points = self.projection.project(lonlat)
-                if float(np.abs(points).max()) > 3000.0:
-                    continue  # far outside the lap; the view never reaches it
-                lanes = parse_lanes(tags.get("lanes")) or LANES_BY_CLASS.get(str(tags.get("highway")), 2)
-                roads.append(
-                    {
-                        "points": [[round(float(x), 2), round(float(y), 2)] for x, y in points],
-                        "width": round(lanes * cfg.lane_width_m + 2 * cfg.shoulder_m, 2),
-                        "oneway": bool(tags.get("oneway") in ("yes", "1", "true")),
-                        "name": tags.get("name"),
-                    }
-                )
-
-        buildings = []
-        footprints = self.track.with_name(self.track.stem + "_buildings.geojson")
-        if footprints.exists():
-            data = _json.loads(footprints.read_text())
-            lap = scene.centerline
-            for feature in data.get("features", []):
-                ring = (feature.get("geometry") or {}).get("coordinates", [[]])[0]
-                if len(ring) < 4:
-                    continue
-                outline = self.projection.project(np.array(ring[:-1], dtype=np.float64))
-                near = np.linalg.norm(outline[:, None, :] - lap[None, :, :], axis=2).min()
-                if near > 700.0:
-                    continue
-                height = float((feature.get("properties") or {}).get("height") or 0.0)
-                buildings.append(
-                    {
-                        "outline": [[round(float(x), 2), round(float(y), 2)] for x, y in outline],
-                        "height": round(height if height > 0 else cfg.unknown_storeys * cfg.storey_m, 1),
-                    }
-                )
-
-        return {
+        vertices, colours, _normals, materials = assemble_static(
+            scene.road, scene.network, scene.buildings, self.sensor.camera.cfg.ground_colour
+        )
+        payload = (
+            vertices.astype("<f4").tobytes()
+            + np.clip(np.rint(colours * 255.0), 0, 255).astype(np.uint8).tobytes()
+            + np.clip(np.rint(materials), 0, 255).astype(np.uint8).tobytes()
+        )
+        header = {
+            "vertices": int(vertices.shape[0]),
             "lap": [[round(float(x), 2), round(float(y), 2)] for x, y in scene.centerline],
             "lap_width": round(float(scene.halfwidth.mean() * 2.0), 2),
-            "roads": roads,
-            "buildings": buildings,
+            "buildings": int(scene.buildings.surface.shape[0] // 3) if scene.buildings is not None else 0,
             "driving_side": self.law.driving_side or "left",
+            "sky": list(self.sensor.camera.cfg.sky_colour),
             "attribution": "(c) OpenStreetMap contributors, ODbL 1.0",
         }
+        return header, payload
 
     def moving(self) -> dict:
         """Where everything is right now, for the 3D view to move its objects."""
@@ -384,6 +367,7 @@ class Simulation:
                     "size": [round(float(v), 2) for v in actor.size],
                     "state": int(actor.state),
                     "hazard": actor.hazard,
+                    "model": self.model_for(actor),
                 }
             )
         return {
@@ -392,10 +376,31 @@ class Simulation:
                 "y": round(float(env.pos[0][1]), 2),
                 "heading": round(float(env.heading[0]), 3),
                 "speed_kmh": round(float(env.speed[0]) * 3.6, 1),
+                "size": [round(float(env.cfg.car_length), 2), round(float(env.cfg.car_halfwidth * 2.0), 2), 1.45],
+                "model": EGO_MODEL if _asset_available(EGO_MODEL) else None,
             },
             "actors": actors,
             "frame": self.frame_index,
         }
+
+    def model_for(self, actor) -> str | None:
+        """The published model the camera draws this actor with, for the 3D page.
+
+        The same choice the renderer makes (`DriverCamera._emit_model`), so
+        the page shows the car the detector saw. None when the kind has no
+        glTF model installed; the page then draws a box, as the camera does.
+        """
+        from assets import MissingAsset, pick
+        from camera import MODELS_FOR
+
+        family = MODELS_FOR.get(actor.kind)
+        if not family:
+            return None
+        try:
+            relative = pick(family, max(actor.node_id, 0) if actor.node_id >= 0 else self.sensor.camera._variant(actor))
+        except MissingAsset:
+            return None
+        return relative if relative.lower().endswith((".glb", ".gltf")) else None
 
     def senses(self) -> dict:
         """What the eye handed the brain this step, column by column.
@@ -591,23 +596,28 @@ poll();
 
 
 WORLD_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>malecns - 3D world</title>
+<html><head><meta charset="utf-8"><title>malecns - 3D world</title>
 <style>
- body{margin:0;background:#0b0c0f;color:#e8e8ea;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden}
- #hud{position:fixed;top:0;left:0;padding:10px 14px;z-index:5;text-shadow:0 1px 3px #000}
- #hud a{color:#7fc6ff}
- #keys{position:fixed;bottom:0;left:0;padding:10px 14px;color:#8b8d96;z-index:5}
- canvas{display:block}
+body{margin:0;background:#0b0c0f;color:#e8e8ea;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden}
+#hud{position:fixed;top:0;left:0;padding:10px 14px;z-index:5;text-shadow:0 1px 3px #000}
+#hud a{color:#7fc6ff}
+#keys{position:fixed;bottom:0;left:0;padding:10px 14px;color:#8b8d96;z-index:5}
+canvas{display:block}
 </style></head>
 <body>
-<div id="hud">loading the city&hellip; &nbsp;<a href="/">camera view</a></div>
-<div id="keys">1 chase &middot; 2 overhead &middot; 3 driver &middot; drag to orbit, wheel to zoom</div>
+<div id="hud">loading city&hellip; &nbsp;<a href="/">camera view</a></div>
+<div id="keys">1 chase &middot; 2 overhead &middot; 3 driver &middot; drag orbit, wheel to zoom</div>
+<script type="importmap">{"imports": {"three": "/vendor/three/three.module.js"}}</script>
 <script type="module">
-import * as THREE from "/vendor/three/three.module.js";
+import * as THREE from "three";
+import { GLTFLoader } from "/vendor/three/loaders/GLTFLoader.js";
 
+// Track frame: x east, y north, z up. three.js: y up. Every point is swizzled
+// (x, y, z) -> (x, z, -y) on the way in, so the mesh the camera renders and
+// the mesh drawn here are the same numbers.
+const SKY = new THREE.Color(0x9fb4cc);
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x9fb4cc);
-scene.fog = new THREE.Fog(0x9fb4cc, 250, 1400);
+scene.background = SKY;
 
 const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.5, 4000);
 const renderer = new THREE.WebGLRenderer({antialias:true});
@@ -624,43 +634,56 @@ const sun = new THREE.DirectionalLight(0xfff2dd, 1.15);
 sun.position.set(-260, 420, 320);
 scene.add(sun);
 
-const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(9000, 9000),
-  new THREE.MeshLambertMaterial({color:0x3f4a36})
-);
-ground.rotation.x = -Math.PI/2; ground.position.y = -0.06; scene.add(ground);
-
-const ROAD = new THREE.MeshLambertMaterial({color:0x2b2c2f});
-const PAINT = new THREE.MeshBasicMaterial({color:0xe8e6dc});
-const WALL = new THREE.MeshLambertMaterial({color:0x9a958c});
-
-// World metres are x east, y north, z up; three.js is x, z ground with y up.
-function ribbon(points, width, y, material) {
-  const half = width/2, vertices = [];
-  for (let i=0;i<points.length-1;i++){
-    const [ax, ay] = points[i], [bx, by] = points[i+1];
-    let dx = bx-ax, dy = by-ay;
-    const len = Math.hypot(dx,dy) || 1; dx/=len; dy/=len;
-    const nx = -dy*half, ny = dx*half;
-    const p1=[ax+nx, ay+ny], p2=[ax-nx, ay-ny], p3=[bx-nx, by-ny], p4=[bx+nx, by+ny];
-    vertices.push(p1[0],y,-p1[1], p2[0],y,-p2[1], p3[0],y,-p3[1]);
-    vertices.push(p1[0],y,-p1[1], p3[0],y,-p3[1], p4[0],y,-p4[1]);
-  }
-  if (!vertices.length) return null;
-  const g = new THREE.BufferGeometry();
-  g.setAttribute("position", new THREE.Float32BufferAttribute(vertices, 3));
-  g.computeVertexNormals();
-  return new THREE.Mesh(g, material);
-}
-
-function buildingMesh(outline, height) {
-  const shape = new THREE.Shape();
-  outline.forEach(([x,y], i) => i ? shape.lineTo(x, -y) : shape.moveTo(x, -y));
-  shape.closePath();
-  const g = new THREE.ExtrudeGeometry(shape, {depth: height, bevelEnabled:false});
-  g.rotateX(-Math.PI/2);
-  return new THREE.Mesh(g, WALL);
-}
+// The static city: one buffer, textured per vertex material by the same GLSL
+// the driver's camera uses (spliced in by the server).
+const SURFACE_GLSL = `/*SURFACE_GLSL*/`;
+const cityMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    sunDir: {value: new THREE.Vector3(-0.35, 0.25, 0.90).normalize()},
+    ambient: {value: 0.45},
+    fogColour: {value: SKY},
+    fogStart: {value: 250.0},
+    fogEnd: {value: 1400.0},
+  },
+  vertexShader: `
+    attribute float material;
+    attribute vec3 colour;
+    varying vec3 vWorld;
+    varying vec3 vColour;
+    varying float vMaterial;
+    varying float vDepth;
+    void main() {
+      vec3 p = vec3(position.x, position.z, -position.y);
+      vec4 view = modelViewMatrix * vec4(p, 1.0);
+      gl_Position = projectionMatrix * view;
+      vWorld = position;
+      vColour = colour;
+      vMaterial = material;
+      vDepth = -view.z;
+    }`,
+  fragmentShader: `
+    precision highp float;
+    uniform vec3 sunDir;
+    uniform float ambient;
+    uniform vec3 fogColour;
+    uniform float fogStart;
+    uniform float fogEnd;
+    varying vec3 vWorld;
+    varying vec3 vColour;
+    varying float vMaterial;
+    varying float vDepth;
+    ` + SURFACE_GLSL + `
+    void main() {
+      // Flat shading from the surface's own slope, in the track frame.
+      vec3 n = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
+      if (n.z < 0.0) n = -n;
+      float lit = ambient + (1.0 - ambient) * max(dot(n, sunDir), 0.0);
+      vec3 shaded = surface_colour(vColour * lit, vMaterial, vWorld);
+      float t = clamp((vDepth - fogStart) / (fogEnd - fogStart), 0.0, 1.0);
+      gl_FragColor = vec4(mix(shaded, fogColour, t), 1.0);
+    }`,
+  side: THREE.DoubleSide,
+});
 
 const COLOURS = {
   "car":0xc8452f, "motorcycle":0x2b2b30, "person":0xe0b357,
@@ -686,63 +709,149 @@ addEventListener("wheel", e => {
 
 async function buildWorld(){
   const w = await (await fetch("/world.json")).json();
-  for (const road of w.roads){
-    const m = ribbon(road.points, road.width, 0, ROAD);
-    if (m) scene.add(m);
-    const e = ribbon(road.points, 0.16, 0.02, PAINT);
-    if (e) { e.scale.set(1,1,1); scene.add(e); }
-  }
-  const lap = ribbon(w.lap, w.lap_width, 0.01, ROAD);
-  if (lap) scene.add(lap);
-  const centre = ribbon(w.lap, 0.16, 0.03, PAINT);
-  if (centre) scene.add(centre);
-  for (const b of w.buildings){
-    try { scene.add(buildingMesh(b.outline, b.height)); } catch (err) {}
-  }
+  const raw = await (await fetch("/world.bin")).arrayBuffer();
+  const n = w.vertices;
+  const positions = new Float32Array(raw, 0, n*3);
+  const colours8 = new Uint8Array(raw, n*12, n*3);
+  const materials8 = new Uint8Array(raw, n*15, n);
+  const colours = new Float32Array(n*3);
+  for (let i=0;i<n*3;i++) colours[i] = colours8[i]/255;
+  const materials = new Float32Array(n);
+  for (let i=0;i<n;i++) materials[i] = materials8[i];
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  g.setAttribute("colour", new THREE.BufferAttribute(colours, 3));
+  g.setAttribute("material", new THREE.BufferAttribute(materials, 1));
+  // Bounding volume in the swizzled frame, so frustum culling does not drop the city.
+  g.computeBoundingSphere(); g.boundingSphere.radius *= 2;
+  const city = new THREE.Mesh(g, cityMaterial);
+  city.frustumCulled = false;
+  scene.add(city);
   document.getElementById("hud").innerHTML =
-    `${w.roads.length} streets &middot; ${w.buildings.length} buildings &middot; keeps ${w.driving_side}` +
-    ` &nbsp;<a href="/">camera view</a><br><span id="live"></span>`;
+    `${(n/3).toLocaleString()} triangles &middot; drives on the ${w.driving_side} &middot; ` +
+    `<a href="/">camera view</a> &nbsp; <span id="live"></span><br><small>${w.attribution}</small>`;
 }
 
-function actorMesh(a){
+// Actors are drawn with the published models the camera drew them with
+// (served from data/assets/raw); a kind with no glTF model is a box, as in
+// the camera. glTF is +Y up, -Z forward; the track frame is +Z up, +X at
+// heading 0, and (x, y, z) -> (x, z, -y) here, so a model at heading h is
+// turned by h - pi/2 about Y and its length lies along its own Z.
+const loader = new GLTFLoader();
+const gltfCache = new Map();
+function loadModel(path){
+  if (!gltfCache.has(path)){
+    gltfCache.set(path, new Promise(resolve => {
+      loader.load("/assets/" + encodeURI(path), g => {
+        const box = new THREE.Box3().setFromObject(g.scene);
+        resolve({scene: g.scene, box});
+      }, undefined, () => resolve(null));
+    }));
+  }
+  return gltfCache.get(path);
+}
+
+function forwardOf(h){ return new THREE.Vector3(Math.cos(h), 0, -Math.sin(h)); }
+
+function boxFor(a, colour){
   const [l, wdt, h] = a.size;
-  const colour = a.kind === "traffic light" && a.state >= 0 ? SIGNAL[a.state] : (COLOURS[a.kind] || 0x888888);
   const m = new THREE.Mesh(
     new THREE.BoxGeometry(Math.max(l,0.2), Math.max(h,0.2), Math.max(wdt,0.2)),
-    new THREE.MeshLambertMaterial({color: colour})
-  );
+    new THREE.MeshLambertMaterial({color: colour}));
+  m.userData.box = true;
   return m;
 }
 
+function signalColour(a){
+  return (a.kind === "traffic light" && a.state >= 0) ? SIGNAL[a.state] : (COLOURS[a.kind] || 0x888888);
+}
+
+// A holder per actor: the model (or box) is attached inside it once loaded,
+// scaled to the actor's real size, so moving the holder moves the actor.
+function actorHolder(a){
+  const holder = new THREE.Group();
+  holder.userData = {model: null, kind: a.kind};
+  const fallback = boxFor(a, signalColour(a));
+  holder.add(fallback);
+  holder.userData.fallback = fallback;
+  if (a.model){
+    loadModel(a.model).then(m => {
+      if (!m) return;
+      const inst = m.scene.clone(true);
+      const size = new THREE.Vector3(); m.box.getSize(size);
+      const [l, wdt, hgt] = a.size;
+      let sx, sy, sz;
+      if (a.kind === "traffic light"){
+        // The whole light on its pole, as tall as the head stands.
+        const tall = Math.max(a.z + 0.45, 0.5);
+        sy = tall / Math.max(size.y, 1e-3); sx = sz = sy;
+      } else {
+        sx = Math.max(wdt,0.2) / Math.max(size.x, 1e-3);
+        sy = Math.max(hgt,0.2) / Math.max(size.y, 1e-3);
+        sz = Math.max(l,0.2) / Math.max(size.z, 1e-3);
+      }
+      inst.scale.set(sx, sy, sz);
+      inst.position.set(-(m.box.min.x + size.x/2)*sx, -m.box.min.y*sy, -(m.box.min.z + size.z/2)*sz);
+      inst.rotation.y = -Math.PI/2;  // model -Z forward -> holder +X forward
+      const wrap = new THREE.Group(); wrap.add(inst);
+      holder.userData.model = wrap;
+      holder.remove(fallback);
+      holder.add(wrap);
+      if (a.kind === "traffic light"){
+        const lens = new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 12),
+                                    new THREE.MeshBasicMaterial({color: SIGNAL[Math.max(a.state,0)] || 0xee2222}));
+        lens.position.set(0.15, Math.max(a.z, 0.5), 0);
+        holder.userData.lens = lens;
+        holder.add(lens);
+      }
+    });
+  }
+  return holder;
+}
+
+function placeActor(holder, a){
+  holder.visible = true;
+  const base = holder.userData.model ? a.z : a.z + a.size[2]/2;
+  holder.position.set(a.x, holder.userData.model ? 0 : base, -a.y);
+  if (holder.userData.model && a.kind !== "traffic light") holder.position.y = a.z;
+  holder.rotation.y = a.heading;
+  if (holder.userData.fallback && !holder.userData.model){
+    const f = holder.userData.fallback;
+    f.material.color.setHex(signalColour(a));
+    f.scale.set(Math.max(a.size[0],0.2)/f.geometry.parameters.width,
+                Math.max(a.size[2],0.2)/f.geometry.parameters.height,
+                Math.max(a.size[1],0.2)/f.geometry.parameters.depth);
+  }
+  if (holder.userData.lens && a.state >= 0) holder.userData.lens.material.color.setHex(SIGNAL[a.state]);
+}
+
+let carHeading = 0;
 async function poll(){
   try {
     const s = await (await fetch("/state.json")).json();
     if (s.actors){
       while (actorPool.length < s.actors.length){
-        const m = actorMesh(s.actors[actorPool.length]);
-        scene.add(m); actorPool.push(m);
+        const holder = actorHolder(s.actors[actorPool.length]);
+        scene.add(holder); actorPool.push(holder);
       }
       s.actors.forEach((a, i) => {
-        const m = actorPool[i];
-        m.visible = true;
-        m.position.set(a.x, a.z + a.size[2]/2, -a.y);
-        m.rotation.y = -a.heading;
-        const colour = a.kind === "traffic light" && a.state >= 0 ? SIGNAL[a.state] : (COLOURS[a.kind] || 0x888888);
-        m.material.color.setHex(colour);
-        m.scale.set(Math.max(a.size[0],0.2)/m.geometry.parameters.width,
-                    Math.max(a.size[2],0.2)/m.geometry.parameters.height,
-                    Math.max(a.size[1],0.2)/m.geometry.parameters.depth);
+        let holder = actorPool[i];
+        // A slot reused for a different kind of thing gets rebuilt.
+        if (holder.userData.kind !== a.kind){
+          scene.remove(holder); holder = actorHolder(a); scene.add(holder); actorPool[i] = holder;
+        }
+        placeActor(holder, a);
       });
       for (let i=s.actors.length;i<actorPool.length;i++) actorPool[i].visible = false;
     }
     if (s.car){
       if (!carMesh){
-        carMesh = new THREE.Mesh(new THREE.BoxGeometry(4.4, 1.45, 1.8),
-                                 new THREE.MeshLambertMaterial({color:0x27d07a}));
+        carMesh = actorHolder({kind: "car", model: s.car.model, size: s.car.size || [4.5, 1.8, 1.45], z: 0, state: -1, x: s.car.x, y: s.car.y, heading: s.car.heading});
+        if (carMesh.userData.fallback) carMesh.userData.fallback.material.color.setHex(0x27d07a);
         scene.add(carMesh);
       }
-      carMesh.position.set(s.car.x, 0.73, -s.car.y);
-      carMesh.rotation.y = -s.car.heading;
+      placeActor(carMesh, {kind: "car", size: s.car.size || [4.5, 1.8, 1.45], z: 0, state: -1, x: s.car.x, y: s.car.y, heading: s.car.heading});
+      carHeading = s.car.heading;
       const live = document.getElementById("live");
       if (live) live.textContent = `${s.car.speed_kmh.toFixed(0)} km/h`;
     }
@@ -752,21 +861,21 @@ async function poll(){
 
 function frame(){
   if (carMesh){
-    const h = carMesh.rotation.y;
+    const fwd = forwardOf(carHeading);
+    const p = carMesh.position;
     if (mode === 1){
-      const back = new THREE.Vector3(Math.cos(h+Math.PI)*14, 7, -Math.sin(h+Math.PI)*14*-1);
-      camera.position.set(carMesh.position.x - Math.cos(-h)*16, 8, carMesh.position.z + Math.sin(-h)*16);
-      camera.lookAt(carMesh.position);
+      camera.position.set(p.x - fwd.x*16, 7.5, p.z - fwd.z*16);
+      camera.lookAt(p.x + fwd.x*6, 1.0, p.z + fwd.z*6);
     } else if (mode === 2){
       camera.position.set(
-        carMesh.position.x + Math.sin(orbit.yaw)*orbit.dist*Math.cos(orbit.pitch),
+        p.x + Math.sin(orbit.yaw)*orbit.dist*Math.cos(orbit.pitch),
         orbit.dist*Math.sin(orbit.pitch) + 6,
-        carMesh.position.z + Math.cos(orbit.yaw)*orbit.dist*Math.cos(orbit.pitch)
+        p.z + Math.cos(orbit.yaw)*orbit.dist*Math.cos(orbit.pitch)
       );
-      camera.lookAt(carMesh.position);
+      camera.lookAt(p);
     } else {
-      camera.position.set(carMesh.position.x, 1.5, carMesh.position.z);
-      camera.rotation.set(0, h + Math.PI/2, 0);
+      camera.position.set(p.x + fwd.x*1.2, 1.25, p.z + fwd.z*1.2);
+      camera.lookAt(p.x + fwd.x*40, 1.0, p.z + fwd.z*40);
     }
   }
   renderer.render(scene, camera);
@@ -812,14 +921,28 @@ def make_handler(shared: Shared):
             if self.path.startswith("/world.json"):
                 self.json_reply(shared.world or {})
                 return
+            if self.path.startswith("/world.bin"):
+                body = shared.world_bin
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith("/state.json"):
                 self.json_reply(shared.moving or {})
                 return
             if self.path.startswith("/3d"):
-                self.html_reply(WORLD_PAGE)
+                from camera import SURFACE_GLSL
+
+                self.html_reply(WORLD_PAGE.replace("/*SURFACE_GLSL*/", SURFACE_GLSL))
                 return
             if self.path.startswith("/vendor/"):
                 self.serve_vendor(self.path[len("/vendor/") :])
+                return
+            if self.path.startswith("/assets/"):
+                self.serve_asset(unquote(self.path[len("/assets/") :]))
                 return
             self.send_error(404)
 
@@ -836,6 +959,23 @@ def make_handler(shared: Shared):
             body = page.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def serve_asset(self, relative: str) -> None:
+            """A published model (data/assets/raw), so the 3D page draws the cars the camera saw."""
+            from assets import RAW_DIR
+
+            root = Path(RAW_DIR).resolve()
+            target = (root / relative).resolve()
+            if not str(target).startswith(str(root)) or not target.is_file():
+                self.send_error(404)
+                return
+            body = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "model/gltf-binary" if target.suffix == ".glb" else "application/octet-stream")
+            self.send_header("Cache-Control", "max-age=3600")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -939,10 +1079,11 @@ def main(argv: list[str] | None = None) -> int:
             raise
         built["simulation"] = simulation
         print(f"[live] {simulation.law.summary()}")
-        world = simulation.world()
+        header, mesh = simulation.world()
         with shared.lock:
-            shared.world = world
-        print(f"[live] 3D world: {len(world['roads'])} streets, {len(world['buildings'])} buildings")
+            shared.world = header
+            shared.world_bin = mesh
+        print(f"[live] 3D world: {header['vertices']:,} vertices, {header['buildings']:,} building triangles, {len(mesh) / 1e6:.1f} MB")
         simulation.run(shared, args.fps)
 
     thread = threading.Thread(target=drive, daemon=True)

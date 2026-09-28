@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MALECNS Trading Terminal</title>
+    <link rel="stylesheet" href="trading.css">
+    <script src="vendor/three.min.js"></script>
+    <script src="vendor/chart.umd.min.js"></script>
+</head>
+<body>
+    <!-- Header -->
+    <header class="terminal-header">
+        <div class="header-left">
+            <div class="logo">
+                <span class="logo-icon">🧠</span>
+                <span class="logo-text">MALECNS</span>
+            </div>
+            <span class="header-subtitle">Neural Trading Terminal</span>
+        </div>
+        <div class="header-center">
+            <div class="market-status" id="market-status">
+                <span class="status-dot"></span>
+                <span class="status-text">LIVE</span>
+            </div>
+            <div class="regime-indicator" id="regime-indicator">
+                <span class="regime-label">REGIME:</span>
+                <span class="regime-value" id="regime-value">--</span>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="clock" id="clock">--:--:--</div>
+        </div>
+    </header>
+
+    <!-- Main Grid -->
+    <main class="terminal-grid">
+        <!-- Left Column: Price Chart & Order Book -->
+        <section class="panel panel-price">
+            <div class="panel-header">
+                <h2>Price Action</h2>
+                <div class="price-info">
+                    <span class="price-value" id="price-value">--</span>
+                    <span class="price-change" id="price-change">--</span>
+                </div>
+            </div>
+            <div class="panel-body">
+                <canvas id="price-chart"></canvas>
+            </div>
+        </section>
+
+        <section class="panel panel-orderbook">
+            <div class="panel-header">
+                <h2>Order Book</h2>
+                <span class="spread-value" id="spread-value">--</span>
+            </div>
+            <div class="panel-body">
+                <div class="orderbook-container">
+                    <div class="orderbook-asks" id="orderbook-asks"></div>
+                    <div class="orderbook-spread">
+                        <span class="bid-label">BID</span>
+                        <span class="bid-value" id="bid-value">--</span>
+                        <span class="ask-value" id="ask-value">--</span>
+                        <span class="ask-label">ASK</span>
+                    </div>
+                    <div class="orderbook-bids" id="orderbook-bids"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Center: 3D Brain Visualization -->
+        <section class="panel panel-brain">
+            <div class="panel-header">
+                <h2>Connectome Activity</h2>
+                <span class="neuron-count" id="neuron-count">-- neurons</span>
+            </div>
+            <div class="panel-body">
+                <div id="brain-canvas-container">
+                    <canvas id="brain-canvas"></canvas>
+                </div>
+                <div class="brain-legend">
+                    <span class="legend-item"><span class="legend-dot low"></span> Low</span>
+                    <span class="legend-item"><span class="legend-dot mid"></span> Medium</span>
+                    <span class="legend-item"><span class="legend-dot high"></span> High</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Right Column: Portfolio & Metrics -->
+        <section class="panel panel-portfolio">
+            <div class="panel-header">
+                <h2>Portfolio</h2>
+                <span class="equity-value" id="equity-value">--</span>
+            </div>
+            <div class="panel-body">
+                <div class="portfolio-stats">
+                    <div class="stat-row">
+                        <span class="stat-label">Position</span>
+                        <span class="stat-value" id="position-value">--</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Cash</span>
+                        <span class="stat-value" id="cash-value">--</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Drawdown</span>
+                        <span class="stat-value stat-negative" id="drawdown-value">--</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Max DD</span>
+                        <span class="stat-value stat-negative" id="max-dd-value">--</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Trades</span>
+                        <span class="stat-value" id="trades-value">--</span>
+                    </div>
+                </div>
+                <canvas id="equity-chart"></canvas>
+            </div>
+        </section>
+
+        <section class="panel panel-metrics">
+            <div class="panel-header">
+                <h2>Performance Metrics</h2>
+            </div>
+            <div class="panel-body">
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <span class="metric-label">Sharpe</span>
+                        <span class="metric-value" id="sharpe-value">--</span>
+                    </div>
+                    <div class="metric-card">
+                        <span class="metric-label">Sortino</span>
+                        <span class="metric-value" id="sortino-value">--</span>
+                    </div>
+                    <div class="metric-card">
+                        <span class="metric-label">Calmar</span>
+                        <span class="metric-value" id="calmar-value">--</span>
+                    </div>
+                    <div class="metric-card">
+                        <span class="metric-label">Win Rate</span>
+                        <span class="metric-value" id="winrate-value">--</span>
+                    </div>
+                    <div class="metric-card">
+                        <span class="metric-label">Profit Factor</span>
+                        <span class="metric-value" id="profit-factor-value">--</span>
+                    </div>
+                    <div class="metric-card">
+                        <span class="metric-label">Volatility</span>
+                        <span class="metric-value" id="volatility-value">--</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Bottom: Indicators & Trade Log -->
+        <section class="panel panel-indicators">
+            <div class="panel-header">
+                <h2>Technical Indicators</h2>
+            </div>
+            <div class="panel-body">
+                <div class="indicators-row">
+                    <div class="indicator-card">
+                        <span class="indicator-label">RSI</span>
+                        <div class="indicator-gauge">
+                            <div class="gauge-fill" id="rsi-gauge"></div>
+                            <span class="gauge-value" id="rsi-value">--</span>
+                        </div>
+                    </div>
+                    <div class="indicator-card">
+                        <span class="indicator-label">MACD</span>
+                        <div class="indicator-value-large" id="macd-value">--</div>
+                    </div>
+                    <div class="indicator-card">
+                        <span class="indicator-label">BB Position</span>
+                        <div class="indicator-gauge">
+                            <div class="gauge-fill" id="bb-gauge"></div>
+                            <span class="gauge-value" id="bb-value">--</span>
+                        </div>
+                    </div>
+                    <div class="indicator-card">
+                        <span class="indicator-label">ATR</span>
+                        <div class="indicator-value-large" id="atr-value">--</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="panel panel-trades">
+            <div class="panel-header">
+                <h2>Trade Log</h2>
+            </div>
+            <div class="panel-body">
+                <div class="trade-log" id="trade-log">
+                    <div class="trade-entry">
+                        <span class="trade-time">--:--:--</span>
+                        <span class="trade-action trade-hold">HOLD</span>
+                        <span class="trade-price">--</span>
+                        <span class="trade-pnl">--</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script src="trading.js"></script>
+</body>
+</html>

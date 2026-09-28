@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -101,11 +101,22 @@ def load_scene(track: Path, scene_cfg: SceneConfig | None = None) -> SceneBundle
         raise SystemExit(f"{track} has no road survey beside it; run fetch_roads.py or fetch_malaysia_osm.py")
     control_points = control_points_for_circuit(track, proj, load_law(), centerline=centerline)
     heights = surveyed_heights_or_flat(track, centerline)
-    road = build_road(centerline, heights, profile, scene_cfg)
     # Every other road in the survey, so a junction has streets leading off it
-    # instead of ending in grass.
+    # instead of ending in grass. The network's paint already stops at every
+    # junction, so the lap keeps only its surface (plus the stop lines and
+    # crossings the law charges at) and does not draw lines through them.
     survey = highways_path(track)
-    network = build_network(survey, proj, scene_cfg) if survey.exists() else None
+    network = build_network(survey, proj, scene_cfg, centre=centerline) if survey.exists() else None
+    has_network = network is not None and network.surface.shape[0] > 0
+    road = build_road(centerline, heights, profile, scene_cfg, paint=not has_network)
+    if has_network:
+        from streets import crossing_markings
+
+        crossings = crossing_markings(
+            centerline, heights, lane_halfwidth(profile, scene_cfg), control_points,
+            profile.driving_side, scene_cfg.marking_width_m,
+        )
+        road = replace(road, markings=crossings.vertices, markings_colour=crossings.colours)
     # The city the street runs through. Without it the camera sees a road in a
     # field, and so does the detector.
     buildings = build_buildings(

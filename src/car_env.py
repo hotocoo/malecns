@@ -270,6 +270,41 @@ class CarConfig:
         return self.wheelbase / float(np.tan(self.max_steer_rad))
 
 
+def street_car_config(**overrides) -> CarConfig:
+    """An ordinary saloon for the street circuits, not the Formula 1 car.
+
+    The camera driver learns a Malaysian street with junctions to turn at
+    right angles and a posted limit of 35-60 km/h. The W11's 8.3 m minimum
+    turning radius, 1.8 g of grip and 340 km/h top speed are wrong for that in
+    every direction: the corner speeds its grip implies exceed the limit
+    everywhere, and it cannot make a 5 m kerb radius at all. These figures are
+    a typical C-segment car (Proton or Perodua class): 2.7 m wheelbase, 1.4 t,
+    about 100 kW, 0.9 g of grip and 35 degrees of lock (about 4.6 m turning
+    radius at the wheelbase).
+    """
+    base = dict(
+        wheelbase=2.70,
+        car_halfwidth=0.90,
+        car_length=4.50,
+        tyre_radius_m=0.31,
+        vehicle_name="street car",
+        mass_kg=1_400.0,
+        power_w=100_000.0,
+        cda_m2=0.70,
+        roll_decel=0.20,
+        traction_g=0.60,
+        grip_mech_g=0.90,
+        grip_aero_g=0.0,
+        grip_v_ref=80.0,
+        grip_max_g=0.95,
+        max_steer_rad=0.61,
+        steer_tau_s=0.15,
+        max_speed=17.0,
+    )
+    base.update(overrides)
+    return CarConfig(**base)
+
+
 def monaco_config(dt_s: float, halfwidth: float | None = None, mirror: bool = False) -> CarConfig:
     """Circuit de Monaco at full scale: 3.29 km smoothed lap (3.337 km official), 11 m road, ~0.5 m cells."""
     return CarConfig(
@@ -611,10 +646,26 @@ class Track:
         """True where a body of half-width `margin` fits on the road."""
         return self.clearance_at(xy) > margin
 
-    def progress_at(self, xy: torch.Tensor) -> torch.Tensor:
-        """Lap fraction in [0, 1): nearest centerline sample plus the signed offset along its tangent."""
-        row, col = self._cell_index(xy)
-        index = self.nearest[row, col].long()
+    def progress_at(self, xy: torch.Tensor, near: torch.Tensor | None = None, window: int = 40) -> torch.Tensor:
+        """Lap fraction in [0, 1): nearest centerline sample plus the signed offset along its tangent.
+
+        With `near` (the car's last progress, one per row of `xy`) the search
+        is limited to `window` samples either side of it. A street route can
+        run out along one carriageway and back along the other a few metres
+        away, or cross itself at a junction; the globally nearest sample then
+        belongs to the other leg, and progress, reward, law and lap all jump
+        legs. Tracked from where the car last was, it cannot.
+        """
+        n = self.centerline.shape[0]
+        if near is None:
+            row, col = self._cell_index(xy)
+            index = self.nearest[row, col].long()
+        else:
+            centre = torch.round(near.to(xy.dtype) * n).long()
+            offsets = torch.arange(-window, window + 1, device=xy.device)
+            candidates = torch.remainder(centre.unsqueeze(-1) + offsets, n)
+            gap = (self.centerline[candidates] - xy.unsqueeze(-2)).square().sum(dim=-1)
+            index = candidates.gather(-1, gap.argmin(dim=-1, keepdim=True)).squeeze(-1)
         along = ((xy - self.centerline[index]) * self.tangent[index]).sum(dim=-1) / self.spacing_m
         n = self.centerline.shape[0]
         # The nearest sample is looked up per grid cell, so a point can sit up to a
@@ -780,7 +831,10 @@ class CarEnv:
         self.lat_g = torch.where(m1, zero, self.lat_g)
         self.laps = torch.where(m1, zero, self.laps)
         self.best_laps = torch.where(m1, zero, self.best_laps)
-        self.last_progress = torch.where(m1, self.track.progress_at(start_all), self.last_progress)
+        n_track = self.track.centerline.shape[0]
+        self.last_progress = torch.where(
+            m1, self.track.progress_at(start_all, self.start_index.to(torch.float32) / n_track), self.last_progress
+        )
         self.anchor_laps = torch.where(m1, zero, self.anchor_laps)
         self.anchor_step = torch.where(m1, zero_l, self.anchor_step)
         self.step_count = torch.where(m1, zero_l, self.step_count)
@@ -945,7 +999,7 @@ class CarEnv:
         self._drive(action)
         self.step_count = self.step_count + 1
 
-        progress = self.track.progress_at(self.pos)
+        progress = self.track.progress_at(self.pos, self.last_progress)
         delta = progress - self.last_progress
         delta = torch.where(delta < -0.5, delta + 1.0, delta)  # lap wrap
         delta = torch.where(delta > 0.5, delta - 1.0, delta)  # backwards wrap

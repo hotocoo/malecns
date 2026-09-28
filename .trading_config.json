@@ -1,0 +1,19 @@
+{
+  "broker": "demo",
+  "instruments": ["EUR_USD", "GBP_USD", "USD_JPY"],
+  "risk_per_trade": 0.01,
+  "max_positions": 3,
+  "stop_loss_pct": 0.02,
+  "take_profit_pct": 0.04,
+  "graph_dir": "data/graph_w5",
+  "checkpoint": "checkpoints/trading_es.pt",
+  "device": "auto",
+  "oanda": {
+    "access_token": "",
+    "account_id": "",
+    "practice": true
+  },
+  "etoro": {
+    "access_token": ""
+  }
+}

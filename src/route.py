@@ -159,6 +159,73 @@ def path_length_m(graph: RoadGraph, nodes: list[int]) -> float:
     return sum(haversine_m(graph.coords[a], graph.coords[b]) for a, b in zip(nodes, nodes[1:]))
 
 
+
+def _local_metres(graph: RoadGraph, nodes: list[int]) -> tuple[list[int], "object"]:
+    """Node ids and their positions in metres on a flat plane about the region's centre."""
+    import numpy as np
+
+    ids = list(nodes)
+    lonlat = np.array([graph.coords[n] for n in ids], dtype=np.float64)
+    lat0 = math.radians(float(lonlat[:, 1].mean()))
+    xy = np.stack(
+        [
+            np.radians(lonlat[:, 0]) * EARTH_RADIUS_M * math.cos(lat0),
+            np.radians(lonlat[:, 1]) * EARTH_RADIUS_M,
+        ],
+        axis=1,
+    )
+    return ids, xy
+
+
+def hops_beside(graph: RoadGraph, path: list[int], clearance_m: float, exempt_m: float) -> set[tuple[int, int]]:
+    """Every directed hop touching a node within `clearance_m` of the path's interior.
+
+    The first and last `exempt_m` of the path are not counted: a return leg has
+    to leave the far end and arrive at the start, and the streets it does that
+    on are necessarily beside the outbound one.
+    """
+    import numpy as np
+
+    if len(path) < 2:
+        return set()
+    ids, xy = _local_metres(graph, list(graph.coords))
+    where = {n: i for i, n in enumerate(ids)}
+    path_xy = xy[[where[n] for n in path]]
+    along = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(path_xy, axis=0), axis=1))])
+    interior = (along > exempt_m) & (along < along[-1] - exempt_m)
+    if not interior.any():
+        return set()
+    core = path_xy[interior]
+    near = np.zeros(xy.shape[0], dtype=bool)
+    for start in range(0, xy.shape[0], 4096):
+        block = xy[start : start + 4096]
+        gap = np.sqrt(((block[:, None, :] - core[None, :, :]) ** 2).sum(axis=2)).min(axis=1)
+        near[start : start + 4096] = gap < clearance_m
+    near_nodes = {ids[i] for i in np.nonzero(near)[0]} - set(path)
+    blocked: set[tuple[int, int]] = set()
+    for node in near_nodes:
+        for edge in graph.neighbours(node):
+            blocked.add((node, edge.to))
+            blocked.add((edge.to, node))
+    return blocked
+
+
+def self_proximity(graph: RoadGraph, loop: list[int], clearance_m: float) -> float:
+    """Share of the loop's nodes that sit within `clearance_m` of a non-adjacent part of it."""
+    import numpy as np
+
+    if len(loop) < 4:
+        return 0.0
+    _, xy = _local_metres(graph, loop)
+    along = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))])
+    total = along[-1]
+    gap = np.sqrt(((xy[:, None, :] - xy[None, :, :]) ** 2).sum(axis=2))
+    apart = np.abs(along[:, None] - along[None, :])
+    apart = np.minimum(apart, total - apart)  # the loop closes
+    beside = (gap < clearance_m) & (apart > clearance_m * 3.0)
+    return float(beside.any(axis=1).mean())
+
+
 def find_circuit(
     graph: RoadGraph,
     target_m: float,
@@ -166,6 +233,7 @@ def find_circuit(
     rng: random.Random | None = None,
     tolerance: float = 0.35,
     attempts: int = 200,
+    clearance_m: float = 30.0,
 ) -> list[int]:
     """A closed drivable loop of roughly `target_m`, as a node sequence.
 
@@ -194,6 +262,14 @@ def find_circuit(
             seed = None
             continue
         used = set(zip(outbound, outbound[1:])) | set(zip(outbound[1:], outbound))
+        # The way back may not run beside the way out either. On a dual
+        # carriageway the other carriageway is a different set of hops a few
+        # metres away; a loop out along one and back along the other is legal
+        # but is a there-and-back, and the two legs sit inside each other's
+        # width. Every hop touching a node within `clearance_m` of the
+        # outbound leg (except near its two ends, which the return must
+        # leave and reach) is closed to the return.
+        used |= hops_beside(graph, outbound, clearance_m, exempt_m=clearance_m * 3.0)
         _, back_prev = shortest_paths(graph, far, blocked=used)
         inbound = path_between(back_prev, far, start)
         if len(inbound) < 2:
@@ -201,6 +277,7 @@ def find_circuit(
             continue
         loop = outbound + inbound[1:]
         error = abs(path_length_m(graph, loop) - target_m) / target_m
+        error += self_proximity(graph, loop, clearance_m)
         if error < best_error:
             best, best_error = loop, error
         if best_error <= tolerance:
@@ -248,12 +325,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--length-km", type=float, default=6.0)
     parser.add_argument("--seed", type=int, default=0, help="random seed for the search")
     parser.add_argument("--name", default=None)
+    parser.add_argument("--clearance-m", type=float, default=30.0, help="the return leg keeps this far from the outbound one")
+    parser.add_argument("--attempts", type=int, default=200)
     args = parser.parse_args(argv)
 
     payload = json.loads(args.survey.read_text())
     graph = build_graph(payload)
     print(f"[graph] {graph.node_count} nodes, {graph.edge_count} directed edges")
-    loop = find_circuit(graph, args.length_km * 1000.0, rng=random.Random(args.seed))
+    loop = find_circuit(graph, args.length_km * 1000.0, rng=random.Random(args.seed), attempts=args.attempts, clearance_m=args.clearance_m)
     name = args.name or args.out.stem
     feature = circuit_geojson(graph, loop, name)
     args.out.parent.mkdir(parents=True, exist_ok=True)

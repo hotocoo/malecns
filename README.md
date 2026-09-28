@@ -234,6 +234,54 @@ is earned by oscillating. An exploit detector runs in every generation and flags
 reward above the distance bound, bonus farming, oscillation, teleports, wall
 phasing, spinning and more (see [docs/AUDIT.md](docs/AUDIT.md)).
 
+## Malaysian street (camera driver)
+
+The `malaysia` branch drives a surveyed Kuala Lumpur loop from a camera: each
+car renders its own view, a fine-tuned detector reads it, and the detections
+plus a road profile measured from the pixels are all the brain receives.
+
+```bash
+python3 src/fetch_malaysia_osm.py --buildings                 # roads + footprints (Overpass)
+python3 src/route.py --survey data/tracks/kl_osm_highways.json \
+    --out data/tracks/kl.geojson --length-km 6 --seed 0       # a loop that never runs beside itself
+python3 src/dataset.py --track data/tracks/kl.geojson --frames 9000 --out data/perception/kl
+python3 src/train_detector.py --data data/perception/kl/data.yaml --epochs 14 --imgsz 448 --name kl
+python3 src/calibrate_camera.py --out checkpoints/camera/driver.pt --force   # fit the readout by imitation
+python3 src/train_camera.py --generations 200                                # refine by ES, real street width
+python3 src/live.py --port 8808                                              # camera page; /3d is the city
+```
+
+The street is built as a street (`src/streets.py`): carriageways joined at
+junctions, edge lines that stop where a side road opens, lane dashes cut out
+of every junction, kerbs and pavements on streets that have footways, and a
+per-vertex material the renderer textures (asphalt grain, paving slabs,
+kerbstone, grass, windows). The 3D page draws the very same triangles.
+
+Three things had to be true before the camera driver could learn at all: the
+eye's nearness values are read directly (`eye_encoding="direct"`) rather than
+as lidar distances; progress along the lap is tracked from where the car last
+was, so a route that passes near itself cannot make reward or law jump legs;
+and the motor readout starts from an imitation fit, as it did for Monaco.
+
+What the eye measures matters as much as what the detector finds. Twelve
+columns across a 180 degree view is 15 degrees a column, and a 1.9 m lane
+error at a 10 m aim point is less than one column wide, so the first camera
+eye simply could not see the error it was meant to correct. It now also
+measures, from the same pixels: the carriageway's left and right boundary at
+four rows, and the lane the car sits in - offset and apparent width at six
+rows, plus a heading and a curvature fitted across them - read off the
+painted runs that bracket the frame centre. Steering predictable from the eye
+vector on a teacher run went from R^2 0.20 to 0.29.
+
+The camera eye also has to drive the brain harder than the ray eye does. It
+spreads 143 channels over the visual projection neurons, so each input group
+fires only a couple of spikes in a 16 ms control step, and the difference
+between two channels drowns in the Poisson noise: steering recoverable from
+the descending population measured R^2 0.04 at the ray eye's 300 Hz / 8 mV,
+0.09 at 1200 Hz, and 0.14 at 1200 Hz / 48 mV, falling again by 2400 Hz. A
+camera driver asks for the middle of that range. The
+vehicle is a street car (`car_env.street_car_config`), not the W11.
+
 ## Layout
 
 ```
@@ -245,6 +293,14 @@ src/car_env.py         batched W11 driving environment on rasterised tracks
 src/agent.py           lidar -> visual neurons -> descending neurons -> controls
 src/teacher.py         linear lidar teacher used to calibrate the readout
 src/calibrate.py       imitation + DAgger fit of the readout -> ES checkpoint
+src/streets.py         street geometry from the survey: junction unions, kerbs, pavements, paint, materials
+src/scene.py           road, network, buildings, signals, signs, traffic actors for the camera
+src/camera.py          offscreen renderer (moderngl) with per-material surface textures
+src/perceive.py        detector + road profile, carriageway edges and lane geometry -> the brain's view
+src/route.py           closed drivable loop on the surveyed road graph (return leg kept clear of the outbound)
+src/calibrate_camera.py imitation fit of the camera driver's readout (LaneTeacher + DART)
+src/train_camera.py    ES over the camera driver on the surveyed street, traffic/event curriculum
+src/live.py            camera page + 3D city (/3d, /world.bin) for the street driver
 src/train.py           headless ES loop: curriculum, eval, telemetry, checkpoints
 src/evaluate.py        long-horizon runs, all starts, stress suite, recording
 src/diagnose.py        controlled-stimulus neural diagnostics with verdicts
@@ -322,3 +378,144 @@ Connectome data: MaleCNS v1.0, HHMI Janelia FlyEM with the University of
 Cambridge, MRC LMB and Google Research, CC-BY 4.0. Nothing in `data/raw` or
 `data/graph*` is redistributed here; `src/download.py` fetches it from the
 official bucket.
+
+## Trading System
+
+The MaleCNS connectome can also be trained to trade financial markets. The trading system uses a realistic market simulation with geometric Brownian motion price dynamics, stochastic volatility, order book spread dynamics, and multiple market regimes.
+
+### Architecture
+
+- **Trading Environment** (`src/trading_env.py`): Simulates a financial market with GBM price dynamics, Heston-like stochastic volatility, regime switching (trending up/down, mean-reverting, high volatility), realistic transaction costs (spread, slippage, commissions), and technical indicators (RSI, MACD, Bollinger Bands, ATR).
+
+- **Trading Agent** (`src/trading_agent.py`): Maps market observations (price features, indicators, position, risk metrics) to the brain's visual projection neurons and reads trade decisions from the descending neurons. The brain's steering output is mapped to buy/sell decisions and the throttle output to position size.
+
+- **Training** (`src/train_trading.py`): Evolutionary strategy training that maintains a population of parameter variants, evaluates each on multiple market episodes, selects the best, and mutates to create the next generation.
+
+- **Trading Viewer** (`src/trading_viewer.py`): Live web dashboard with real-time price charts, 3D brain visualization, order book, portfolio metrics, technical indicators, and trade log.
+
+### Quick Start
+
+```bash
+# Train the trading agent
+./run_trading.sh train --population 32 --generations 1000
+
+# View the trading agent live
+./run_trading.sh view
+# Open http://127.0.0.1:8766/trading.html
+
+# Quick test
+./run_trading.sh test
+```
+
+### Market Simulation Features
+
+- **Price Dynamics**: Geometric Brownian Motion with stochastic volatility (Heston-like)
+- **Market Regimes**: Trending up, trending down, mean-reverting, high volatility (Markov chain switching)
+- **Order Book**: Dynamic bid-ask spread that widens with volatility
+- **Transaction Costs**: Spread, slippage, and per-trade commissions
+- **Technical Indicators**: RSI(14), MACD(12,26,9), Bollinger Bands(20,2), ATR(14)
+- **Risk Management**: Max drawdown limit, position sizing
+- **Performance Metrics**: Sharpe ratio, Sortino ratio, Calmar ratio, win rate, profit factor
+
+### Trading Dashboard
+
+The premium luxury trading dashboard at `http://127.0.0.1:8766/trading.html` features:
+
+- **3D Connectome Visualization**: Real-time brain activity as a rotatable 3D point cloud (166,700 neurons) with activity-based color coding
+- **Price Charts**: Real-time price action and equity curve charts
+- **Order Book**: Simulated bid/ask depth visualization
+- **Portfolio Panel**: Position, cash, drawdown, and trade count
+- **Performance Metrics**: Sharpe, Sortino, Calmar, win rate, profit factor, volatility
+- **Technical Indicators**: RSI gauge, MACD value, Bollinger Band position, ATR
+- **Market Regime Indicator**: Current market regime display
+- **Trade Log**: Real-time trade history
+
+### Financial Research Basis
+
+The trading system is based on established financial research:
+
+- **Geometric Brownian Motion**: Standard model for stock price dynamics (Black-Scholes framework)
+- **Stochastic Volatility**: Heston model-inspired volatility dynamics
+- **Technical Analysis**: RSI (Welles Wilder), MACD (Gerald Appel), Bollinger Bands (John Bollinger), ATR
+- **Risk Metrics**: Sharpe ratio (William Sharpe), Sortino ratio, Calmar ratio
+- **Market Microstructure**: Order book dynamics, spread modeling, slippage
+
+## Real-Time Trading (Live Markets)
+
+The MaleCNS can trade real markets in real-time through broker APIs.
+
+### Supported Brokers
+
+- **OANDA v20** (Forex): Free practice account, WebSocket streaming, REST API
+- **eToro** (CFDs/Forex/Crypto): Via etoropy SDK
+
+### Quick Start (OANDA Forex)
+
+1. Create a free practice account: https://practice-oanda.com
+2. Generate an API token in your account settings
+3. Set environment variables:
+   ```bash
+   export OANDA_ACCESS_TOKEN='your_api_token_here'
+   export OANDA_ACCOUNT_ID='your_account_id_here'
+   ```
+4. Start trading:
+   ```bash
+   # Paper trading (safe, no real money)
+   ./run_realtime_trading.sh oanda --instrument EUR_USD --paper
+
+   # Multiple instruments
+   ./run_realtime_trading.sh oanda --instruments EUR_USD,GBP_USD,USD_JPY --paper
+
+   # Live trading (real money - use caution!)
+   ./run_realtime_trading.sh oanda --instrument EUR_USD --live
+   ```
+
+### Risk Management
+
+The system includes built-in risk management:
+
+- **Risk per trade**: Default 1% of account balance
+- **Stop loss**: Default 2% (automatic position close)
+- **Take profit**: Default 4% (automatic position close)
+- **Max positions**: Default 3 simultaneous positions
+- **Position sizing**: Calculated based on account balance and risk settings
+
+### Trading Strategy
+
+The MaleCNS brain processes real-time price data and makes trading decisions:
+
+- **Input**: Real-time prices, price changes, technical indicators
+- **Processing**: 166,700-neuron fly brain with learned trading policy
+- **Output**: Buy/sell/hold decisions with position sizing
+
+### Profitability
+
+To maximize profitability:
+
+1. **Train the brain first**: Run `./run_trading.sh train` for at least 1000 generations
+2. **Start with paper trading**: Test the strategy without risk
+3. **Use conservative risk settings**: Start with 0.5% risk per trade
+4. **Monitor performance**: Track win rate, Sharpe ratio, max drawdown
+5. **Optimize parameters**: Adjust stop loss, take profit, and risk settings
+
+### eToro Trading
+
+```bash
+export ETORO_ACCESS_TOKEN='your_etoro_api_token'
+./run_realtime_trading.sh etoro --instrument BTCUSD --paper
+```
+
+### Real-Time Dashboard
+
+While trading, open the dashboard to monitor the brain and positions:
+
+```bash
+./run_trading.sh view
+# Open http://127.0.0.1:8766/trading.html
+```
+
+### Disclaimer
+
+Trading involves risk. Past performance does not guarantee future results.
+Always start with paper trading before using real money. The MaleCNS trading
+system is provided as-is without warranty.
