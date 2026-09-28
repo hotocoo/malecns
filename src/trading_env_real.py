@@ -172,7 +172,7 @@ class RealTradingEnvironment:
                     losses.append(-change)
             avg_gain = np.mean(gains) if gains else 0
             avg_loss = np.mean(losses) if losses else 0.0001
-            rs = avg_gain / avg_loss
+            rs = avg_gain / avg_loss if avg_loss > 0 else 1.0
             obs[f"{asset}_rsi"] = 100 - (100 / (1 + rs))
 
         equity = self.cash + sum(
@@ -247,7 +247,7 @@ class RealTradingEnvironment:
         current_value = self.positions[asset] * self.prices_now[asset]
         available = min(equity * fraction, max_position - current_value)
 
-        if available > 0 and self.cash > 0:
+        if available > 0 and self.cash > 0 and self.prices_now[asset] > 0:
             shares = available / self.prices_now[asset]
             cost = shares * self.prices_now[asset]
             commission = cost * cfg.commission_rate

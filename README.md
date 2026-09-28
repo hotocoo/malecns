@@ -498,6 +498,26 @@ To maximize profitability:
 4. **Monitor performance**: Track win rate, Sharpe ratio, max drawdown
 5. **Optimize parameters**: Adjust stop loss, take profit, and risk settings
 
+### Training Improvements (2026-09-22)
+
+The training system has been improved with:
+
+- **Early stopping**: Training stops when validation performance stagnates (configurable patience)
+- **Overfitting prevention**: Train/test split with validation on unseen data every N generations
+- **Real market training**: `train_trading_real.py` trains on actual historical market data (SPY, QQQ, IWM)
+- **Adaptive mutation**: Mutation strength increases when stagnating, decreases when improving
+- **Multi-objective fitness**: Optimizes for return + Sharpe ratio - drawdown - trading costs
+
+```bash
+# Train on real market data with early stopping
+python3 src/train_trading_real.py --population 32 --generations 100000 --early-stop-patience 100
+
+# Train on simulated market with early stopping
+python3 src/train_trading_v2.py --population 48 --generations 2000 --early-stop-patience 200
+```
+
+See [docs/agent_work.md](docs/agent_work.md) for detailed documentation of all fixes and improvements.
+
 ### eToro Trading
 
 ```bash

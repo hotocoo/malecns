@@ -19,7 +19,18 @@ OBS_FEATURES = [
     "volatility",
 ]
 
+REAL_OBS_FEATURES = [
+    "SPY_price_change", "QQQ_price_change", "IWM_price_change",
+    "SPY_position", "QQQ_position", "IWM_position",
+    "SPY_avg_price", "QQQ_avg_price", "IWM_avg_price",
+    "SPY_sma_20", "QQQ_sma_20", "IWM_sma_20",
+    "SPY_rsi", "QQQ_rsi", "IWM_rsi",
+    "cash_pct", "equity", "drawdown",
+    "SPY_sma_20",  # duplicate to fill 18 slots (brain expects 19 inputs = 18 + constant)
+]
+
 N_OBS = len(OBS_FEATURES)
+N_REAL_OBS = len(REAL_OBS_FEATURES)
 
 
 class TradingAgent:
@@ -32,10 +43,13 @@ class TradingAgent:
         device: str = "auto",
         agent_config: AgentConfig | None = None,
         trading_config: TradingConfig | None = None,
+        obs_features: list[str] | None = None,
     ):
         self.device = pick_device(device)
         self.agent_config = agent_config or AgentConfig()
         self.trading_config = trading_config or TradingConfig()
+        self.obs_features = obs_features or OBS_FEATURES
+        self.n_obs = len(self.obs_features)
 
         connectome = load_connectome(graph_dir)
         self.brain = Brain(connectome, batch=1, config=LIFConfig(), device=self.device)
@@ -47,8 +61,8 @@ class TradingAgent:
         if checkpoint:
             self.load_checkpoint(checkpoint)
 
-        self.obs_mean = np.zeros(N_OBS)
-        self.obs_std = np.ones(N_OBS)
+        self.obs_mean = np.zeros(self.n_obs)
+        self.obs_std = np.ones(self.n_obs)
         self.n_obs_samples = 0
 
         self.env = TradingEnvironment(self.trading_config)
@@ -88,7 +102,7 @@ class TradingAgent:
         torch.save(state, path)
 
     def _obs_to_tensor(self, obs: dict) -> torch.Tensor:
-        features = np.array([obs[f] for f in OBS_FEATURES], dtype=np.float64)
+        features = np.array([obs[f] for f in self.obs_features], dtype=np.float64)
         self.n_obs_samples += 1
         alpha = 1.0 / self.n_obs_samples
         self.obs_mean = (1 - alpha) * self.obs_mean + alpha * features

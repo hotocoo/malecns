@@ -123,6 +123,7 @@ def main():
     parser.add_argument("--log-interval", type=int, default=5, help="Log every N generations")
     parser.add_argument("--save-interval", type=int, default=25, help="Save checkpoint every N generations")
     parser.add_argument("--stagnation-window", type=int, default=50, help="Generations to detect stagnation")
+    parser.add_argument("--early-stop-patience", type=int, default=200, help="Early stopping patience (generations without improvement)")
     args = parser.parse_args()
 
     device = pick_device(args.device or "auto")
@@ -278,6 +279,11 @@ def main():
                 "best_fitness": best_fitness,
                 "best_return": best_return,
             })
+
+        # Early stopping
+        if stagnation_counter > args.early_stop_patience:
+            print(f"\nEarly stopping at generation {gen} (no improvement for {stagnation_counter} generations)")
+            break
 
         generation = gen + 1
 
