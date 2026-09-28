@@ -44,6 +44,7 @@ class TradingAgent:
         agent_config: AgentConfig | None = None,
         trading_config: TradingConfig | None = None,
         obs_features: list[str] | None = None,
+        connectome=None,
     ):
         self.device = pick_device(device)
         self.agent_config = agent_config or AgentConfig()
@@ -51,7 +52,8 @@ class TradingAgent:
         self.obs_features = obs_features or OBS_FEATURES
         self.n_obs = len(self.obs_features)
 
-        connectome = load_connectome(graph_dir)
+        if connectome is None:
+            connectome = load_connectome(graph_dir)
         self.brain = Brain(connectome, batch=1, config=LIFConfig(), device=self.device)
         self.agent = ConnectomeAgent(self.brain, connectome.neurons, self.agent_config)
         self.theta = self.agent.unpack(self.agent.initial_params().unsqueeze(0))

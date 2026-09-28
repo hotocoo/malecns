@@ -51,7 +51,7 @@ def compute_fitness(metrics):
     )
 
 
-def evaluate_agent(agent, env, n_episodes=5, seed=0, train=True):
+def evaluate_agent(agent, n_episodes=5, seed=0, train=True, market_data=None):
     """Evaluate an agent over multiple episodes."""
     rng = np.random.default_rng(seed)
     total_fitness = 0.0
@@ -65,7 +65,10 @@ def evaluate_agent(agent, env, n_episodes=5, seed=0, train=True):
 
     for ep in range(n_episodes):
         ep_seed = seed * 1000 + ep
-        new_env = RealTradingEnvironment(seed=ep_seed)
+        if market_data is not None:
+            new_env = RealTradingEnvironment(seed=ep_seed, data=market_data)
+        else:
+            new_env = RealTradingEnvironment(seed=ep_seed)
         if not train:
             new_env.config = RealTradingConfig(
                 data_file=new_env.config.data_file,
@@ -161,10 +164,19 @@ def main():
         device=device,
         agent_config=agent_cfg,
         obs_features=REAL_OBS_FEATURES,
+        connectome=connectome,
     )
 
-    # Create validation environment
-    val_env = RealTradingEnvironment()
+    # Load market data once and reuse
+    print("Loading market data...")
+    initial_env = RealTradingEnvironment()
+    market_data = {
+        "dates": initial_env.dates,
+        "prices": initial_env.prices,
+        "volumes": initial_env.volumes,
+        "n_days": initial_env.n_days,
+    }
+    del initial_env
 
     log_path = LOG_DIR / "train_trading_real.jsonl"
     log_file = open(log_path, "a")
@@ -201,6 +213,7 @@ def main():
                 device=device,
                 agent_config=agent_cfg,
                 obs_features=REAL_OBS_FEATURES,
+                connectome=connectome,
             )
 
             if i == 0:
@@ -212,7 +225,7 @@ def main():
                         noise = torch.distributions.cauchy.Cauchy(0, 1).sample(agent.theta[name].shape).to(agent.theta[name].device)
                         agent.theta[name] = agent.theta[name] + noise * mutation_strength
 
-            fitness = evaluate_agent(agent, val_env, n_episodes=args.episodes, seed=gen * 100 + i, train=True)
+            fitness = evaluate_agent(agent, n_episodes=args.episodes, seed=gen * 100 + i, train=True, market_data=market_data)
             population.append((fitness, agent.theta))
             del agent
 
@@ -246,9 +259,10 @@ def main():
                 device=device,
                 agent_config=agent_cfg,
                 obs_features=REAL_OBS_FEATURES,
+                connectome=connectome,
             )
             val_agent.theta = {k: v.clone() for k, v in best_theta.items()}
-            val_fitness = evaluate_agent(val_agent, val_env, n_episodes=args.episodes, seed=gen * 1000, train=False)
+            val_fitness = evaluate_agent(val_agent, n_episodes=args.episodes, seed=gen * 1000, train=False, market_data=market_data)
             del val_agent
 
             if val_fitness["fitness"] > best_val_fitness:

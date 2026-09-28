@@ -32,10 +32,16 @@ class RealTradingConfig:
 class RealTradingEnvironment:
     """Trading environment using real historical market data."""
 
-    def __init__(self, config=None, seed=None):
+    def __init__(self, config=None, seed=None, data=None):
         self.config = config or RealTradingConfig()
         self.rng = np.random.default_rng(seed)
-        self._load_data()
+        if data is not None:
+            self.dates = data["dates"]
+            self.prices = data["prices"]
+            self.volumes = data["volumes"]
+            self.n_days = data["n_days"]
+        else:
+            self._load_data()
         self.reset()
 
     def _load_data(self):
