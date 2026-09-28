@@ -405,6 +405,8 @@ class RealTimeTradingEngine:
 
     def calculate_position_size(self, price: float) -> float:
         """Calculate position size based on risk per trade."""
+        if price <= 0:
+            return 0.0
         balance = self.broker.get_account_balance()
         risk_amount = balance * self.risk_per_trade
         # For Forex, 1 standard lot = 100,000 units

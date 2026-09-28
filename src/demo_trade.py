@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from trading_agent import TradingAgent
 from trading_env import TradingConfig
-from demo_broker import DemoBroker
+from real_broker import RealBroker
 from realtime_trading import RealTimeTradingEngine, Order, OrderSide
 
 
@@ -34,8 +34,8 @@ def main():
         latest = None
         print("No checkpoint found, using default brain")
 
-    # Initialize demo broker
-    broker = DemoBroker()
+    # Initialize real broker
+    broker = RealBroker()
     broker.connect()
     print()
 
@@ -43,10 +43,10 @@ def main():
     engine = RealTimeTradingEngine(
         broker=broker,
         graph_dir="data/graph_w5",
-        instruments=["EUR_USD", "GBP_USD"],
+        instruments=["SPY", "QQQ", "AAPL"],
         device="cpu",
         risk_per_trade=0.01,
-        max_positions=2,
+        max_positions=3,
         stop_loss_pct=0.02,
         take_profit_pct=0.04,
         checkpoint=str(latest) if latest else None,
@@ -69,7 +69,7 @@ def main():
         for inst, price in prices.items():
             engine.on_price_update({inst: price})
 
-    broker.stream_prices(["EUR_USD", "GBP_USD"], on_price)
+    broker.stream_prices(["SPY", "QQQ", "AAPL"], on_price)
 
     while time.time() - start_time < duration:
         time.sleep(1)
