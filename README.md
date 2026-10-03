@@ -35,7 +35,7 @@ python3 src/verify_laps.py                       # lap gate: every start must la
 python3 src/evaluate.py --suite --plot run.png   # long-horizon + stress tracks
 python3 src/diagnose.py --plot logs/diag.png     # does vision produce avoidance?
 python3 src/exploits.py --log logs/train.jsonl   # reward-hacking scan of a run
-python3 -m pytest tests -q                       # 102 tests
+python3 -m pytest tests -q                       # 427 tests
 ```
 
 ## Watching it
