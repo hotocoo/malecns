@@ -494,6 +494,10 @@ class RealTimeTradingEngine:
         self.balance_history = []
         self.total_mae = 0.0
         self.total_mfe = 0.0
+        self.best_trade_pnl = 0.0
+        self.worst_trade_pnl = 0.0
+        self.best_trade_instrument = ""
+        self.worst_trade_instrument = ""
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -1483,6 +1487,14 @@ class RealTimeTradingEngine:
             
             # Calculate expectancy
             expectancy = self.total_pnl / max(self.trade_count, 1)
+            
+            # Track best and worst trades
+            if pnl > self.best_trade_pnl:
+                self.best_trade_pnl = pnl
+                self.best_trade_instrument = instrument
+            if pnl < self.worst_trade_pnl:
+                self.worst_trade_pnl = pnl
+                self.worst_trade_instrument = instrument
             
             print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak}, PF: {profit_factor:.2f}, Avg duration: {avg_duration/60:.1f}min, Avg MAE: {avg_mae:.5f}, Avg MFE: {avg_mfe:.5f}, Expectancy: {expectancy:.2f})")
             if self.use_risk_parity and self.risk_parity_sizer:
