@@ -812,6 +812,19 @@ class RealTimeTradingEngine:
                                 self._close_position(instrument, pos["units"])
                                 return
 
+                # Time-based exit: close position if held too long without profit
+                entry_time = pos.get("entry_time", time.time())
+                hold_time = time.time() - entry_time
+                if hold_time > 3600:  # 1 hour
+                    if side == "buy":
+                        pnl_pct = (price - entry_price) / entry_price
+                    else:
+                        pnl_pct = (entry_price - price) / entry_price
+                    if pnl_pct < 0.005:  # Less than 0.5% profit
+                        print(f"TIME EXIT: {instrument} held {int(hold_time/60)}min with {pnl_pct*100:.2f}% profit")
+                        self._close_position(instrument, pos["units"])
+                        return
+
                 if side == "buy":
                     pnl_pct = (price - entry_price) / entry_price
                     
@@ -984,6 +997,7 @@ class RealTimeTradingEngine:
                         "side": "buy",
                         "order_id": result.order_id,
                         "trailing_stop": price * (1 - self.trailing_stop_pct) if self.use_trailing_stop else None,
+                        "entry_time": time.time(),
                     }
                     self.trade_count += 1
                     if self.use_risk_parity and self.risk_parity_sizer:
@@ -1015,6 +1029,7 @@ class RealTimeTradingEngine:
                         "side": "sell",
                         "order_id": result.order_id,
                         "trailing_stop": price * (1 + self.trailing_stop_pct) if self.use_trailing_stop else None,
+                        "entry_time": time.time(),
                     }
                     self.trade_count += 1
                     if self.use_risk_parity and self.risk_parity_sizer:
