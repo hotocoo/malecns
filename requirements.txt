@@ -4,3 +4,6 @@ pandas>=2.2
 pyarrow>=15
 matplotlib>=3.8
 pytest>=8
+yfinance>=0.2.40
+requests>=2.31
+websocket-client>=1.7
