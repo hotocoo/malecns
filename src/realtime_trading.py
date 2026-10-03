@@ -470,7 +470,10 @@ class RealTimeTradingEngine:
     def on_price_update(self, prices: dict[str, float]):
         """Handle real-time price updates."""
         for instrument, price in prices.items():
-            self._process_instrument(instrument, price)
+            try:
+                self._process_instrument(instrument, price)
+            except Exception as e:
+                print(f"Error processing {instrument}: {e}")
 
     def _process_instrument(self, instrument: str, price: float):
         """Process trading logic for one instrument."""
