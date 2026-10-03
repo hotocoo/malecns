@@ -674,6 +674,15 @@ class RealTimeTradingEngine:
                 else:
                     profit_factor_by_session[session] = float('inf') if session_wins > 0 else 0.0
             
+            # Calculate win rate by session
+            win_rate_by_session = {}
+            for session, trades in self.trades_by_session.items():
+                if trades:
+                    session_win_count = sum(1 for t in trades if t[2] > 0)
+                    win_rate_by_session[session] = session_win_count / len(trades)
+                else:
+                    win_rate_by_session[session] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -698,6 +707,7 @@ class RealTimeTradingEngine:
                 "avg_loss": avg_loss,
                 "payoff_ratio": payoff_ratio,
                 "profit_factor_by_session": profit_factor_by_session,
+                "win_rate_by_session": win_rate_by_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
