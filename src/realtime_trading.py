@@ -780,6 +780,16 @@ class RealTimeTradingEngine:
                 else:
                     profit_factor_by_day[day] = 0.0
             
+            # Calculate win rate by day of week
+            win_rate_by_day = {}
+            for day in range(7):
+                day_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 86400 % 7 == day]
+                if day_trades:
+                    day_win_count = sum(1 for t in day_trades if t[2] > 0)
+                    win_rate_by_day[day] = day_win_count / len(day_trades)
+                else:
+                    win_rate_by_day[day] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -813,6 +823,7 @@ class RealTimeTradingEngine:
                 "win_rate_by_hour": win_rate_by_hour,
                 "avg_duration_by_hour": avg_duration_by_hour,
                 "profit_factor_by_day": profit_factor_by_day,
+                "win_rate_by_day": win_rate_by_day,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
