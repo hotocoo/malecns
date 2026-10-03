@@ -484,6 +484,10 @@ class RealTimeTradingEngine:
         self.last_correlation_check = 0.0
         self.daily_start_balance = 0.0
         self.daily_pnl = 0.0
+        self.win_streak = 0
+        self.loss_streak = 0
+        self.max_win_streak = 0
+        self.max_loss_streak = 0
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -1330,7 +1334,16 @@ class RealTimeTradingEngine:
             self.total_pnl += pnl
             if pnl > 0:
                 self.win_count += 1
-            print(f"Closed {instrument}: P&L = {pnl:.2f} USD")
+                self.win_streak += 1
+                self.loss_streak = 0
+                if self.win_streak > self.max_win_streak:
+                    self.max_win_streak = self.win_streak
+            else:
+                self.loss_streak += 1
+                self.win_streak = 0
+                if self.loss_streak > self.max_loss_streak:
+                    self.max_loss_streak = self.loss_streak
+            print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak})")
             if self.use_risk_parity and self.risk_parity_sizer:
                 self.risk_parity_sizer.remove_position(instrument)
 
