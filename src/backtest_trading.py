@@ -157,6 +157,7 @@ def main():
     parser.add_argument("--stop-loss", type=float, default=0.02, help="Stop loss pct")
     parser.add_argument("--take-profit", type=float, default=0.04, help="Take profit pct")
     parser.add_argument("--sweep", action="store_true", help="Sweep risk parameters (0.5%, 1%, 2%, 3%)")
+    parser.add_argument("--sltp-sweep", action="store_true", help="Sweep SL/TP ratios (1:1, 1:2, 1:3, 1:4)")
     parser.add_argument("--output", default=None, help="Export results to CSV file")
     parser.add_argument("--periods", default=None, help="Comma-separated periods to test (e.g., 1mo,3mo,6mo)")
     args = parser.parse_args()
@@ -177,6 +178,12 @@ def main():
     else:
         risk_levels = [args.risk]
     
+    # Determine SL/TP ratios to test
+    if args.sltp_sweep:
+        sltp_ratios = [(0.01, 0.01), (0.01, 0.02), (0.01, 0.03), (0.01, 0.04)]
+    else:
+        sltp_ratios = [(args.stop_loss, args.take_profit)]
+    
     # Determine periods to test
     if args.periods:
         periods = args.periods.split(",")
@@ -186,7 +193,7 @@ def main():
     # Collect results for CSV export
     all_results = []
     
-    # Run backtest for each instrument, period, and risk level
+    # Run backtest for each instrument, period, risk, and SL/TP
     for instrument in instruments:
         for period in periods:
             print(f"\n{'=' * 50}")
@@ -198,31 +205,35 @@ def main():
                 continue
             
             for risk in risk_levels:
-                results = run_backtest(
-                    agent, df, instrument,
-                    risk_per_trade=risk,
-                    stop_loss_pct=args.stop_loss,
-                    take_profit_pct=args.take_profit,
-                )
-                
-                risk_label = f" (risk={risk*100:.1f}%)" if args.sweep else ""
-                print(f"\nResults for {instrument} ({period}){risk_label}:")
-                print(f"  Total Return:  {results['total_return']*100:.2f}%")
-                print(f"  Final Equity:  ${results['final_equity']:,.2f}")
-                print(f"  Number of Trades: {results['num_trades']}")
-                print(f"  Win Rate:      {results['win_rate']*100:.1f}%")
-                print(f"  Max Drawdown:  {results['max_drawdown']*100:.2f}%")
-                
-                all_results.append({
-                    "instrument": instrument,
-                    "period": period,
-                    "risk": risk,
-                    "total_return": results["total_return"],
-                    "final_equity": results["final_equity"],
-                    "num_trades": results["num_trades"],
-                    "win_rate": results["win_rate"],
-                    "max_drawdown": results["max_drawdown"],
-                })
+                for sl, tp in sltp_ratios:
+                    results = run_backtest(
+                        agent, df, instrument,
+                        risk_per_trade=risk,
+                        stop_loss_pct=sl,
+                        take_profit_pct=tp,
+                    )
+                    
+                    risk_label = f" (risk={risk*100:.1f}%)" if args.sweep else ""
+                    sltp_label = f" (SL={sl*100:.0f}%/TP={tp*100:.0f}%)" if args.sltp_sweep else ""
+                    print(f"\nResults for {instrument} ({period}){risk_label}{sltp_label}:")
+                    print(f"  Total Return:  {results['total_return']*100:.2f}%")
+                    print(f"  Final Equity:  ${results['final_equity']:,.2f}")
+                    print(f"  Number of Trades: {results['num_trades']}")
+                    print(f"  Win Rate:      {results['win_rate']*100:.1f}%")
+                    print(f"  Max Drawdown:  {results['max_drawdown']*100:.2f}%")
+                    
+                    all_results.append({
+                        "instrument": instrument,
+                        "period": period,
+                        "risk": risk,
+                        "stop_loss": sl,
+                        "take_profit": tp,
+                        "total_return": results["total_return"],
+                        "final_equity": results["final_equity"],
+                        "num_trades": results["num_trades"],
+                        "win_rate": results["win_rate"],
+                        "max_drawdown": results["max_drawdown"],
+                    })
     
     # Export to CSV if requested
     if args.output and all_results:
