@@ -708,6 +708,18 @@ class RealTimeTradingEngine:
                     else:
                         profit_factor_by_inst_by_session[session][inst] = 0.0
             
+            # Calculate win rate by instrument by session
+            win_rate_by_inst_by_session = {}
+            for session, trades in self.trades_by_session.items():
+                win_rate_by_inst_by_session[session] = {}
+                for inst in self.instruments:
+                    inst_trades = [t for t in trades if t[0] == inst]
+                    if inst_trades:
+                        inst_win_count = sum(1 for t in inst_trades if t[2] > 0)
+                        win_rate_by_inst_by_session[session][inst] = inst_win_count / len(inst_trades)
+                    else:
+                        win_rate_by_inst_by_session[session][inst] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -735,6 +747,7 @@ class RealTimeTradingEngine:
                 "win_rate_by_session": win_rate_by_session,
                 "avg_duration_by_session": avg_duration_by_session,
                 "profit_factor_by_inst_by_session": profit_factor_by_inst_by_session,
+                "win_rate_by_inst_by_session": win_rate_by_inst_by_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
