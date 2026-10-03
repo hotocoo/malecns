@@ -421,6 +421,11 @@ class RealTimeTradingEngine:
         use_trailing_stop: bool = True,
         trailing_stop_pct: float = 0.01,  # 1% trailing stop
         volatility_adjusted_sizing: bool = True,
+        use_break_even: bool = True,
+        break_even_trigger_pct: float = 0.01,  # Move SL to BE when 1% profit
+        use_partial_profit: bool = True,
+        partial_profit_pct: float = 0.02,      # Close 50% at 2% profit
+        partial_profit_fraction: float = 0.5,  # Close 50% of position
     ):
         self.broker = broker
         self.graph_dir = graph_dir
@@ -434,6 +439,11 @@ class RealTimeTradingEngine:
         self.use_trailing_stop = use_trailing_stop
         self.trailing_stop_pct = trailing_stop_pct
         self.volatility_adjusted_sizing = volatility_adjusted_sizing
+        self.use_break_even = use_break_even
+        self.break_even_trigger_pct = break_even_trigger_pct
+        self.use_partial_profit = use_partial_profit
+        self.partial_profit_pct = partial_profit_pct
+        self.partial_profit_fraction = partial_profit_fraction
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -609,8 +619,28 @@ class RealTimeTradingEngine:
 
                 if side == "buy":
                     pnl_pct = (price - entry_price) / entry_price
-                    if pnl_pct <= -self.stop_loss_pct:
-                        print(f"STOP LOSS: {instrument} at {price:.5f}")
+                    
+                    # Break-even stop: move SL to entry when profit reaches trigger
+                    if self.use_break_even and pnl_pct >= self.break_even_trigger_pct:
+                        if not pos.get("break_even_set", False):
+                            pos["break_even_set"] = True
+                            print(f"BREAK-EVEN: {instrument} SL moved to {entry_price:.5f}")
+                    
+                    # Partial profit taking: close fraction at target
+                    if self.use_partial_profit and pnl_pct >= self.partial_profit_pct:
+                        if not pos.get("partial_taken", False):
+                            pos["partial_taken"] = True
+                            partial_units = pos["units"] * self.partial_profit_fraction
+                            print(f"PARTIAL PROFIT: {instrument} closing {partial_units:.0f} units at {price:.5f}")
+                            self._close_position(instrument, partial_units)
+                            pos["units"] -= partial_units
+                            return
+                    
+                    # Stop loss (or break-even if set)
+                    sl_price = entry_price if pos.get("break_even_set", False) else entry_price * (1 - self.stop_loss_pct)
+                    if price <= sl_price:
+                        reason = "BREAK-EVEN STOP" if pos.get("break_even_set", False) else "STOP LOSS"
+                        print(f"{reason}: {instrument} at {price:.5f}")
                         self._close_position(instrument, pos["units"])
                         return
                     elif pnl_pct >= self.take_profit_pct:
@@ -619,8 +649,28 @@ class RealTimeTradingEngine:
                         return
                 else:  # sell
                     pnl_pct = (entry_price - price) / entry_price
-                    if pnl_pct <= -self.stop_loss_pct:
-                        print(f"STOP LOSS: {instrument} at {price:.5f}")
+                    
+                    # Break-even stop: move SL to entry when profit reaches trigger
+                    if self.use_break_even and pnl_pct >= self.break_even_trigger_pct:
+                        if not pos.get("break_even_set", False):
+                            pos["break_even_set"] = True
+                            print(f"BREAK-EVEN: {instrument} SL moved to {entry_price:.5f}")
+                    
+                    # Partial profit taking: close fraction at target
+                    if self.use_partial_profit and pnl_pct >= self.partial_profit_pct:
+                        if not pos.get("partial_taken", False):
+                            pos["partial_taken"] = True
+                            partial_units = pos["units"] * self.partial_profit_fraction
+                            print(f"PARTIAL PROFIT: {instrument} closing {partial_units:.0f} units at {price:.5f}")
+                            self._close_position(instrument, partial_units)
+                            pos["units"] -= partial_units
+                            return
+                    
+                    # Stop loss (or break-even if set)
+                    sl_price = entry_price if pos.get("break_even_set", False) else entry_price * (1 + self.stop_loss_pct)
+                    if price >= sl_price:
+                        reason = "BREAK-EVEN STOP" if pos.get("break_even_set", False) else "STOP LOSS"
+                        print(f"{reason}: {instrument} at {price:.5f}")
                         self._close_position(instrument, pos["units"])
                         return
                     elif pnl_pct >= self.take_profit_pct:
