@@ -47,6 +47,7 @@ from correlation import CorrelationAnalyzer
 from multi_timeframe import MultiTimeframeAnalyzer
 from risk_parity import RiskParitySizer
 from drawdown_protection import DrawdownProtection
+from market_regime import MarketRegimeDetector
 
 
 # --- Order Types ---
@@ -439,6 +440,7 @@ class RealTimeTradingEngine:
         use_multi_timeframe: bool = True,
         use_risk_parity: bool = True,
         use_drawdown_protection: bool = True,
+        use_market_regime: bool = True,
     ):
         self.broker = broker
         self.graph_dir = graph_dir
@@ -474,6 +476,8 @@ class RealTimeTradingEngine:
         ) if use_risk_parity else None
         self.use_drawdown_protection = use_drawdown_protection
         self.drawdown_protection = None  # Initialized after broker connection
+        self.use_market_regime = use_market_regime
+        self.regime_detector = MarketRegimeDetector() if use_market_regime else None
         self.last_rebalance_check = 0.0
 
         # Trading state
@@ -697,6 +701,14 @@ class RealTimeTradingEngine:
             except Exception as e:
                 print(f"Drawdown protection error: {e}")
         
+        # Adjust for market regime
+        if self.use_market_regime and self.regime_detector and instrument:
+            try:
+                regime_factor = self.regime_detector.get_position_adjustment(instrument)
+                position_size *= regime_factor
+            except Exception as e:
+                print(f"Market regime error: {e}")
+        
         return min(position_size, 100000)  # Max 1 standard lot
 
     def on_price_update(self, prices: dict[str, float]):
@@ -721,6 +733,11 @@ class RealTimeTradingEngine:
         # Update risk parity sizer
         if self.use_risk_parity and self.risk_parity_sizer:
             self.risk_parity_sizer.update_prices(prices)
+        
+        # Update market regime detector
+        if self.use_market_regime and self.regime_detector:
+            for instrument, price in prices.items():
+                self.regime_detector.update_price(instrument, price)
         
         # Auto-rebalancing check (every 60 seconds)
         if self.use_risk_parity and self.risk_parity_sizer:
@@ -904,6 +921,14 @@ class RealTimeTradingEngine:
             effective_sl = self.stop_loss_pct
             if self.use_drawdown_protection and self.drawdown_protection:
                 effective_sl = self.drawdown_protection.get_adjusted_stop_loss(self.stop_loss_pct)
+            
+            # Adjust stop loss for market regime
+            if self.use_market_regime and self.regime_detector and instrument:
+                try:
+                    regime_sl_factor = self.regime_detector.get_stop_loss_adjustment(instrument)
+                    effective_sl *= regime_sl_factor
+                except Exception as e:
+                    print(f"Market regime SL error: {e}")
             
             if action == TradeAction.BUY_SMALL or action == TradeAction.BUY_MEDIUM or action == TradeAction.BUY_LARGE:
                 units = self.calculate_position_size(price, instrument=instrument)
