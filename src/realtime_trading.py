@@ -540,6 +540,15 @@ class RealTimeTradingEngine:
                 if std_return > 0:
                     sharpe_ratio = mean_return / std_return * (252 ** 0.5)  # Annualized
             
+            # Calculate Calmar ratio (return to drawdown ratio)
+            calmar_ratio = 0.0
+            if len(self.balance_history) >= 10:
+                max_balance = max(self.balance_history)
+                max_drawdown = (max_balance - min(self.balance_history)) / max_balance
+                if max_drawdown > 0:
+                    total_return = (current_balance - self.balance_history[0]) / self.balance_history[0]
+                    calmar_ratio = total_return / max_drawdown
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -550,6 +559,7 @@ class RealTimeTradingEngine:
                 "positions": len(self.positions),
                 "position_details": {k: {"units": v["units"], "entry": v["entry_price"], "side": v["side"]} for k, v in self.positions.items()},
                 "sharpe_ratio": sharpe_ratio,
+                "calmar_ratio": calmar_ratio,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
