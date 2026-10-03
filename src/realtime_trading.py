@@ -1042,14 +1042,18 @@ class RealTimeTradingEngine:
                 elif action == TradeAction.BUY_LARGE:
                     units *= 2.0
 
-                sl = price * (1 - effective_sl)
+                # Slippage compensation: assume 1 pip slippage
+                slippage = price * 0.0001
+                entry_price = price + slippage  # Buy at slightly higher price
+                
+                sl = entry_price * (1 - effective_sl)
                 
                 # Dynamic take profit based on ATR (2x ATR)
                 atr = self._calculate_atr(instrument)
                 if atr > 0:
-                    tp = price + (2 * atr)
+                    tp = entry_price + (2 * atr)
                 else:
-                    tp = price * (1 + self.take_profit_pct)
+                    tp = entry_price * (1 + self.take_profit_pct)
 
                 order = Order(
                     instrument=instrument,
@@ -1060,13 +1064,13 @@ class RealTimeTradingEngine:
                 )
                 result = self.broker.place_order(order)
                 if result.status == "filled":
-                    print(f"BUY {instrument}: {units:.0f} units at {price:.5f} (SL: {sl:.5f}, TP: {tp:.5f})")
+                    print(f"BUY {instrument}: {units:.0f} units at {entry_price:.5f} (SL: {sl:.5f}, TP: {tp:.5f})")
                     self.positions[instrument] = {
-                        "entry_price": price,
+                        "entry_price": entry_price,
                         "units": units,
                         "side": "buy",
                         "order_id": result.order_id,
-                        "trailing_stop": price * (1 - self.trailing_stop_pct) if self.use_trailing_stop else None,
+                        "trailing_stop": entry_price * (1 - self.trailing_stop_pct) if self.use_trailing_stop else None,
                         "entry_time": time.time(),
                     }
                     self.trade_count += 1
@@ -1080,14 +1084,18 @@ class RealTimeTradingEngine:
                 elif action == TradeAction.SELL_LARGE:
                     units *= 2.0
 
-                sl = price * (1 + effective_sl)
+                # Slippage compensation: assume 1 pip slippage
+                slippage = price * 0.0001
+                entry_price = price - slippage  # Sell at slightly lower price
+                
+                sl = entry_price * (1 + effective_sl)
                 
                 # Dynamic take profit based on ATR (2x ATR)
                 atr = self._calculate_atr(instrument)
                 if atr > 0:
-                    tp = price - (2 * atr)
+                    tp = entry_price - (2 * atr)
                 else:
-                    tp = price * (1 - self.take_profit_pct)
+                    tp = entry_price * (1 - self.take_profit_pct)
 
                 order = Order(
                     instrument=instrument,
@@ -1098,13 +1106,13 @@ class RealTimeTradingEngine:
                 )
                 result = self.broker.place_order(order)
                 if result.status == "filled":
-                    print(f"SELL {instrument}: {units:.0f} units at {price:.5f} (SL: {sl:.5f}, TP: {tp:.5f})")
+                    print(f"SELL {instrument}: {units:.0f} units at {entry_price:.5f} (SL: {sl:.5f}, TP: {tp:.5f})")
                     self.positions[instrument] = {
-                        "entry_price": price,
+                        "entry_price": entry_price,
                         "units": units,
                         "side": "sell",
                         "order_id": result.order_id,
-                        "trailing_stop": price * (1 + self.trailing_stop_pct) if self.use_trailing_stop else None,
+                        "trailing_stop": entry_price * (1 + self.trailing_stop_pct) if self.use_trailing_stop else None,
                         "entry_time": time.time(),
                     }
                     self.trade_count += 1
