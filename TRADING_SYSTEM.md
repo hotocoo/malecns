@@ -115,11 +115,38 @@ Edit `.trading_config.json`:
 
 ## Recent Improvements (Oct 4, 2026)
 
+### Robustness & Reliability
 - **Config file loading**: System now reads `.trading_config.json` for default settings
 - **Thread safety**: Added locking to prevent duplicate position openings
 - **Rate limiting**: Forex data fetching now includes retry logic with exponential backoff
 - **Error handling**: Graceful fallback to simple momentum trading if brain fails to load
 - **Cleaner logs**: Suppressed PyTorch sparse tensor beta warnings
+- **WebSocket auto-reconnect**: OANDA broker automatically reconnects after 5s on disconnect
+- **Broker connection retry**: Retries broker connection up to 3 times with 5s delay
+- **Heartbeat monitoring**: Warns if no price updates received for 60 seconds
+- **Price update error handling**: Per-instrument error isolation prevents crashes
+
+### Monitoring & Analytics
+- **Real-time monitoring**: Updates `.trading_monitor.json` with balance, P&L, positions
+- **Decision logging**: Logs brain decisions to `trading_decisions.csv` with indicators
+- **Detailed decision logging**: Prints observation features (price_change, RSI, MACD, momentum)
+- **Decision tracking**: Agent tracks total buys/sells/holds for performance analysis
+- **Enhanced session summary**: Shows initial/final balance, return %, avg win
+
+### Backtesting
+- **Backtesting script**: `src/backtest_trading.py` for historical data testing
+- **Risk parameter sweep**: `--sweep` flag tests multiple risk levels (0.5%, 1%, 2%, 3%)
+- **SL/TP ratio sweep**: `--sltp-sweep` flag tests multiple stop loss/take profit ratios
+- **Multiple period testing**: `--periods` flag tests across different time periods
+- **CSV export**: `--output` flag exports results to CSV for analysis
+
+### Market Simulation
+- **Market conditions**: Demo broker supports bull, bear, sideways, volatile, normal conditions
+- **Market condition CLI**: `--market-condition` argument for testing different scenarios
+
+### State Management
+- **State persistence**: `save_state()` and `load_state()` methods for trading state
+- **Brain checkpointing**: Existing save/load checkpoint functionality
 
 ## Requirements
 
