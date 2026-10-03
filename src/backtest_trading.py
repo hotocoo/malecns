@@ -44,8 +44,20 @@ def load_historical_data(instrument: str, period: str = "1mo", interval: str = "
 
 
 def run_backtest(agent, df, instrument: str, risk_per_trade: float = 0.01,
-                 stop_loss_pct: float = 0.02, take_profit_pct: float = 0.04):
-    """Run backtest on historical data."""
+                 stop_loss_pct: float = 0.02, take_profit_pct: float = 0.04,
+                 slippage_pct: float = 0.0001, commission_per_trade: float = 0.0):
+    """Run backtest on historical data with slippage and commission modeling.
+    
+    Args:
+        agent: Trading agent
+        df: Historical price data
+        instrument: Currency pair symbol
+        risk_per_trade: Risk per trade as fraction of balance
+        stop_loss_pct: Stop loss percentage
+        take_profit_pct: Take profit percentage
+        slippage_pct: Slippage as fraction of price (default 0.01% = 1 pip for EUR/USD)
+        commission_per_trade: Commission per trade in USD
+    """
     # Handle both regular and multi-index DataFrames
     if isinstance(df.columns, pd.MultiIndex):
         prices = df["Close"].values.flatten()
@@ -58,10 +70,17 @@ def run_backtest(agent, df, instrument: str, risk_per_trade: float = 0.01,
     entry_price = 0.0
     trades = []
     equity_curve = []
+    total_commission = 0.0
+    total_slippage_cost = 0.0
     
     for i in range(1, n):
         price = float(prices[i])
         prev_price = float(prices[i-1])
+        
+        # Apply slippage to current price
+        # Buy: pay slightly more; Sell: receive slightly less
+        buy_price = price * (1 + slippage_pct)
+        sell_price = price * (1 - slippage_pct)
         
         # Create observation (all values must be scalars)
         obs = {
@@ -95,25 +114,41 @@ def run_backtest(agent, df, instrument: str, risk_per_trade: float = 0.01,
                 size_mult = 1.0 if action == TradeAction.BUY_SMALL else (1.5 if action == TradeAction.BUY_MEDIUM else 2.0)
                 units = (balance * risk_per_trade * size_mult) / (price * stop_loss_pct)
                 position = units
-                entry_price = price
-                trades.append({"type": "BUY", "price": price, "units": units, "date": i})
+                entry_price = buy_price  # Entry at buy price (with slippage)
+                slippage_cost = (buy_price - price) * units
+                total_slippage_cost += slippage_cost
+                if commission_per_trade > 0:
+                    balance -= commission_per_trade
+                    total_commission += commission_per_trade
+                trades.append({"type": "BUY", "price": buy_price, "units": units, "date": i})
         
         elif action in [TradeAction.SELL_SMALL, TradeAction.SELL_MEDIUM, TradeAction.SELL_LARGE]:
             if position > 0:
                 size_mult = 1.0 if action == TradeAction.SELL_SMALL else (1.5 if action == TradeAction.SELL_MEDIUM else 2.0)
                 units = min(position, (balance * risk_per_trade * size_mult) / (price * stop_loss_pct))
-                pnl = (price - entry_price) * units
+                pnl = (sell_price - entry_price) * units  # Exit at sell price (with slippage)
+                slippage_cost = (price - sell_price) * units
+                total_slippage_cost += slippage_cost
+                if commission_per_trade > 0:
+                    balance -= commission_per_trade
+                    total_commission += commission_per_trade
                 balance += pnl
                 position -= units
-                trades.append({"type": "SELL", "price": price, "units": units, "pnl": pnl, "date": i})
+                trades.append({"type": "SELL", "price": sell_price, "units": units, "pnl": pnl, "date": i})
         
         # Check stop loss / take profit
         if position > 0:
             pnl_pct = (price - entry_price) / entry_price
             if pnl_pct <= -stop_loss_pct or pnl_pct >= take_profit_pct:
-                pnl = (price - entry_price) * position
+                exit_price = sell_price  # Exit at sell price (with slippage)
+                pnl = (exit_price - entry_price) * position
+                slippage_cost = (price - exit_price) * position
+                total_slippage_cost += slippage_cost
+                if commission_per_trade > 0:
+                    balance -= commission_per_trade
+                    total_commission += commission_per_trade
                 balance += pnl
-                trades.append({"type": "SL/TP", "price": price, "units": position, "pnl": pnl, "date": i})
+                trades.append({"type": "SL/TP", "price": exit_price, "units": position, "pnl": pnl, "date": i})
                 position = 0.0
         
         # Track equity
@@ -139,6 +174,8 @@ def run_backtest(agent, df, instrument: str, risk_per_trade: float = 0.01,
         "num_trades": len(trades),
         "win_rate": win_rate,
         "max_drawdown": max_dd,
+        "total_commission": total_commission,
+        "total_slippage_cost": total_slippage_cost,
         "equity_curve": equity_curve,
         "trades": trades,
     }
@@ -156,6 +193,8 @@ def main():
     parser.add_argument("--risk", type=float, default=0.01, help="Risk per trade")
     parser.add_argument("--stop-loss", type=float, default=0.02, help="Stop loss pct")
     parser.add_argument("--take-profit", type=float, default=0.04, help="Take profit pct")
+    parser.add_argument("--slippage", type=float, default=0.0001, help="Slippage as fraction (default 0.01% = 1 pip)")
+    parser.add_argument("--commission", type=float, default=0.0, help="Commission per trade in USD")
     parser.add_argument("--sweep", action="store_true", help="Sweep risk parameters (0.5%, 1%, 2%, 3%)")
     parser.add_argument("--sltp-sweep", action="store_true", help="Sweep SL/TP ratios (1:1, 1:2, 1:3, 1:4)")
     parser.add_argument("--output", default=None, help="Export results to CSV file")
@@ -211,6 +250,8 @@ def main():
                         risk_per_trade=risk,
                         stop_loss_pct=sl,
                         take_profit_pct=tp,
+                        slippage_pct=args.slippage,
+                        commission_per_trade=args.commission,
                     )
                     
                     risk_label = f" (risk={risk*100:.1f}%)" if args.sweep else ""
