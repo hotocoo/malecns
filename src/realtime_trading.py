@@ -814,6 +814,16 @@ class RealTimeTradingEngine:
                 else:
                     profit_factor_by_month[month] = 0.0
             
+            # Calculate win rate by month
+            win_rate_by_month = {}
+            for month in range(12):
+                month_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 2629800 % 12 == month]
+                if month_trades:
+                    month_win_count = sum(1 for t in month_trades if t[2] > 0)
+                    win_rate_by_month[month] = month_win_count / len(month_trades)
+                else:
+                    win_rate_by_month[month] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -850,6 +860,7 @@ class RealTimeTradingEngine:
                 "win_rate_by_day": win_rate_by_day,
                 "avg_duration_by_day": avg_duration_by_day,
                 "profit_factor_by_month": profit_factor_by_month,
+                "win_rate_by_month": win_rate_by_month,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
