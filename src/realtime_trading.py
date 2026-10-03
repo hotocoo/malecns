@@ -498,6 +498,7 @@ class RealTimeTradingEngine:
         self.worst_trade_pnl = 0.0
         self.best_trade_instrument = ""
         self.worst_trade_instrument = ""
+        self.trades_per_day = {}
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -1495,6 +1496,12 @@ class RealTimeTradingEngine:
             if pnl < self.worst_trade_pnl:
                 self.worst_trade_pnl = pnl
                 self.worst_trade_instrument = instrument
+            
+            # Track trades per day
+            today = time.strftime("%Y-%m-%d")
+            if today not in self.trades_per_day:
+                self.trades_per_day[today] = 0
+            self.trades_per_day[today] += 1
             
             print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak}, PF: {profit_factor:.2f}, Avg duration: {avg_duration/60:.1f}min, Avg MAE: {avg_mae:.5f}, Avg MFE: {avg_mfe:.5f}, Expectancy: {expectancy:.2f})")
             if self.use_risk_parity and self.risk_parity_sizer:
