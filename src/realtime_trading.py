@@ -629,6 +629,13 @@ class RealTimeTradingEngine:
             if self.trade_pnl_history:
                 avg_trade_size = sum(self.trade_pnl_history) / len(self.trade_pnl_history)
             
+            # Calculate trade consistency (standard deviation of trade P&L)
+            trade_consistency = 0.0
+            if len(self.trade_pnl_history) >= 2:
+                mean = sum(self.trade_pnl_history) / len(self.trade_pnl_history)
+                variance = sum((p - mean) ** 2 for p in self.trade_pnl_history) / len(self.trade_pnl_history)
+                trade_consistency = variance ** 0.5
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -647,6 +654,7 @@ class RealTimeTradingEngine:
                 "avg_position_size": avg_position_size,
                 "win_loss_ratio": win_loss_ratio,
                 "avg_trade_size": avg_trade_size,
+                "trade_consistency": trade_consistency,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
