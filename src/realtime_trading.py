@@ -507,6 +507,7 @@ class RealTimeTradingEngine:
         self.trade_pnl_history = []
         self.wins_by_instrument_value = {inst: 0.0 for inst in instruments}
         self.losses_by_instrument_value = {inst: 0.0 for inst in instruments}
+        self.total_mae_mfe_ratio = 0.0
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -1538,6 +1539,10 @@ class RealTimeTradingEngine:
             mfe = pos.get("max_favorable_excursion", 0.0)
             self.total_mfe += mfe
             avg_mfe = self.total_mfe / max(self.trade_count, 1)
+            
+            # Track MAE/MFE ratio (trade quality)
+            if mfe > 0:
+                self.total_mae_mfe_ratio += mae / mfe
             
             # Calculate expectancy
             expectancy = self.total_pnl / max(self.trade_count, 1)
