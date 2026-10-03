@@ -908,6 +908,12 @@ class RealTimeTradingEngine:
                 hour_trades = [t for t in self.trades_by_session.values() for t in t if t[4] % 86400 // 3600 == hour]
                 trade_count_by_hour[hour] = len(hour_trades)
             
+            # Calculate trade count by day of week
+            trade_count_by_day = {}
+            for day in range(7):
+                day_trades = [t for t in self.trades_by_session.values() for t in t if t[4] % 604800 // 86400 == day]
+                trade_count_by_day[day] = len(day_trades)
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -953,6 +959,7 @@ class RealTimeTradingEngine:
                 "win_rate_by_year": win_rate_by_year,
                 "avg_duration_by_year": avg_duration_by_year,
                 "trade_count_by_hour": trade_count_by_hour,
+                "trade_count_by_day": trade_count_by_day,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
