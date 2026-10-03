@@ -442,6 +442,38 @@ class RealTimeTradingEngine:
         # Brain agent (shared across instruments)
         self.agent = None
 
+    def save_state(self, path: str = ".trading_state.json"):
+        """Save trading state to JSON file."""
+        state = {
+            "balance": self.balance,
+            "total_pnl": self.total_pnl,
+            "trade_count": self.trade_count,
+            "win_count": self.win_count,
+            "positions": self.positions,
+            "timestamp": time.time(),
+        }
+        with open(path, "w") as f:
+            json.dump(state, f, indent=2)
+        print(f"Trading state saved to {path}")
+
+    def load_state(self, path: str = ".trading_state.json"):
+        """Load trading state from JSON file."""
+        if not Path(path).exists():
+            return False
+        try:
+            with open(path) as f:
+                state = json.load(f)
+            self.balance = state["balance"]
+            self.total_pnl = state["total_pnl"]
+            self.trade_count = state["trade_count"]
+            self.win_count = state["win_count"]
+            self.positions = state["positions"]
+            print(f"Trading state loaded from {path}")
+            return True
+        except Exception as e:
+            print(f"Error loading trading state: {e}")
+            return False
+
     def init_brain(self):
         """Initialize the MaleCNS brain with graceful fallback."""
         print("Initializing MaleCNS brain...")
