@@ -932,6 +932,22 @@ class RealTimeTradingEngine:
                 year_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 31557600 == year - 1970]
                 trade_count_by_year[year] = len(year_trades)
             
+            # Calculate profit factor by session and instrument
+            profit_factor_by_session_inst = {}
+            for session in self.trades_by_session:
+                profit_factor_by_session_inst[session] = {}
+                for inst in self.instruments:
+                    session_inst_trades = [t for t in self.trades_by_session[session] if t[5] == inst]
+                    if session_inst_trades:
+                        session_inst_wins = sum(t[2] for t in session_inst_trades if t[2] > 0)
+                        session_inst_losses = sum(abs(t[2]) for t in session_inst_trades if t[2] < 0)
+                        if session_inst_losses > 0:
+                            profit_factor_by_session_inst[session][inst] = session_inst_wins / session_inst_losses
+                        else:
+                            profit_factor_by_session_inst[session][inst] = float('inf') if session_inst_wins > 0 else 0.0
+                    else:
+                        profit_factor_by_session_inst[session][inst] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -981,6 +997,7 @@ class RealTimeTradingEngine:
                 "trade_count_by_month": trade_count_by_month,
                 "trade_count_by_quarter": trade_count_by_quarter,
                 "trade_count_by_year": trade_count_by_year,
+                "profit_factor_by_session_inst": profit_factor_by_session_inst,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
