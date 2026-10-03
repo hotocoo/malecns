@@ -518,6 +518,13 @@ class RealTimeTradingEngine:
             obs = self._create_observation(instrument, price)
             action = self.agent.act(obs)
 
+            # Log brain decision details
+            print(f"[{instrument}] Brain decision: {action} | "
+                  f"price_change={obs.get('price_change', 0):.5f} "
+                  f"rsi={obs.get('rsi', 0):.1f} "
+                  f"macd={obs.get('macd', 0):.5f} "
+                  f"momentum={obs.get('momentum_5', 0):.5f}")
+
             # Map brain action to trade
             from trading_env import TradeAction
             if action == TradeAction.BUY_SMALL or action == TradeAction.BUY_MEDIUM or action == TradeAction.BUY_LARGE:
