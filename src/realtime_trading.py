@@ -589,6 +589,20 @@ class RealTimeTradingEngine:
                     drawdowns.append(drawdown)
                 ulcer_index = (sum(d ** 2 for d in drawdowns) / len(drawdowns)) ** 0.5
             
+            # Calculate Omega ratio (upside potential to downside risk)
+            omega_ratio = 0.0
+            if len(self.balance_history) >= 10:
+                returns = []
+                for i in range(1, len(self.balance_history)):
+                    r = (self.balance_history[i] - self.balance_history[i-1]) / self.balance_history[i-1]
+                    returns.append(r)
+                # Threshold return (e.g., risk-free rate, simplified to 0)
+                threshold = 0.0
+                upside = sum(r - threshold for r in returns if r > threshold)
+                downside = sum(threshold - r for r in returns if r < threshold)
+                if downside > 0:
+                    omega_ratio = upside / downside
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -603,6 +617,7 @@ class RealTimeTradingEngine:
                 "sortino_ratio": sortino_ratio,
                 "info_ratio": info_ratio,
                 "ulcer_index": ulcer_index,
+                "omega_ratio": omega_ratio,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
