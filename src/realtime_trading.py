@@ -651,6 +651,14 @@ class RealTimeTradingEngine:
                 if max_dd > 0:
                     recovery_factor = self.total_pnl / (max_dd * self.initial_balance)
             
+            # Calculate average winning trade and average losing trade
+            avg_win = 0.0
+            avg_loss = 0.0
+            if self.win_count > 0:
+                avg_win = self.total_wins / self.win_count
+            if self.trade_count - self.win_count > 0:
+                avg_loss = self.total_losses / (self.trade_count - self.win_count)
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -671,6 +679,8 @@ class RealTimeTradingEngine:
                 "avg_trade_size": avg_trade_size,
                 "trade_consistency": trade_consistency,
                 "recovery_factor": recovery_factor,
+                "avg_win": avg_win,
+                "avg_loss": avg_loss,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
