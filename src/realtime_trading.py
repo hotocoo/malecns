@@ -926,6 +926,12 @@ class RealTimeTradingEngine:
                 quarter_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 7889400 % 4 == quarter]
                 trade_count_by_quarter[quarter] = len(quarter_trades)
             
+            # Calculate trade count by year
+            trade_count_by_year = {}
+            for year in range(2020, 2030):
+                year_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 31557600 == year - 1970]
+                trade_count_by_year[year] = len(year_trades)
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -974,6 +980,7 @@ class RealTimeTradingEngine:
                 "trade_count_by_day": trade_count_by_day,
                 "trade_count_by_month": trade_count_by_month,
                 "trade_count_by_quarter": trade_count_by_quarter,
+                "trade_count_by_year": trade_count_by_year,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
