@@ -490,6 +490,7 @@ class RealTimeTradingEngine:
         self.max_loss_streak = 0
         self.gross_profit = 0.0
         self.gross_loss = 0.0
+        self.total_trade_duration = 0.0
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -1354,7 +1355,13 @@ class RealTimeTradingEngine:
             else:
                 profit_factor = float('inf')
             
-            print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak}, PF: {profit_factor:.2f})")
+            # Track trade duration
+            entry_time = pos.get("entry_time", time.time())
+            trade_duration = time.time() - entry_time
+            self.total_trade_duration += trade_duration
+            avg_duration = self.total_trade_duration / max(self.trade_count, 1)
+            
+            print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak}, PF: {profit_factor:.2f}, Avg duration: {avg_duration/60:.1f}min)")
             if self.use_risk_parity and self.risk_parity_sizer:
                 self.risk_parity_sizer.remove_position(instrument)
 
