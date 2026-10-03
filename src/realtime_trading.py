@@ -442,6 +442,8 @@ class RealTimeTradingEngine:
         # Brain agent (shared across instruments)
         self.agent = None
         self._monitor_path = Path(__file__).resolve().parent.parent / ".trading_monitor.json"
+        self._decisions_path = Path(__file__).resolve().parent.parent / "trading_decisions.csv"
+        self._decisions_written = False
 
     def _update_monitor(self):
         """Update performance monitoring file for external tools."""
@@ -460,6 +462,29 @@ class RealTimeTradingEngine:
                 json.dump(monitor, f, indent=2)
         except Exception:
             pass  # Don't crash on monitor update failure
+
+    def _log_decision(self, instrument: str, action, price: float, obs: dict):
+        """Log trading decision to CSV file."""
+        import csv
+        try:
+            write_header = not self._decisions_written
+            with open(self._decisions_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(["timestamp", "instrument", "action", "price", "price_change", "rsi", "macd", "momentum"])
+                    self._decisions_written = True
+                writer.writerow([
+                    time.time(),
+                    instrument,
+                    str(action),
+                    f"{price:.5f}",
+                    f"{obs.get('price_change', 0):.6f}",
+                    f"{obs.get('rsi', 0):.1f}",
+                    f"{obs.get('macd', 0):.6f}",
+                    f"{obs.get('momentum_5', 0):.6f}",
+                ])
+        except Exception:
+            pass  # Don't crash on decision logging
 
     def save_state(self, path: str = ".trading_state.json"):
         """Save trading state to JSON file."""
@@ -581,6 +606,9 @@ class RealTimeTradingEngine:
                   f"rsi={obs.get('rsi', 0):.1f} "
                   f"macd={obs.get('macd', 0):.5f} "
                   f"momentum={obs.get('momentum_5', 0):.5f}")
+
+            # Log to CSV
+            self._log_decision(instrument, action, price, obs)
 
             # Map brain action to trade
             from trading_env import TradeAction
