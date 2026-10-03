@@ -493,6 +493,7 @@ class RealTimeTradingEngine:
         self.total_trade_duration = 0.0
         self.balance_history = []
         self.total_mae = 0.0
+        self.total_mfe = 0.0
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -889,6 +890,14 @@ class RealTimeTradingEngine:
                 if adverse > pos.get("max_adverse_excursion", 0.0):
                     pos["max_adverse_excursion"] = adverse
 
+                # Track maximum favorable excursion
+                if side == "buy":
+                    favorable = price - entry_price
+                else:
+                    favorable = entry_price - price
+                if favorable > pos.get("max_favorable_excursion", 0.0):
+                    pos["max_favorable_excursion"] = favorable
+
                 # Time-based exit: close position if held too long without profit
                 entry_time = pos.get("entry_time", time.time())
                 hold_time = time.time() - entry_time
@@ -1109,6 +1118,7 @@ class RealTimeTradingEngine:
                         "trailing_stop": entry_price * (1 - self.trailing_stop_pct) if self.use_trailing_stop else None,
                         "entry_time": time.time(),
                         "max_adverse_excursion": 0.0,
+                        "max_favorable_excursion": 0.0,
                     }
                     self.trade_count += 1
                     if self.use_risk_parity and self.risk_parity_sizer:
@@ -1152,6 +1162,7 @@ class RealTimeTradingEngine:
                         "trailing_stop": entry_price * (1 + self.trailing_stop_pct) if self.use_trailing_stop else None,
                         "entry_time": time.time(),
                         "max_adverse_excursion": 0.0,
+                        "max_favorable_excursion": 0.0,
                     }
                     self.trade_count += 1
                     if self.use_risk_parity and self.risk_parity_sizer:
@@ -1397,7 +1408,12 @@ class RealTimeTradingEngine:
             self.total_mae += mae
             avg_mae = self.total_mae / max(self.trade_count, 1)
             
-            print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak}, PF: {profit_factor:.2f}, Avg duration: {avg_duration/60:.1f}min, Avg MAE: {avg_mae:.5f})")
+            # Track MFE
+            mfe = pos.get("max_favorable_excursion", 0.0)
+            self.total_mfe += mfe
+            avg_mfe = self.total_mfe / max(self.trade_count, 1)
+            
+            print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak}, PF: {profit_factor:.2f}, Avg duration: {avg_duration/60:.1f}min, Avg MAE: {avg_mae:.5f}, Avg MFE: {avg_mfe:.5f})")
             if self.use_risk_parity and self.risk_parity_sizer:
                 self.risk_parity_sizer.remove_position(instrument)
 
