@@ -549,6 +549,21 @@ class RealTimeTradingEngine:
                     total_return = (current_balance - self.balance_history[0]) / self.balance_history[0]
                     calmar_ratio = total_return / max_drawdown
             
+            # Calculate Sortino ratio (downside risk-adjusted return)
+            sortino_ratio = 0.0
+            if len(self.balance_history) >= 10:
+                returns = []
+                for i in range(1, len(self.balance_history)):
+                    r = (self.balance_history[i] - self.balance_history[i-1]) / self.balance_history[i-1]
+                    returns.append(r)
+                mean_return = sum(returns) / len(returns)
+                downside_returns = [r for r in returns if r < 0]
+                if downside_returns:
+                    downside_variance = sum(r ** 2 for r in downside_returns) / len(downside_returns)
+                    downside_std = downside_variance ** 0.5
+                    if downside_std > 0:
+                        sortino_ratio = mean_return / downside_std * (252 ** 0.5)  # Annualized
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -560,6 +575,7 @@ class RealTimeTradingEngine:
                 "position_details": {k: {"units": v["units"], "entry": v["entry_price"], "side": v["side"]} for k, v in self.positions.items()},
                 "sharpe_ratio": sharpe_ratio,
                 "calmar_ratio": calmar_ratio,
+                "sortino_ratio": sortino_ratio,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
