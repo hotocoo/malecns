@@ -238,9 +238,11 @@ class OandaBroker(Broker):
         return 0.0
 
     def stream_prices(self, instruments: list[str], callback: Callable):
-        """Stream real-time prices via WebSocket."""
+        """Stream real-time prices via WebSocket with auto-reconnect."""
         url = "wss://stream-fxpractice.oanda.com/v3/prices" if self.practice else "wss://stream-fxtrade.oanda.com/v3/prices"
-        instruments_param = ",".join(instruments)
+        self._ws_instruments = instruments
+        self._ws_callback = callback
+        self._ws_url = url
 
         def on_message(ws, message):
             try:
@@ -254,17 +256,38 @@ class OandaBroker(Broker):
         def on_error(ws, error):
             print(f"WebSocket error: {error}")
 
+        def on_close(ws, close_status_code, close_msg):
+            print(f"WebSocket closed: {close_status_code} {close_msg}")
+            # Auto-reconnect after 5 seconds
+            if self.ws:
+                time.sleep(5)
+                try:
+                    self.ws = websocket.WebSocketApp(
+                        self._ws_url,
+                        on_message=on_message,
+                        on_error=on_error,
+                        on_close=on_close,
+                        on_open=on_open,
+                    )
+                    self.ws_thread = threading.Thread(target=self.ws.run_forever)
+                    self.ws_thread.daemon = True
+                    self.ws_thread.start()
+                except Exception as e:
+                    print(f"WebSocket reconnect failed: {e}")
+
         def on_open(ws):
             subscribe = {
                 "type": "PRICE",
                 "instrumentNames": instruments,
             }
             ws.send(json.dumps(subscribe))
+            print(f"WebSocket connected, subscribed to {instruments}")
 
         self.ws = websocket.WebSocketApp(
             url,
             on_message=on_message,
             on_error=on_error,
+            on_close=on_close,
             on_open=on_open,
         )
         self.ws_thread = threading.Thread(target=self.ws.run_forever)
