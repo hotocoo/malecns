@@ -45,9 +45,21 @@ class DemoBroker(Broker):
         "GBP_JPY": 0.15,
     }
 
-    def __init__(self, api_key: str = ""):
+    # Market condition parameters: (drift, vol_multiplier)
+    MARKET_CONDITIONS = {
+        "bull": (0.0005, 1.0),      # Upward trend, normal vol
+        "bear": (-0.0005, 1.0),     # Downward trend, normal vol
+        "sideways": (0.0, 0.8),     # No trend, low vol
+        "volatile": (0.0, 2.0),     # No trend, high vol
+        "normal": (0.0, 1.0),       # No trend, normal vol
+    }
+
+    def __init__(self, api_key: str = "", market_condition: str = "normal"):
         self.api_key = api_key
         self.prices = dict(self.STARTING_PRICES)
+        self.market_condition = market_condition.lower()
+        if self.market_condition not in self.MARKET_CONDITIONS:
+            self.market_condition = "normal"
         self.positions = {}
         self.balance = 100000.0  # $100k demo account
         self.equity = 100000.0
@@ -139,8 +151,9 @@ class DemoBroker(Broker):
         return self.equity
 
     def stream_prices(self, instruments: list[str], callback: Callable):
-        """Simulate real-time price updates every 100ms."""
+        """Simulate real-time price updates every 100ms with market conditions."""
         self.running = True
+        drift, vol_mult = self.MARKET_CONDITIONS[self.market_condition]
 
         def price_loop():
             dt = 0.1  # 100ms updates
@@ -148,10 +161,9 @@ class DemoBroker(Broker):
                 prices = {}
                 for inst in instruments:
                     if inst in self.prices:
-                        # GBM price movement
-                        vol = self.VOLATILITY.get(inst, 0.1)
+                        # GBM price movement with market condition
+                        vol = self.VOLATILITY.get(inst, 0.1) * vol_mult
                         sigma = vol * math.sqrt(dt / 86400)  # Scale to 100ms
-                        drift = 0.0
                         dW = np.random.normal()
                         self.prices[inst] *= math.exp((drift - 0.5 * sigma**2) + sigma * dW)
                         prices[inst] = self.prices[inst]

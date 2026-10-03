@@ -754,9 +754,9 @@ class RealTimeTradingEngine:
         print("=" * 50)
 
 
-def get_demo_broker():
+def get_demo_broker(market_condition: str = "normal"):
     from demo_broker import DemoBroker
-    return DemoBroker()
+    return DemoBroker(market_condition=market_condition)
 
 def load_config() -> dict:
     """Load trading configuration from .trading_config.json."""
@@ -786,6 +786,7 @@ def main():
     parser.add_argument("--max-positions", type=int, default=config.get("max_positions", 3))
     parser.add_argument("--stop-loss", type=float, default=config.get("stop_loss_pct", 0.02), help="Stop loss percentage")
     parser.add_argument("--take-profit", type=float, default=config.get("take_profit_pct", 0.04), help="Take profit percentage")
+    parser.add_argument("--market-condition", choices=["bull", "bear", "sideways", "volatile", "normal"], default=config.get("market_condition", "normal"), help="Market condition for demo broker")
     args = parser.parse_args()
 
     # Determine instruments (CLI > config > default)
@@ -798,7 +799,7 @@ def main():
 
     # Create broker
     if args.broker == "demo":
-        broker = get_demo_broker()
+        broker = get_demo_broker(args.market_condition)
     elif args.broker == "oanda":
         access_token = os.environ.get("OANDA_ACCESS_TOKEN", "")
         account_id = os.environ.get("OANDA_ACCOUNT_ID", "")
