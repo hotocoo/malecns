@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from trading_agent import TradingAgent
 from trading_env import TradingConfig
+from news_sentiment import NewsSentimentAnalyzer
 
 
 # --- Order Types ---
@@ -429,6 +430,7 @@ class RealTimeTradingEngine:
         use_session_filter: bool = True,
         trading_sessions: list[str] | None = None,  # ["london", "ny", "tokyo"]
         avoid_low_liquidity: bool = True,
+        use_news_sentiment: bool = True,
     ):
         self.broker = broker
         self.graph_dir = graph_dir
@@ -450,6 +452,8 @@ class RealTimeTradingEngine:
         self.use_session_filter = use_session_filter
         self.trading_sessions = trading_sessions or ["london", "ny"]
         self.avoid_low_liquidity = avoid_low_liquidity
+        self.use_news_sentiment = use_news_sentiment
+        self.news_analyzer = NewsSentimentAnalyzer(instruments=instruments) if use_news_sentiment else None
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -608,10 +612,11 @@ class RealTimeTradingEngine:
         
         return True
     
-    def calculate_position_size(self, price: float, volatility: float = 0.02) -> float:
-        """Calculate position size based on risk per trade and market volatility.
+    def calculate_position_size(self, price: float, volatility: float = 0.02, instrument: str = "") -> float:
+        """Calculate position size based on risk per trade, market volatility, and news sentiment.
         
         Higher volatility -> smaller position size to maintain consistent risk.
+        Strong news sentiment -> larger position size to capitalize on momentum.
         """
         if price <= 0:
             return 0.0
@@ -628,6 +633,15 @@ class RealTimeTradingEngine:
         # For Forex, 1 standard lot = 100,000 units
         # Position size = risk amount / (price * stop loss %)
         position_size = risk_amount / (price * effective_sl)
+        
+        # Adjust for news sentiment
+        if self.use_news_sentiment and self.news_analyzer and instrument:
+            try:
+                sentiment_factor = self.news_analyzer.get_sentiment_factor(instrument)
+                position_size *= sentiment_factor
+            except Exception as e:
+                print(f"News sentiment error: {e}")
+        
         return min(position_size, 100000)  # Max 1 standard lot
 
     def on_price_update(self, prices: dict[str, float]):
@@ -766,7 +780,7 @@ class RealTimeTradingEngine:
             # Map brain action to trade
             from trading_env import TradeAction
             if action == TradeAction.BUY_SMALL or action == TradeAction.BUY_MEDIUM or action == TradeAction.BUY_LARGE:
-                units = self.calculate_position_size(price)
+                units = self.calculate_position_size(price, instrument=instrument)
                 if action == TradeAction.BUY_MEDIUM:
                     units *= 1.5
                 elif action == TradeAction.BUY_LARGE:
@@ -795,7 +809,7 @@ class RealTimeTradingEngine:
                     self.trade_count += 1
 
             elif action == TradeAction.SELL_SMALL or action == TradeAction.SELL_MEDIUM or action == TradeAction.SELL_LARGE:
-                units = self.calculate_position_size(price)
+                units = self.calculate_position_size(price, instrument=instrument)
                 if action == TradeAction.SELL_MEDIUM:
                     units *= 1.5
                 elif action == TradeAction.SELL_LARGE:
