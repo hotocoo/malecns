@@ -790,6 +790,16 @@ class RealTimeTradingEngine:
                 else:
                     win_rate_by_day[day] = 0.0
             
+            # Calculate average trade duration by day of week
+            avg_duration_by_day = {}
+            for day in range(7):
+                day_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 86400 % 7 == day]
+                if day_trades:
+                    day_durations = [t[3] for t in day_trades]
+                    avg_duration_by_day[day] = sum(day_durations) / len(day_durations)
+                else:
+                    avg_duration_by_day[day] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -824,6 +834,7 @@ class RealTimeTradingEngine:
                 "avg_duration_by_hour": avg_duration_by_hour,
                 "profit_factor_by_day": profit_factor_by_day,
                 "win_rate_by_day": win_rate_by_day,
+                "avg_duration_by_day": avg_duration_by_day,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
