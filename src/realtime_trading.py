@@ -441,6 +441,25 @@ class RealTimeTradingEngine:
 
         # Brain agent (shared across instruments)
         self.agent = None
+        self._monitor_path = Path(__file__).resolve().parent.parent / ".trading_monitor.json"
+
+    def _update_monitor(self):
+        """Update performance monitoring file for external tools."""
+        try:
+            monitor = {
+                "timestamp": time.time(),
+                "balance": self.balance,
+                "total_pnl": self.total_pnl,
+                "trade_count": self.trade_count,
+                "win_count": self.win_count,
+                "positions": len(self.positions),
+                "position_details": {k: {"units": v["units"], "entry": v["entry_price"], "side": v["side"]} for k, v in self.positions.items()},
+                "last_heartbeat": self.last_heartbeat,
+            }
+            with open(self._monitor_path, "w") as f:
+                json.dump(monitor, f, indent=2)
+        except Exception:
+            pass  # Don't crash on monitor update failure
 
     def save_state(self, path: str = ".trading_state.json"):
         """Save trading state to JSON file."""
@@ -508,6 +527,7 @@ class RealTimeTradingEngine:
                 self._process_instrument(instrument, price)
             except Exception as e:
                 print(f"Error processing {instrument}: {e}")
+        self._update_monitor()
 
     def _process_instrument(self, instrument: str, price: float):
         """Process trading logic for one instrument."""
