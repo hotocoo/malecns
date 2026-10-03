@@ -659,6 +659,11 @@ class RealTimeTradingEngine:
             if self.trade_count - self.win_count > 0:
                 avg_loss = self.total_losses / (self.trade_count - self.win_count)
             
+            # Calculate payoff ratio (average win / average loss)
+            payoff_ratio = 0.0
+            if avg_loss > 0:
+                payoff_ratio = avg_win / avg_loss
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -681,6 +686,7 @@ class RealTimeTradingEngine:
                 "recovery_factor": recovery_factor,
                 "avg_win": avg_win,
                 "avg_loss": avg_loss,
+                "payoff_ratio": payoff_ratio,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
