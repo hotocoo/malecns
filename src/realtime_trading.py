@@ -933,6 +933,18 @@ class RealTimeTradingEngine:
                 except Exception as e:
                     print(f"Liquidity check error: {e}")
 
+            # Check spread (avoid trading when spreads are wide)
+            try:
+                bid, ask = self.broker.get_bid_ask(instrument)
+                if bid > 0 and ask > 0:
+                    spread = ask - bid
+                    spread_pct = spread / price
+                    if spread_pct > 0.0005:  # Wider than 5 pips
+                        return
+            except Exception as e:
+                # If we can't get bid/ask, continue anyway
+                pass
+
             # Check correlation analysis
             if self.use_correlation and self.correlation_analyzer:
                 try:
