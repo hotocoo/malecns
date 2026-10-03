@@ -492,6 +492,7 @@ class RealTimeTradingEngine:
         self.gross_loss = 0.0
         self.total_trade_duration = 0.0
         self.balance_history = []
+        self.total_mae = 0.0
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -880,6 +881,14 @@ class RealTimeTradingEngine:
                                 self._close_position(instrument, pos["units"])
                                 return
 
+                # Track maximum adverse excursion
+                if side == "buy":
+                    adverse = entry_price - price
+                else:
+                    adverse = price - entry_price
+                if adverse > pos.get("max_adverse_excursion", 0.0):
+                    pos["max_adverse_excursion"] = adverse
+
                 # Time-based exit: close position if held too long without profit
                 entry_time = pos.get("entry_time", time.time())
                 hold_time = time.time() - entry_time
@@ -1099,6 +1108,7 @@ class RealTimeTradingEngine:
                         "order_id": result.order_id,
                         "trailing_stop": entry_price * (1 - self.trailing_stop_pct) if self.use_trailing_stop else None,
                         "entry_time": time.time(),
+                        "max_adverse_excursion": 0.0,
                     }
                     self.trade_count += 1
                     if self.use_risk_parity and self.risk_parity_sizer:
@@ -1141,6 +1151,7 @@ class RealTimeTradingEngine:
                         "order_id": result.order_id,
                         "trailing_stop": entry_price * (1 + self.trailing_stop_pct) if self.use_trailing_stop else None,
                         "entry_time": time.time(),
+                        "max_adverse_excursion": 0.0,
                     }
                     self.trade_count += 1
                     if self.use_risk_parity and self.risk_parity_sizer:
@@ -1381,7 +1392,12 @@ class RealTimeTradingEngine:
             self.total_trade_duration += trade_duration
             avg_duration = self.total_trade_duration / max(self.trade_count, 1)
             
-            print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak}, PF: {profit_factor:.2f}, Avg duration: {avg_duration/60:.1f}min)")
+            # Track MAE
+            mae = pos.get("max_adverse_excursion", 0.0)
+            self.total_mae += mae
+            avg_mae = self.total_mae / max(self.trade_count, 1)
+            
+            print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak}, PF: {profit_factor:.2f}, Avg duration: {avg_duration/60:.1f}min, Avg MAE: {avg_mae:.5f})")
             if self.use_risk_parity and self.risk_parity_sizer:
                 self.risk_parity_sizer.remove_position(instrument)
 
