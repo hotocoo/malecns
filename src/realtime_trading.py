@@ -480,6 +480,7 @@ class RealTimeTradingEngine:
         self.regime_detector = MarketRegimeDetector() if use_market_regime else None
         self.avoid_low_liquidity = True
         self.last_rebalance_check = 0.0
+        self.last_overnight_check = 0.0
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -773,6 +774,21 @@ class RealTimeTradingEngine:
                                 print(f"Rebalancing: reduced {inst} by {units:.0f} units")
                 except Exception as e:
                     print(f"Rebalancing error: {e}")
+        
+        # Overnight position management: close positions before market close
+        now = time.time()
+        if now - self.last_overnight_check > 60:
+            self.last_overnight_check = now
+            try:
+                utc_now = datetime.utcnow()
+                # Close all positions before 21:00 UTC (market close)
+                if utc_now.hour >= 21 or utc_now.hour < 0:
+                    for instrument in list(self.positions.keys()):
+                        pos = self.positions[instrument]
+                        self._close_position(instrument, pos["units"])
+                        print(f"OVERNIGHT: closed {instrument} before market close")
+            except Exception as e:
+                print(f"Overnight check error: {e}")
         
         for instrument, price in prices.items():
             try:
