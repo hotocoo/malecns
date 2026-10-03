@@ -848,6 +848,16 @@ class RealTimeTradingEngine:
                 else:
                     profit_factor_by_quarter[quarter] = 0.0
             
+            # Calculate win rate by quarter
+            win_rate_by_quarter = {}
+            for quarter in range(4):
+                quarter_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 7889400 % 4 == quarter]
+                if quarter_trades:
+                    quarter_win_count = sum(1 for t in quarter_trades if t[2] > 0)
+                    win_rate_by_quarter[quarter] = quarter_win_count / len(quarter_trades)
+                else:
+                    win_rate_by_quarter[quarter] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -887,6 +897,7 @@ class RealTimeTradingEngine:
                 "win_rate_by_month": win_rate_by_month,
                 "avg_duration_by_month": avg_duration_by_month,
                 "profit_factor_by_quarter": profit_factor_by_quarter,
+                "win_rate_by_quarter": win_rate_by_quarter,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
