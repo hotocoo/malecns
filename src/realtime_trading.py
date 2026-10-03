@@ -45,6 +45,7 @@ from trading_env import TradingConfig
 from news_sentiment import NewsSentimentAnalyzer
 from correlation import CorrelationAnalyzer
 from multi_timeframe import MultiTimeframeAnalyzer
+from risk_parity import RiskParitySizer
 
 
 # --- Order Types ---
@@ -435,6 +436,7 @@ class RealTimeTradingEngine:
         use_news_sentiment: bool = True,
         use_correlation: bool = True,
         use_multi_timeframe: bool = True,
+        use_risk_parity: bool = True,
     ):
         self.broker = broker
         self.graph_dir = graph_dir
@@ -462,6 +464,12 @@ class RealTimeTradingEngine:
         self.correlation_analyzer = CorrelationAnalyzer(instruments=instruments) if use_correlation else None
         self.use_multi_timeframe = use_multi_timeframe
         self.mtf_analyzer = MultiTimeframeAnalyzer() if use_multi_timeframe else None
+        self.use_risk_parity = use_risk_parity
+        self.risk_parity_sizer = RiskParitySizer(
+            instruments=instruments,
+            target_risk_per_position=self.risk_per_trade,
+            max_positions=max_positions,
+        ) if use_risk_parity else None
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -666,6 +674,17 @@ class RealTimeTradingEngine:
             except Exception as e:
                 print(f"Multi-timeframe error: {e}")
         
+        # Override with risk parity sizing if enabled
+        if self.use_risk_parity and self.risk_parity_sizer and instrument:
+            try:
+                portfolio_value = self.broker.get_account_balance()
+                rp_size = self.risk_parity_sizer.calculate_position_size(
+                    instrument, price, portfolio_value, self.stop_loss_pct
+                )
+                position_size = rp_size
+            except Exception as e:
+                print(f"Risk parity error: {e}")
+        
         return min(position_size, 100000)  # Max 1 standard lot
 
     def on_price_update(self, prices: dict[str, float]):
@@ -680,6 +699,10 @@ class RealTimeTradingEngine:
         if self.use_multi_timeframe and self.mtf_analyzer:
             for instrument, price in prices.items():
                 self.mtf_analyzer.update_price(instrument, price)
+        
+        # Update risk parity sizer
+        if self.use_risk_parity and self.risk_parity_sizer:
+            self.risk_parity_sizer.update_prices(prices)
         
         for instrument, price in prices.items():
             try:
@@ -857,6 +880,8 @@ class RealTimeTradingEngine:
                         "trailing_stop": price * (1 - self.trailing_stop_pct) if self.use_trailing_stop else None,
                     }
                     self.trade_count += 1
+                    if self.use_risk_parity and self.risk_parity_sizer:
+                        self.risk_parity_sizer.update_position(instrument, units)
 
             elif action == TradeAction.SELL_SMALL or action == TradeAction.SELL_MEDIUM or action == TradeAction.SELL_LARGE:
                 units = self.calculate_position_size(price, instrument=instrument)
@@ -886,6 +911,8 @@ class RealTimeTradingEngine:
                         "trailing_stop": price * (1 + self.trailing_stop_pct) if self.use_trailing_stop else None,
                     }
                     self.trade_count += 1
+                    if self.use_risk_parity and self.risk_parity_sizer:
+                        self.risk_parity_sizer.update_position(instrument, units)
 
     def _create_observation(self, instrument: str, price: float) -> dict:
         """Create observation dict for brain from real price data."""
@@ -1078,6 +1105,8 @@ class RealTimeTradingEngine:
             if pnl > 0:
                 self.win_count += 1
             print(f"Closed {instrument}: P&L = {pnl:.2f} USD")
+            if self.use_risk_parity and self.risk_parity_sizer:
+                self.risk_parity_sizer.remove_position(instrument)
 
     def run(self):
         """Start the real-time trading engine with connection retry."""
