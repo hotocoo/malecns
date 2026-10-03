@@ -882,6 +882,16 @@ class RealTimeTradingEngine:
                 else:
                     profit_factor_by_year[year] = 0.0
             
+            # Calculate win rate by year
+            win_rate_by_year = {}
+            for year in range(2020, 2030):
+                year_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 31557600 == year - 1970]
+                if year_trades:
+                    year_win_count = sum(1 for t in year_trades if t[2] > 0)
+                    win_rate_by_year[year] = year_win_count / len(year_trades)
+                else:
+                    win_rate_by_year[year] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -924,6 +934,7 @@ class RealTimeTradingEngine:
                 "win_rate_by_quarter": win_rate_by_quarter,
                 "avg_duration_by_quarter": avg_duration_by_quarter,
                 "profit_factor_by_year": profit_factor_by_year,
+                "win_rate_by_year": win_rate_by_year,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
