@@ -44,6 +44,7 @@ from trading_agent import TradingAgent
 from trading_env import TradingConfig
 from news_sentiment import NewsSentimentAnalyzer
 from correlation import CorrelationAnalyzer
+from multi_timeframe import MultiTimeframeAnalyzer
 
 
 # --- Order Types ---
@@ -433,6 +434,7 @@ class RealTimeTradingEngine:
         avoid_low_liquidity: bool = True,
         use_news_sentiment: bool = True,
         use_correlation: bool = True,
+        use_multi_timeframe: bool = True,
     ):
         self.broker = broker
         self.graph_dir = graph_dir
@@ -458,6 +460,8 @@ class RealTimeTradingEngine:
         self.news_analyzer = NewsSentimentAnalyzer(instruments=instruments) if use_news_sentiment else None
         self.use_correlation = use_correlation
         self.correlation_analyzer = CorrelationAnalyzer(instruments=instruments) if use_correlation else None
+        self.use_multi_timeframe = use_multi_timeframe
+        self.mtf_analyzer = MultiTimeframeAnalyzer() if use_multi_timeframe else None
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -654,6 +658,14 @@ class RealTimeTradingEngine:
             except Exception as e:
                 print(f"Correlation error: {e}")
         
+        # Adjust for multi-timeframe trend strength
+        if self.use_multi_timeframe and self.mtf_analyzer and instrument:
+            try:
+                mtf_factor = self.mtf_analyzer.get_position_adjustment(instrument)
+                position_size *= mtf_factor
+            except Exception as e:
+                print(f"Multi-timeframe error: {e}")
+        
         return min(position_size, 100000)  # Max 1 standard lot
 
     def on_price_update(self, prices: dict[str, float]):
@@ -663,6 +675,11 @@ class RealTimeTradingEngine:
         # Update correlation analyzer
         if self.use_correlation and self.correlation_analyzer:
             self.correlation_analyzer.update_prices(prices)
+        
+        # Update multi-timeframe analyzer
+        if self.use_multi_timeframe and self.mtf_analyzer:
+            for instrument, price in prices.items():
+                self.mtf_analyzer.update_price(instrument, price)
         
         for instrument, price in prices.items():
             try:
@@ -783,6 +800,14 @@ class RealTimeTradingEngine:
                         return
                 except Exception as e:
                     print(f"Correlation check error: {e}")
+
+            # Check multi-timeframe analysis
+            if self.use_multi_timeframe and self.mtf_analyzer:
+                try:
+                    if not self.mtf_analyzer.should_trade(instrument):
+                        return
+                except Exception as e:
+                    print(f"Multi-timeframe check error: {e}")
 
             # Get brain decision
             if self.agent is None:
