@@ -46,6 +46,7 @@ from news_sentiment import NewsSentimentAnalyzer
 from correlation import CorrelationAnalyzer
 from multi_timeframe import MultiTimeframeAnalyzer
 from risk_parity import RiskParitySizer
+from drawdown_protection import DrawdownProtection
 
 
 # --- Order Types ---
@@ -437,6 +438,7 @@ class RealTimeTradingEngine:
         use_correlation: bool = True,
         use_multi_timeframe: bool = True,
         use_risk_parity: bool = True,
+        use_drawdown_protection: bool = True,
     ):
         self.broker = broker
         self.graph_dir = graph_dir
@@ -470,6 +472,8 @@ class RealTimeTradingEngine:
             target_risk_per_position=self.risk_per_trade,
             max_positions=max_positions,
         ) if use_risk_parity else None
+        self.use_drawdown_protection = use_drawdown_protection
+        self.drawdown_protection = None  # Initialized after broker connection
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -685,11 +689,24 @@ class RealTimeTradingEngine:
             except Exception as e:
                 print(f"Risk parity error: {e}")
         
+        # Adjust for drawdown protection
+        if self.use_drawdown_protection and self.drawdown_protection:
+            try:
+                position_size = self.drawdown_protection.get_adjusted_position_size(position_size)
+            except Exception as e:
+                print(f"Drawdown protection error: {e}")
+        
         return min(position_size, 100000)  # Max 1 standard lot
 
     def on_price_update(self, prices: dict[str, float]):
         """Handle real-time price updates."""
         self.last_heartbeat = time.time()
+        
+        # Update drawdown protection
+        if self.use_drawdown_protection and self.drawdown_protection:
+            # Calculate current portfolio value (balance + unrealized P&L)
+            portfolio_value = self.broker.get_account_balance()
+            self.drawdown_protection.update_balance(portfolio_value)
         
         # Update correlation analyzer
         if self.use_correlation and self.correlation_analyzer:
@@ -812,6 +829,15 @@ class RealTimeTradingEngine:
             if instrument in self.positions:
                 return
 
+            # Check drawdown protection
+            if self.use_drawdown_protection and self.drawdown_protection:
+                if not self.drawdown_protection.should_trade():
+                    return
+                # Adjust max positions based on drawdown
+                adjusted_max = self.drawdown_protection.get_adjusted_max_positions(self.max_positions)
+                if len(self.positions) >= adjusted_max:
+                    return
+
             # Check if it's a good time to trade
             if not self._is_trading_time():
                 return
@@ -852,6 +878,12 @@ class RealTimeTradingEngine:
 
             # Map brain action to trade
             from trading_env import TradeAction
+            
+            # Adjust stop loss for drawdown protection
+            effective_sl = self.stop_loss_pct
+            if self.use_drawdown_protection and self.drawdown_protection:
+                effective_sl = self.drawdown_protection.get_adjusted_stop_loss(self.stop_loss_pct)
+            
             if action == TradeAction.BUY_SMALL or action == TradeAction.BUY_MEDIUM or action == TradeAction.BUY_LARGE:
                 units = self.calculate_position_size(price, instrument=instrument)
                 if action == TradeAction.BUY_MEDIUM:
@@ -859,7 +891,7 @@ class RealTimeTradingEngine:
                 elif action == TradeAction.BUY_LARGE:
                     units *= 2.0
 
-                sl = price * (1 - self.stop_loss_pct)
+                sl = price * (1 - effective_sl)
                 tp = price * (1 + self.take_profit_pct)
 
                 order = Order(
@@ -890,7 +922,7 @@ class RealTimeTradingEngine:
                 elif action == TradeAction.SELL_LARGE:
                     units *= 2.0
 
-                sl = price * (1 + self.stop_loss_pct)
+                sl = price * (1 + effective_sl)
                 tp = price * (1 - self.take_profit_pct)
 
                 order = Order(
@@ -1132,6 +1164,12 @@ class RealTimeTradingEngine:
         print(f"Instruments: {self.instruments}")
         print(f"Risk per trade: {self.risk_per_trade*100}%")
         print(f"Max positions: {self.max_positions}")
+        
+        # Initialize drawdown protection
+        if self.use_drawdown_protection:
+            self.drawdown_protection = DrawdownProtection(initial_balance=self.balance)
+            print(f"Drawdown protection: warning at {self.drawdown_protection.warning_drawdown_pct*100}%, pause at {self.drawdown_protection.max_drawdown_pct*100}%")
+        
         print("Waiting for price updates...")
 
         self.running = True
