@@ -156,6 +156,7 @@ def main():
     parser.add_argument("--risk", type=float, default=0.01, help="Risk per trade")
     parser.add_argument("--stop-loss", type=float, default=0.02, help="Stop loss pct")
     parser.add_argument("--take-profit", type=float, default=0.04, help="Take profit pct")
+    parser.add_argument("--sweep", action="store_true", help="Sweep risk parameters (0.5%, 1%, 2%, 3%)")
     args = parser.parse_args()
     
     # Determine instruments
@@ -168,7 +169,13 @@ def main():
     print("Loading MaleCNS brain...")
     agent = TradingAgent(args.graph, checkpoint=args.checkpoint, device=args.device)
     
-    # Run backtest for each instrument
+    # Determine risk levels to test
+    if args.sweep:
+        risk_levels = [0.005, 0.01, 0.02, 0.03]
+    else:
+        risk_levels = [args.risk]
+    
+    # Run backtest for each instrument and risk level
     for instrument in instruments:
         print(f"\n{'=' * 50}")
         print(f"Backtesting {instrument}")
@@ -178,25 +185,21 @@ def main():
         if df is None:
             continue
         
-        results = run_backtest(
-            agent, df, instrument,
-            risk_per_trade=args.risk,
-            stop_loss_pct=args.stop_loss,
-            take_profit_pct=args.take_profit,
-        )
-        
-        print(f"\nResults for {instrument}:")
-        print(f"  Total Return:  {results['total_return']*100:.2f}%")
-        print(f"  Final Equity:  ${results['final_equity']:,.2f}")
-        print(f"  Number of Trades: {results['num_trades']}")
-        print(f"  Win Rate:      {results['win_rate']*100:.1f}%")
-        print(f"  Max Drawdown:  {results['max_drawdown']*100:.2f}%")
-        
-        # Print last 5 trades
-        print(f"\n  Last 5 trades:")
-        for trade in results["trades"][-5:]:
-            pnl_str = f" (P&L: ${trade['pnl']:.2f})" if "pnl" in trade else ""
-            print(f"    {trade['type']} @ {trade['price']:.5f} x {trade['units']:.0f}{pnl_str}")
+        for risk in risk_levels:
+            results = run_backtest(
+                agent, df, instrument,
+                risk_per_trade=risk,
+                stop_loss_pct=args.stop_loss,
+                take_profit_pct=args.take_profit,
+            )
+            
+            risk_label = f" (risk={risk*100:.1f}%)" if args.sweep else ""
+            print(f"\nResults for {instrument}{risk_label}:")
+            print(f"  Total Return:  {results['total_return']*100:.2f}%")
+            print(f"  Final Equity:  ${results['final_equity']:,.2f}")
+            print(f"  Number of Trades: {results['num_trades']}")
+            print(f"  Win Rate:      {results['win_rate']*100:.1f}%")
+            print(f"  Max Drawdown:  {results['max_drawdown']*100:.2f}%")
 
 
 if __name__ == "__main__":
