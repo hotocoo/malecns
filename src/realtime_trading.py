@@ -979,7 +979,13 @@ class RealTimeTradingEngine:
                     units *= 2.0
 
                 sl = price * (1 - effective_sl)
-                tp = price * (1 + self.take_profit_pct)
+                
+                # Dynamic take profit based on ATR (2x ATR)
+                atr = self._calculate_atr(instrument)
+                if atr > 0:
+                    tp = price + (2 * atr)
+                else:
+                    tp = price * (1 + self.take_profit_pct)
 
                 order = Order(
                     instrument=instrument,
@@ -1011,7 +1017,13 @@ class RealTimeTradingEngine:
                     units *= 2.0
 
                 sl = price * (1 + effective_sl)
-                tp = price * (1 - self.take_profit_pct)
+                
+                # Dynamic take profit based on ATR (2x ATR)
+                atr = self._calculate_atr(instrument)
+                if atr > 0:
+                    tp = price - (2 * atr)
+                else:
+                    tp = price * (1 - self.take_profit_pct)
 
                 order = Order(
                     instrument=instrument,
@@ -1034,6 +1046,27 @@ class RealTimeTradingEngine:
                     self.trade_count += 1
                     if self.use_risk_parity and self.risk_parity_sizer:
                         self.risk_parity_sizer.update_position(instrument, units)
+
+    def _calculate_atr(self, instrument: str) -> float:
+        """Calculate Average True Range (ATR) for an instrument."""
+        if instrument not in self.price_history:
+            return 0.0
+        
+        history = self.price_history[instrument]
+        n = len(history)
+        
+        if n < 15:
+            return 0.0
+        
+        trs = []
+        for i in range(-14, 0):
+            high = max(history[i], history[i-1])
+            low = min(history[i], history[i-1])
+            tr = high - low
+            trs.append(tr)
+        
+        atr = sum(trs) / 14
+        return float(atr)
 
     def _create_observation(self, instrument: str, price: float) -> dict:
         """Create observation dict for brain from real price data."""
