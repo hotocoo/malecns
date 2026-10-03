@@ -564,6 +564,20 @@ class RealTimeTradingEngine:
                     if downside_std > 0:
                         sortino_ratio = mean_return / downside_std * (252 ** 0.5)  # Annualized
             
+            # Calculate Information ratio (active return to tracking error)
+            # Using a simple benchmark: holding cash (0% return)
+            info_ratio = 0.0
+            if len(self.balance_history) >= 10:
+                returns = []
+                for i in range(1, len(self.balance_history)):
+                    r = (self.balance_history[i] - self.balance_history[i-1]) / self.balance_history[i-1]
+                    returns.append(r)
+                mean_return = sum(returns) / len(returns)
+                # Tracking error = standard deviation of returns (benchmark is 0)
+                tracking_error = (sum((r - mean_return) ** 2 for r in returns) / len(returns)) ** 0.5
+                if tracking_error > 0:
+                    info_ratio = mean_return / tracking_error * (252 ** 0.5)  # Annualized
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -576,6 +590,7 @@ class RealTimeTradingEngine:
                 "sharpe_ratio": sharpe_ratio,
                 "calmar_ratio": calmar_ratio,
                 "sortino_ratio": sortino_ratio,
+                "info_ratio": info_ratio,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
