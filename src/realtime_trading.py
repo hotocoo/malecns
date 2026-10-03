@@ -426,6 +426,9 @@ class RealTimeTradingEngine:
         use_partial_profit: bool = True,
         partial_profit_pct: float = 0.02,      # Close 50% at 2% profit
         partial_profit_fraction: float = 0.5,  # Close 50% of position
+        use_session_filter: bool = True,
+        trading_sessions: list[str] | None = None,  # ["london", "ny", "tokyo"]
+        avoid_low_liquidity: bool = True,
     ):
         self.broker = broker
         self.graph_dir = graph_dir
@@ -444,6 +447,9 @@ class RealTimeTradingEngine:
         self.use_partial_profit = use_partial_profit
         self.partial_profit_pct = partial_profit_pct
         self.partial_profit_fraction = partial_profit_fraction
+        self.use_session_filter = use_session_filter
+        self.trading_sessions = trading_sessions or ["london", "ny"]
+        self.avoid_low_liquidity = avoid_low_liquidity
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -553,6 +559,55 @@ class RealTimeTradingEngine:
             print("Falling back to simple momentum trading strategy")
             self.agent = SimpleMomentumAgent()
 
+    def _get_trading_session(self) -> str | None:
+        """Determine current trading session based on UTC time.
+        
+        Sessions:
+        - Tokyo: 00:00-09:00 UTC
+        - London: 08:00-17:00 UTC
+        - New York: 13:00-22:00 UTC
+        """
+        from datetime import datetime, timezone
+        utc_now = datetime.now(timezone.utc)
+        hour = utc_now.hour
+        
+        if 0 <= hour < 9:
+            return "tokyo"
+        elif 8 <= hour < 17:
+            return "london"
+        elif 13 <= hour < 22:
+            return "ny"
+        else:
+            return "closed"
+    
+    def _is_trading_time(self) -> bool:
+        """Check if current time is suitable for trading."""
+        if not self.use_session_filter:
+            return True
+        
+        session = self._get_trading_session()
+        if session not in self.trading_sessions:
+            return False
+        
+        # Avoid low liquidity periods (first 15 min and last 15 min of session)
+        if self.avoid_low_liquidity:
+            from datetime import datetime, timezone
+            utc_now = datetime.now(timezone.utc)
+            minute = utc_now.minute
+            
+            # Check session-specific low liquidity windows
+            if session == "tokyo":
+                if (utc_now.hour == 0 and minute < 15) or (utc_now.hour == 8 and minute >= 45):
+                    return False
+            elif session == "london":
+                if (utc_now.hour == 8 and minute < 15) or (utc_now.hour == 16 and minute >= 45):
+                    return False
+            elif session == "ny":
+                if (utc_now.hour == 13 and minute < 15) or (utc_now.hour == 21 and minute >= 45):
+                    return False
+        
+        return True
+    
     def calculate_position_size(self, price: float, volatility: float = 0.02) -> float:
         """Calculate position size based on risk per trade and market volatility.
         
@@ -684,6 +739,10 @@ class RealTimeTradingEngine:
 
             # Check if we already have a position for this instrument
             if instrument in self.positions:
+                return
+
+            # Check if it's a good time to trade
+            if not self._is_trading_time():
                 return
 
             # Get brain decision
