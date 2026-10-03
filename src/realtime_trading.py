@@ -437,6 +437,7 @@ class RealTimeTradingEngine:
         self.win_count = 0
         self.running = False
         self._lock = threading.Lock()
+        self.last_heartbeat = time.time()
 
         # Brain agent (shared across instruments)
         self.agent = None
@@ -469,6 +470,7 @@ class RealTimeTradingEngine:
 
     def on_price_update(self, prices: dict[str, float]):
         """Handle real-time price updates."""
+        self.last_heartbeat = time.time()
         for instrument, price in prices.items():
             try:
                 self._process_instrument(instrument, price)
@@ -663,6 +665,10 @@ class RealTimeTradingEngine:
 
         try:
             while self.running:
+                # Check heartbeat - if no price updates for 60s, log warning
+                if time.time() - self.last_heartbeat > 60:
+                    print(f"WARNING: No price updates for {int(time.time() - self.last_heartbeat)}s")
+                    self.last_heartbeat = time.time()  # Reset to avoid spam
                 time.sleep(1)
         except KeyboardInterrupt:
             print("\nShutting down...")
