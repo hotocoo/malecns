@@ -157,6 +157,7 @@ def main():
     parser.add_argument("--stop-loss", type=float, default=0.02, help="Stop loss pct")
     parser.add_argument("--take-profit", type=float, default=0.04, help="Take profit pct")
     parser.add_argument("--sweep", action="store_true", help="Sweep risk parameters (0.5%, 1%, 2%, 3%)")
+    parser.add_argument("--output", default=None, help="Export results to CSV file")
     args = parser.parse_args()
     
     # Determine instruments
@@ -174,6 +175,9 @@ def main():
         risk_levels = [0.005, 0.01, 0.02, 0.03]
     else:
         risk_levels = [args.risk]
+    
+    # Collect results for CSV export
+    all_results = []
     
     # Run backtest for each instrument and risk level
     for instrument in instruments:
@@ -200,6 +204,25 @@ def main():
             print(f"  Number of Trades: {results['num_trades']}")
             print(f"  Win Rate:      {results['win_rate']*100:.1f}%")
             print(f"  Max Drawdown:  {results['max_drawdown']*100:.2f}%")
+            
+            all_results.append({
+                "instrument": instrument,
+                "risk": risk,
+                "total_return": results["total_return"],
+                "final_equity": results["final_equity"],
+                "num_trades": results["num_trades"],
+                "win_rate": results["win_rate"],
+                "max_drawdown": results["max_drawdown"],
+            })
+    
+    # Export to CSV if requested
+    if args.output and all_results:
+        import csv
+        with open(args.output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=all_results[0].keys())
+            writer.writeheader()
+            writer.writerows(all_results)
+        print(f"\nResults exported to {args.output}")
 
 
 if __name__ == "__main__":
