@@ -418,6 +418,9 @@ class RealTimeTradingEngine:
         max_positions: int = 3,
         stop_loss_pct: float = 0.02,   # 2% stop loss
         take_profit_pct: float = 0.04, # 4% take profit
+        use_trailing_stop: bool = True,
+        trailing_stop_pct: float = 0.01,  # 1% trailing stop
+        volatility_adjusted_sizing: bool = True,
     ):
         self.broker = broker
         self.graph_dir = graph_dir
@@ -428,6 +431,9 @@ class RealTimeTradingEngine:
         self.max_positions = max_positions
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
+        self.use_trailing_stop = use_trailing_stop
+        self.trailing_stop_pct = trailing_stop_pct
+        self.volatility_adjusted_sizing = volatility_adjusted_sizing
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -438,6 +444,10 @@ class RealTimeTradingEngine:
         self.running = False
         self._lock = threading.Lock()
         self.last_heartbeat = time.time()
+        
+        # Price history for technical indicators
+        self.price_history: dict[str, list[float]] = {inst: [] for inst in instruments}
+        self.max_history = 50
 
         # Brain agent (shared across instruments)
         self.agent = None
@@ -533,15 +543,26 @@ class RealTimeTradingEngine:
             print("Falling back to simple momentum trading strategy")
             self.agent = SimpleMomentumAgent()
 
-    def calculate_position_size(self, price: float) -> float:
-        """Calculate position size based on risk per trade."""
+    def calculate_position_size(self, price: float, volatility: float = 0.02) -> float:
+        """Calculate position size based on risk per trade and market volatility.
+        
+        Higher volatility -> smaller position size to maintain consistent risk.
+        """
         if price <= 0:
             return 0.0
         balance = self.broker.get_account_balance()
         risk_amount = balance * self.risk_per_trade
+        
+        # Adjust stop loss based on volatility (wider in volatile markets)
+        if self.volatility_adjusted_sizing:
+            # ATR-based stop: 2x average true range
+            effective_sl = max(self.stop_loss_pct, volatility * 2)
+        else:
+            effective_sl = self.stop_loss_pct
+        
         # For Forex, 1 standard lot = 100,000 units
-        # Risk 1% with 2% stop loss = 50,000 units (0.5 lots)
-        position_size = risk_amount / (price * self.stop_loss_pct)
+        # Position size = risk amount / (price * stop loss %)
+        position_size = risk_amount / (price * effective_sl)
         return min(position_size, 100000)  # Max 1 standard lot
 
     def on_price_update(self, prices: dict[str, float]):
@@ -562,6 +583,29 @@ class RealTimeTradingEngine:
                 pos = self.positions[instrument]
                 entry_price = pos["entry_price"]
                 side = pos["side"]
+
+                # Update trailing stop if enabled
+                if self.use_trailing_stop:
+                    if side == "buy":
+                        # For long positions, trailing stop moves up
+                        current_trailing = pos.get("trailing_stop", entry_price * (1 - self.trailing_stop_pct))
+                        new_trailing = price * (1 - self.trailing_stop_pct)
+                        if new_trailing > current_trailing:
+                            pos["trailing_stop"] = new_trailing
+                            if price <= current_trailing:
+                                print(f"TRAILING STOP: {instrument} at {price:.5f} (was {current_trailing:.5f})")
+                                self._close_position(instrument, pos["units"])
+                                return
+                    else:
+                        # For short positions, trailing stop moves down
+                        current_trailing = pos.get("trailing_stop", entry_price * (1 + self.trailing_stop_pct))
+                        new_trailing = price * (1 + self.trailing_stop_pct)
+                        if new_trailing < current_trailing:
+                            pos["trailing_stop"] = new_trailing
+                            if price >= current_trailing:
+                                print(f"TRAILING STOP: {instrument} at {price:.5f} (was {current_trailing:.5f})")
+                                self._close_position(instrument, pos["units"])
+                                return
 
                 if side == "buy":
                     pnl_pct = (price - entry_price) / entry_price
@@ -637,6 +681,7 @@ class RealTimeTradingEngine:
                         "units": units,
                         "side": "buy",
                         "order_id": result.order_id,
+                        "trailing_stop": price * (1 - self.trailing_stop_pct) if self.use_trailing_stop else None,
                     }
                     self.trade_count += 1
 
@@ -665,38 +710,185 @@ class RealTimeTradingEngine:
                         "units": units,
                         "side": "sell",
                         "order_id": result.order_id,
+                        "trailing_stop": price * (1 + self.trailing_stop_pct) if self.use_trailing_stop else None,
                     }
                     self.trade_count += 1
 
     def _create_observation(self, instrument: str, price: float) -> dict:
         """Create observation dict for brain from real price data."""
-        # In a full implementation, this would use historical data
-        # For now, use simplified observation
+        # Update price history
+        if instrument not in self.price_history:
+            self.price_history[instrument] = []
+        self.price_history[instrument].append(price)
+        if len(self.price_history[instrument]) > self.max_history:
+            self.price_history[instrument].pop(0)
+        
+        history = self.price_history[instrument]
+        n = len(history)
+        
+        # Calculate technical indicators from price history
+        if n >= 2:
+            price_change = (history[-1] - history[-2]) / history[-2]
+        else:
+            price_change = 0.0
+        
+        if n >= 6:
+            price_change_5 = (history[-1] - history[-6]) / history[-6]
+        else:
+            price_change_5 = 0.0
+        
+        if n >= 21:
+            price_change_20 = (history[-1] - history[-21]) / history[-21]
+        else:
+            price_change_20 = 0.0
+        
+        # Simple RSI calculation (14-period)
+        if n >= 15:
+            gains = []
+            losses = []
+            for i in range(-14, 0):
+                change = history[i] - history[i-1]
+                if change > 0:
+                    gains.append(change)
+                    losses.append(0)
+                else:
+                    gains.append(0)
+                    losses.append(-change)
+            avg_gain = sum(gains) / 14
+            avg_loss = sum(losses) / 14
+            if avg_loss == 0:
+                rsi = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+        else:
+            rsi = 50.0
+        
+        # Simple MACD calculation (12, 26, 9)
+        if n >= 26:
+            # Short EMA (12)
+            ema_short = history[-1]
+            multiplier_short = 2 / (12 + 1)
+            for i in range(n-2, -1, -1):
+                ema_short = (history[i] - ema_short) * multiplier_short + ema_short
+            # Long EMA (26)
+            ema_long = history[-1]
+            multiplier_long = 2 / (26 + 1)
+            for i in range(n-2, -1, -1):
+                ema_long = (history[i] - ema_long) * multiplier_long + ema_long
+            macd_line = ema_short - ema_long
+            macd = macd_line  # Simplified: using MACD line as signal
+        else:
+            macd_line = 0.0
+            macd = 0.0
+        
+        # Bollinger Bands (20, 2)
+        if n >= 20:
+            window = history[-20:]
+            bb_mid = sum(window) / 20
+            bb_std = (sum((x - bb_mid)**2 for x in window) / 20) ** 0.5
+            bb_upper = bb_mid + 2 * bb_std
+            bb_lower = bb_mid - 2 * bb_std
+            if bb_upper != bb_lower:
+                bb_position = (price - bb_lower) / (bb_upper - bb_lower)
+            else:
+                bb_position = 0.5
+            bb_width = (bb_upper - bb_lower) / bb_mid
+        else:
+            bb_position = 0.5
+            bb_width = 0.02
+        
+        # ATR (Average True Range, 14-period)
+        if n >= 15:
+            trs = []
+            for i in range(-14, 0):
+                high = max(history[i], history[i-1])
+                low = min(history[i], history[i-1])
+                tr = high - low
+                trs.append(tr)
+            atr = sum(trs) / 14
+        else:
+            atr = 0.01
+        
+        # Momentum (5-period)
+        if n >= 6:
+            momentum_5 = (history[-1] - history[-6]) / history[-6]
+        else:
+            momentum_5 = 0.0
+        
+        # Realized volatility (20-period)
+        if n >= 21:
+            returns = [(history[i] - history[i-1]) / history[i-1] for i in range(-20, 0)]
+            realized_vol = (sum(r**2 for r in returns) / 20) ** 0.5
+        else:
+            realized_vol = 0.1
+        
+        # Volatility estimate
+        volatility = realized_vol if n >= 21 else 0.02
+        
+        # Position info
+        position_pct = 0.0
+        unrealized_pnl = 0.0
+        if instrument in self.positions:
+            pos = self.positions[instrument]
+            position_pct = pos["units"] / 100000  # As fraction of standard lot
+            if pos["side"] == "buy":
+                unrealized_pnl = (price - pos["entry_price"]) * pos["units"]
+            else:
+                unrealized_pnl = (pos["entry_price"] - price) * pos["units"]
+        
+        # Drawdown calculation (simplified)
+        if n >= 10:
+            peak = max(history[-10:])
+            drawdown = (peak - price) / peak
+        else:
+            drawdown = 0.0
+        
+        # Market regime detection (simplified)
+        if n >= 20:
+            # Trending up: price above 20-period MA and rising
+            ma20 = sum(history[-20:]) / 20
+            if price > ma20 and price_change_5 > 0:
+                regime_trending_up = 1.0
+                regime_trending_down = 0.0
+            elif price < ma20 and price_change_5 < 0:
+                regime_trending_up = 0.0
+                regime_trending_down = 1.0
+            else:
+                regime_trending_up = 0.0
+                regime_trending_down = 0.0
+        else:
+            regime_trending_up = 0.0
+            regime_trending_down = 0.0
+        
+        regime_mean_reverting = 1.0 - regime_trending_up - regime_trending_down
+        regime_high_volatility = 1.0 if volatility > 0.03 else 0.0
+        
         return {
-            "price_change": 0.0,
-            "price_change_5": 0.0,
-            "price_change_20": 0.0,
-            "price_normalized": price / 1.0,
-            "position_pct": 0.0,
+            "price_change": price_change,
+            "price_change_5": price_change_5,
+            "price_change_20": price_change_20,
+            "price_normalized": price,
+            "position_pct": position_pct,
             "equity_normalized": 1.0,
-            "unrealized_pnl": 0.0,
-            "rsi": 0.0,
-            "macd": 0.0,
-            "macd_line": 0.0,
-            "bb_position": 0.0,
-            "bb_width": 0.02,
-            "atr": 0.01,
-            "momentum_5": 0.0,
-            "realized_vol": 0.1,
+            "unrealized_pnl": unrealized_pnl,
+            "rsi": rsi / 100.0,  # Normalize to 0-1
+            "macd": macd,
+            "macd_line": macd_line,
+            "bb_position": bb_position,
+            "bb_width": bb_width,
+            "atr": atr,
+            "momentum_5": momentum_5,
+            "realized_vol": realized_vol,
             "spread": 0.0001,
-            "drawdown": 0.0,
-            "max_drawdown": 0.0,
-            "volatility": 0.02,
-            "regime_trending_up": 0.0,
-            "regime_trending_down": 0.0,
-            "regime_mean_reverting": 1.0,
-            "regime_high_volatility": 0.0,
-            "step": 0.0,
+            "drawdown": drawdown,
+            "max_drawdown": drawdown,  # Simplified
+            "volatility": volatility,
+            "regime_trending_up": regime_trending_up,
+            "regime_trending_down": regime_trending_down,
+            "regime_mean_reverting": regime_mean_reverting,
+            "regime_high_volatility": regime_high_volatility,
+            "step": float(n),
         }
 
     def _close_position(self, instrument: str, units: float):
