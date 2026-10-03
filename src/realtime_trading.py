@@ -618,6 +618,11 @@ class RealTimeTradingEngine:
             if self.position_size_history:
                 avg_position_size = sum(self.position_size_history) / len(self.position_size_history)
             
+            # Calculate win/loss ratio
+            win_loss_ratio = 0.0
+            if self.win_count > 0 and (self.trade_count - self.win_count) > 0:
+                win_loss_ratio = self.win_count / (self.trade_count - self.win_count)
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -634,6 +639,7 @@ class RealTimeTradingEngine:
                 "ulcer_index": ulcer_index,
                 "omega_ratio": omega_ratio,
                 "avg_position_size": avg_position_size,
+                "win_loss_ratio": win_loss_ratio,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
