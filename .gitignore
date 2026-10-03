@@ -16,3 +16,6 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 .serena/
+.trading_monitor.json
+.trading_state.json
+trading_decisions.csv
