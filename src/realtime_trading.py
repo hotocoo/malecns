@@ -504,6 +504,7 @@ class RealTimeTradingEngine:
         self.losses_by_instrument = {inst: 0 for inst in instruments}
         self.total_wins = 0.0
         self.total_losses = 0.0
+        self.trade_pnl_history = []
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -623,6 +624,11 @@ class RealTimeTradingEngine:
             if self.win_count > 0 and (self.trade_count - self.win_count) > 0:
                 win_loss_ratio = self.win_count / (self.trade_count - self.win_count)
             
+            # Calculate average trade size
+            avg_trade_size = 0.0
+            if self.trade_pnl_history:
+                avg_trade_size = sum(self.trade_pnl_history) / len(self.trade_pnl_history)
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -640,6 +646,7 @@ class RealTimeTradingEngine:
                 "omega_ratio": omega_ratio,
                 "avg_position_size": avg_position_size,
                 "win_loss_ratio": win_loss_ratio,
+                "avg_trade_size": avg_trade_size,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
@@ -1492,6 +1499,11 @@ class RealTimeTradingEngine:
                     self.max_loss_streak = self.loss_streak
                 self.losses_by_instrument[instrument] += 1
                 self.total_losses += abs(pnl)
+            
+            # Track trade P&L history
+            self.trade_pnl_history.append(pnl)
+            if len(self.trade_pnl_history) > 1000:
+                self.trade_pnl_history.pop(0)
             
             # Calculate profit factor
             if self.gross_loss > 0:
