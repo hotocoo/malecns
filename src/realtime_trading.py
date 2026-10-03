@@ -578,6 +578,17 @@ class RealTimeTradingEngine:
                 if tracking_error > 0:
                     info_ratio = mean_return / tracking_error * (252 ** 0.5)  # Annualized
             
+            # Calculate Ulcer index (drawdown severity and duration)
+            ulcer_index = 0.0
+            if len(self.balance_history) >= 10:
+                drawdowns = []
+                max_balance = self.balance_history[0]
+                for balance in self.balance_history:
+                    max_balance = max(max_balance, balance)
+                    drawdown = (max_balance - balance) / max_balance
+                    drawdowns.append(drawdown)
+                ulcer_index = (sum(d ** 2 for d in drawdowns) / len(drawdowns)) ** 0.5
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -591,6 +602,7 @@ class RealTimeTradingEngine:
                 "calmar_ratio": calmar_ratio,
                 "sortino_ratio": sortino_ratio,
                 "info_ratio": info_ratio,
+                "ulcer_index": ulcer_index,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
