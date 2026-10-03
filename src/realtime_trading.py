@@ -474,6 +474,7 @@ class RealTimeTradingEngine:
         ) if use_risk_parity else None
         self.use_drawdown_protection = use_drawdown_protection
         self.drawdown_protection = None  # Initialized after broker connection
+        self.last_rebalance_check = 0.0
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -720,6 +721,26 @@ class RealTimeTradingEngine:
         # Update risk parity sizer
         if self.use_risk_parity and self.risk_parity_sizer:
             self.risk_parity_sizer.update_prices(prices)
+        
+        # Auto-rebalancing check (every 60 seconds)
+        if self.use_risk_parity and self.risk_parity_sizer:
+            now = time.time()
+            if now - self.last_rebalance_check > 60:
+                self.last_rebalance_check = now
+                try:
+                    portfolio_value = self.broker.get_account_balance()
+                    suggestions = self.risk_parity_sizer.get_rebalancing_suggestions(portfolio_value)
+                    for suggestion in suggestions:
+                        inst = suggestion["instrument"]
+                        action = suggestion["action"]
+                        if inst in self.positions:
+                            if action == "reduce":
+                                # Close 20% of position
+                                units = self.positions[inst]["units"] * 0.2
+                                self._close_position(inst, units)
+                                print(f"Rebalancing: reduced {inst} by {units:.0f} units")
+                except Exception as e:
+                    print(f"Rebalancing error: {e}")
         
         for instrument, price in prices.items():
             try:
