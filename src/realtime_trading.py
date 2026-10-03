@@ -834,6 +834,20 @@ class RealTimeTradingEngine:
                 else:
                     avg_duration_by_month[month] = 0.0
             
+            # Calculate profit factor by quarter
+            profit_factor_by_quarter = {}
+            for quarter in range(4):
+                quarter_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 7889400 % 4 == quarter]
+                if quarter_trades:
+                    quarter_wins = sum(t[2] for t in quarter_trades if t[2] > 0)
+                    quarter_losses = sum(abs(t[2]) for t in quarter_trades if t[2] < 0)
+                    if quarter_losses > 0:
+                        profit_factor_by_quarter[quarter] = quarter_wins / quarter_losses
+                    else:
+                        profit_factor_by_quarter[quarter] = float('inf') if quarter_wins > 0 else 0.0
+                else:
+                    profit_factor_by_quarter[quarter] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -872,6 +886,7 @@ class RealTimeTradingEngine:
                 "profit_factor_by_month": profit_factor_by_month,
                 "win_rate_by_month": win_rate_by_month,
                 "avg_duration_by_month": avg_duration_by_month,
+                "profit_factor_by_quarter": profit_factor_by_quarter,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
