@@ -482,6 +482,8 @@ class RealTimeTradingEngine:
         self.last_rebalance_check = 0.0
         self.last_overnight_check = 0.0
         self.last_correlation_check = 0.0
+        self.daily_start_balance = 0.0
+        self.daily_pnl = 0.0
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -506,10 +508,15 @@ class RealTimeTradingEngine:
     def _update_monitor(self):
         """Update performance monitoring file for external tools."""
         try:
+            # Calculate daily P&L
+            current_balance = self.broker.get_account_balance()
+            self.daily_pnl = current_balance - self.daily_start_balance
+            
             monitor = {
                 "timestamp": time.time(),
-                "balance": self.balance,
+                "balance": current_balance,
                 "total_pnl": self.total_pnl,
+                "daily_pnl": self.daily_pnl,
                 "trade_count": self.trade_count,
                 "win_count": self.win_count,
                 "positions": len(self.positions),
@@ -1339,6 +1346,7 @@ class RealTimeTradingEngine:
         self.init_brain()
 
         self.balance = self.broker.get_account_balance()
+        self.daily_start_balance = self.balance
         print(f"Account balance: ${self.balance:.2f}")
         print(f"Instruments: {self.instruments}")
         print(f"Risk per trade: {self.risk_per_trade*100}%")
