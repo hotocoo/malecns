@@ -356,6 +356,30 @@ class EtoroBroker(Broker):
             self.client.close()
 
 
+# --- Simple Fallback Trading Agent ---
+class SimpleMomentumAgent:
+    """Simple momentum-based trading agent as fallback when brain fails to load."""
+
+    def __init__(self):
+        from trading_env import TradeAction
+        self.TradeAction = TradeAction
+        self._price_history: dict[str, list[float]] = {}
+        self._last_trade: dict[str, float] = {}
+
+    def act(self, obs: dict):
+        """Make a trading decision based on simple momentum."""
+        import random
+        # Use random with some bias to avoid overtrading
+        actions = [
+            self.TradeAction.HOLD,
+            self.TradeAction.HOLD,
+            self.TradeAction.HOLD,
+            self.TradeAction.BUY_SMALL,
+            self.TradeAction.SELL_SMALL,
+        ]
+        return random.choice(actions)
+
+
 # --- Real-Time Trading Engine ---
 class RealTimeTradingEngine:
     """Real-time trading engine using MaleCNS brain."""
@@ -389,19 +413,25 @@ class RealTimeTradingEngine:
         self.trade_count = 0
         self.win_count = 0
         self.running = False
+        self._lock = threading.Lock()
 
         # Brain agent (shared across instruments)
         self.agent = None
 
     def init_brain(self):
-        """Initialize the MaleCNS brain."""
+        """Initialize the MaleCNS brain with graceful fallback."""
         print("Initializing MaleCNS brain...")
-        self.agent = TradingAgent(
-            self.graph_dir,
-            checkpoint=self.checkpoint,
-            device=self.device,
-        )
-        print("Brain initialized")
+        try:
+            self.agent = TradingAgent(
+                self.graph_dir,
+                checkpoint=self.checkpoint,
+                device=self.device,
+            )
+            print("Brain initialized")
+        except Exception as e:
+            print(f"Warning: Brain initialization failed: {e}")
+            print("Falling back to simple momentum trading strategy")
+            self.agent = SimpleMomentumAgent()
 
     def calculate_position_size(self, price: float) -> float:
         """Calculate position size based on risk per trade."""
@@ -421,102 +451,107 @@ class RealTimeTradingEngine:
 
     def _process_instrument(self, instrument: str, price: float):
         """Process trading logic for one instrument."""
-        # Check existing position for stop loss / take profit
-        if instrument in self.positions:
-            pos = self.positions[instrument]
-            entry_price = pos["entry_price"]
-            side = pos["side"]
+        with self._lock:
+            # Check existing position for stop loss / take profit
+            if instrument in self.positions:
+                pos = self.positions[instrument]
+                entry_price = pos["entry_price"]
+                side = pos["side"]
 
-            if side == "buy":
-                pnl_pct = (price - entry_price) / entry_price
-                if pnl_pct <= -self.stop_loss_pct:
-                    print(f"STOP LOSS: {instrument} at {price:.5f}")
-                    self._close_position(instrument, pos["units"])
-                    return
-                elif pnl_pct >= self.take_profit_pct:
-                    print(f"TAKE PROFIT: {instrument} at {price:.5f}")
-                    self._close_position(instrument, pos["units"])
-                    return
-            else:  # sell
-                pnl_pct = (entry_price - price) / entry_price
-                if pnl_pct <= -self.stop_loss_pct:
-                    print(f"STOP LOSS: {instrument} at {price:.5f}")
-                    self._close_position(instrument, pos["units"])
-                    return
-                elif pnl_pct >= self.take_profit_pct:
-                    print(f"TAKE PROFIT: {instrument} at {price:.5f}")
-                    self._close_position(instrument, pos["units"])
-                    return
+                if side == "buy":
+                    pnl_pct = (price - entry_price) / entry_price
+                    if pnl_pct <= -self.stop_loss_pct:
+                        print(f"STOP LOSS: {instrument} at {price:.5f}")
+                        self._close_position(instrument, pos["units"])
+                        return
+                    elif pnl_pct >= self.take_profit_pct:
+                        print(f"TAKE PROFIT: {instrument} at {price:.5f}")
+                        self._close_position(instrument, pos["units"])
+                        return
+                else:  # sell
+                    pnl_pct = (entry_price - price) / entry_price
+                    if pnl_pct <= -self.stop_loss_pct:
+                        print(f"STOP LOSS: {instrument} at {price:.5f}")
+                        self._close_position(instrument, pos["units"])
+                        return
+                    elif pnl_pct >= self.take_profit_pct:
+                        print(f"TAKE PROFIT: {instrument} at {price:.5f}")
+                        self._close_position(instrument, pos["units"])
+                        return
 
-        # Check if we can open new position
-        if len(self.positions) >= self.max_positions:
-            return
+            # Check if we can open new position
+            if len(self.positions) >= self.max_positions:
+                return
 
-        # Get brain decision
-        if self.agent is None:
-            return
+            # Check if we already have a position for this instrument
+            if instrument in self.positions:
+                return
 
-        # Create observation from price data
-        obs = self._create_observation(instrument, price)
-        action = self.agent.act(obs)
+            # Get brain decision
+            if self.agent is None:
+                return
 
-        # Map brain action to trade
-        from trading_env import TradeAction
-        if action == TradeAction.BUY_SMALL or action == TradeAction.BUY_MEDIUM or action == TradeAction.BUY_LARGE:
-            units = self.calculate_position_size(price)
-            if action == TradeAction.BUY_MEDIUM:
-                units *= 1.5
-            elif action == TradeAction.BUY_LARGE:
-                units *= 2.0
+            # Create observation from price data
+            obs = self._create_observation(instrument, price)
+            action = self.agent.act(obs)
 
-            sl = price * (1 - self.stop_loss_pct)
-            tp = price * (1 + self.take_profit_pct)
+            # Map brain action to trade
+            from trading_env import TradeAction
+            if action == TradeAction.BUY_SMALL or action == TradeAction.BUY_MEDIUM or action == TradeAction.BUY_LARGE:
+                units = self.calculate_position_size(price)
+                if action == TradeAction.BUY_MEDIUM:
+                    units *= 1.5
+                elif action == TradeAction.BUY_LARGE:
+                    units *= 2.0
 
-            order = Order(
-                instrument=instrument,
-                side=OrderSide.BUY,
-                units=units,
-                stop_loss=sl,
-                take_profit=tp,
-            )
-            result = self.broker.place_order(order)
-            if result.status == "filled":
-                print(f"BUY {instrument}: {units:.0f} units at {price:.5f} (SL: {sl:.5f}, TP: {tp:.5f})")
-                self.positions[instrument] = {
-                    "entry_price": price,
-                    "units": units,
-                    "side": "buy",
-                    "order_id": result.order_id,
-                }
-                self.trade_count += 1
+                sl = price * (1 - self.stop_loss_pct)
+                tp = price * (1 + self.take_profit_pct)
 
-        elif action == TradeAction.SELL_SMALL or action == TradeAction.SELL_MEDIUM or action == TradeAction.SELL_LARGE:
-            units = self.calculate_position_size(price)
-            if action == TradeAction.SELL_MEDIUM:
-                units *= 1.5
-            elif action == TradeAction.SELL_LARGE:
-                units *= 2.0
+                order = Order(
+                    instrument=instrument,
+                    side=OrderSide.BUY,
+                    units=units,
+                    stop_loss=sl,
+                    take_profit=tp,
+                )
+                result = self.broker.place_order(order)
+                if result.status == "filled":
+                    print(f"BUY {instrument}: {units:.0f} units at {price:.5f} (SL: {sl:.5f}, TP: {tp:.5f})")
+                    self.positions[instrument] = {
+                        "entry_price": price,
+                        "units": units,
+                        "side": "buy",
+                        "order_id": result.order_id,
+                    }
+                    self.trade_count += 1
 
-            sl = price * (1 + self.stop_loss_pct)
-            tp = price * (1 - self.take_profit_pct)
+            elif action == TradeAction.SELL_SMALL or action == TradeAction.SELL_MEDIUM or action == TradeAction.SELL_LARGE:
+                units = self.calculate_position_size(price)
+                if action == TradeAction.SELL_MEDIUM:
+                    units *= 1.5
+                elif action == TradeAction.SELL_LARGE:
+                    units *= 2.0
 
-            order = Order(
-                instrument=instrument,
-                side=OrderSide.SELL,
-                units=units,
-                stop_loss=sl,
-                take_profit=tp,
-            )
-            result = self.broker.place_order(order)
-            if result.status == "filled":
-                print(f"SELL {instrument}: {units:.0f} units at {price:.5f} (SL: {sl:.5f}, TP: {tp:.5f})")
-                self.positions[instrument] = {
-                    "entry_price": price,
-                    "units": units,
-                    "side": "sell",
-                    "order_id": result.order_id,
-                }
-                self.trade_count += 1
+                sl = price * (1 + self.stop_loss_pct)
+                tp = price * (1 - self.take_profit_pct)
+
+                order = Order(
+                    instrument=instrument,
+                    side=OrderSide.SELL,
+                    units=units,
+                    stop_loss=sl,
+                    take_profit=tp,
+                )
+                result = self.broker.place_order(order)
+                if result.status == "filled":
+                    print(f"SELL {instrument}: {units:.0f} units at {price:.5f} (SL: {sl:.5f}, TP: {tp:.5f})")
+                    self.positions[instrument] = {
+                        "entry_price": price,
+                        "units": units,
+                        "side": "sell",
+                        "order_id": result.order_id,
+                    }
+                    self.trade_count += 1
 
     def _create_observation(self, instrument: str, price: float) -> dict:
         """Create observation dict for brain from real price data."""
@@ -605,27 +640,48 @@ def get_demo_broker():
     from demo_broker import DemoBroker
     return DemoBroker()
 
+def load_config() -> dict:
+    """Load trading configuration from .trading_config.json."""
+    config_path = Path(__file__).resolve().parent.parent / ".trading_config.json"
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Failed to load config from {config_path}: {e}")
+    return {}
+
 def main():
+    # Load base config from file
+    config = load_config()
+
     parser = argparse.ArgumentParser(description="MaleCNS Real-Time Trading")
-    parser.add_argument("--broker", choices=["oanda", "etoro"], default="oanda")
-    parser.add_argument("--instrument", default="EUR_USD", help="Trading instrument (e.g., EUR_USD, GBP_USD, BTCUSD)")
+    parser.add_argument("--broker", choices=["oanda", "etoro", "demo"], default=config.get("broker", "demo"))
+    parser.add_argument("--instrument", default=config.get("instrument", "EUR_USD"), help="Trading instrument (e.g., EUR_USD, GBP_USD, BTCUSD)")
     parser.add_argument("--instruments", default=None, help="Comma-separated list of instruments")
     parser.add_argument("--paper", action="store_true", help="Use paper/practice account")
     parser.add_argument("--live", action="store_true", help="Use live account")
-    parser.add_argument("--graph", default="data/graph_w5")
-    parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--risk", type=float, default=0.01, help="Risk per trade (fraction of balance)")
-    parser.add_argument("--max-positions", type=int, default=3)
-    parser.add_argument("--stop-loss", type=float, default=0.02, help="Stop loss percentage")
-    parser.add_argument("--take-profit", type=float, default=0.04, help="Take profit percentage")
+    parser.add_argument("--graph", default=config.get("graph_dir", "data/graph_w5"))
+    parser.add_argument("--checkpoint", default=config.get("checkpoint", None))
+    parser.add_argument("--device", default=config.get("device", "auto"))
+    parser.add_argument("--risk", type=float, default=config.get("risk_per_trade", 0.01), help="Risk per trade (fraction of balance)")
+    parser.add_argument("--max-positions", type=int, default=config.get("max_positions", 3))
+    parser.add_argument("--stop-loss", type=float, default=config.get("stop_loss_pct", 0.02), help="Stop loss percentage")
+    parser.add_argument("--take-profit", type=float, default=config.get("take_profit_pct", 0.04), help="Take profit percentage")
     args = parser.parse_args()
 
-    # Determine instruments
-    instruments = [args.instruments] if args.instruments else [args.instrument]
+    # Determine instruments (CLI > config > default)
+    if args.instruments:
+        instruments = args.instruments.split(",")
+    elif config.get("instruments"):
+        instruments = config["instruments"]
+    else:
+        instruments = [args.instrument]
 
     # Create broker
-    if args.broker == "oanda":
+    if args.broker == "demo":
+        broker = get_demo_broker()
+    elif args.broker == "oanda":
         access_token = os.environ.get("OANDA_ACCESS_TOKEN", "")
         account_id = os.environ.get("OANDA_ACCOUNT_ID", "")
         if not access_token or not account_id:

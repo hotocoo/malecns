@@ -31,8 +31,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import warnings
 
 import metal_lif
+
+# Suppress PyTorch sparse tensor beta warnings (expected, not actionable)
+warnings.filterwarnings("ignore", message=".*Sparse invariant checks.*")
+warnings.filterwarnings("ignore", message=".*Sparse CSR tensor support is in beta.*")
 
 
 @dataclass(frozen=True)
