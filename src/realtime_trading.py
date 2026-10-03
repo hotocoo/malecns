@@ -609,6 +609,11 @@ class RealTimeTradingEngine:
                 if downside > 0:
                     omega_ratio = upside / downside
             
+            # Calculate average position size
+            avg_position_size = 0.0
+            if self.position_size_history:
+                avg_position_size = sum(self.position_size_history) / len(self.position_size_history)
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -624,6 +629,7 @@ class RealTimeTradingEngine:
                 "info_ratio": info_ratio,
                 "ulcer_index": ulcer_index,
                 "omega_ratio": omega_ratio,
+                "avg_position_size": avg_position_size,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
