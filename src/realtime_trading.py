@@ -505,6 +505,8 @@ class RealTimeTradingEngine:
         self.total_wins = 0.0
         self.total_losses = 0.0
         self.trade_pnl_history = []
+        self.wins_by_instrument_value = {inst: 0.0 for inst in instruments}
+        self.losses_by_instrument_value = {inst: 0.0 for inst in instruments}
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -1499,6 +1501,7 @@ class RealTimeTradingEngine:
                     self.max_win_streak = self.win_streak
                 self.wins_by_instrument[instrument] += 1
                 self.total_wins += pnl
+                self.wins_by_instrument_value[instrument] += pnl
             else:
                 self.loss_streak += 1
                 self.gross_loss += abs(pnl)
@@ -1507,6 +1510,7 @@ class RealTimeTradingEngine:
                     self.max_loss_streak = self.loss_streak
                 self.losses_by_instrument[instrument] += 1
                 self.total_losses += abs(pnl)
+                self.losses_by_instrument_value[instrument] += abs(pnl)
             
             # Track trade P&L history
             self.trade_pnl_history.append(pnl)
