@@ -880,6 +880,20 @@ class RealTimeTradingEngine:
             if not self._is_trading_time():
                 return
 
+            # Check correlation-based diversification
+            if self.use_correlation and self.correlation_analyzer:
+                try:
+                    # Check if we're already long/short highly correlated pairs
+                    for pos_inst in self.positions:
+                        if pos_inst == instrument:
+                            continue
+                        corr = self.correlation_analyzer.calculate_correlation(instrument, pos_inst)
+                        if corr > 0.8:
+                            # Highly correlated - avoid adding another position
+                            return
+                except Exception as e:
+                    print(f"Correlation diversification error: {e}")
+
             # Check correlation analysis
             if self.use_correlation and self.correlation_analyzer:
                 try:
