@@ -478,6 +478,7 @@ class RealTimeTradingEngine:
         self.drawdown_protection = None  # Initialized after broker connection
         self.use_market_regime = use_market_regime
         self.regime_detector = MarketRegimeDetector() if use_market_regime else None
+        self.avoid_low_liquidity = True
         self.last_rebalance_check = 0.0
 
         # Trading state
@@ -920,6 +921,17 @@ class RealTimeTradingEngine:
                             return
                 except Exception as e:
                     print(f"Correlation diversification error: {e}")
+
+            # Check liquidity (avoid trading during low-volume periods)
+            if self.avoid_low_liquidity:
+                try:
+                    # Use ATR as a proxy for liquidity/volatility
+                    atr = self._calculate_atr(instrument)
+                    if atr > 0 and atr < price * 0.0001:
+                        # Very low volatility = low liquidity
+                        return
+                except Exception as e:
+                    print(f"Liquidity check error: {e}")
 
             # Check correlation analysis
             if self.use_correlation and self.correlation_analyzer:
