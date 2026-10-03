@@ -1413,7 +1413,10 @@ class RealTimeTradingEngine:
             self.total_mfe += mfe
             avg_mfe = self.total_mfe / max(self.trade_count, 1)
             
-            print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak}, PF: {profit_factor:.2f}, Avg duration: {avg_duration/60:.1f}min, Avg MAE: {avg_mae:.5f}, Avg MFE: {avg_mfe:.5f})")
+            # Calculate expectancy
+            expectancy = self.total_pnl / max(self.trade_count, 1)
+            
+            print(f"Closed {instrument}: P&L = {pnl:.2f} USD (Win streak: {self.win_streak}, Loss streak: {self.loss_streak}, PF: {profit_factor:.2f}, Avg duration: {avg_duration/60:.1f}min, Avg MAE: {avg_mae:.5f}, Avg MFE: {avg_mfe:.5f}, Expectancy: {expectancy:.2f})")
             if self.use_risk_parity and self.risk_parity_sizer:
                 self.risk_parity_sizer.remove_position(instrument)
 
