@@ -800,6 +800,20 @@ class RealTimeTradingEngine:
                 else:
                     avg_duration_by_day[day] = 0.0
             
+            # Calculate profit factor by month
+            profit_factor_by_month = {}
+            for month in range(12):
+                month_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 2629800 % 12 == month]
+                if month_trades:
+                    month_wins = sum(t[2] for t in month_trades if t[2] > 0)
+                    month_losses = sum(abs(t[2]) for t in month_trades if t[2] < 0)
+                    if month_losses > 0:
+                        profit_factor_by_month[month] = month_wins / month_losses
+                    else:
+                        profit_factor_by_month[month] = float('inf') if month_wins > 0 else 0.0
+                else:
+                    profit_factor_by_month[month] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -835,6 +849,7 @@ class RealTimeTradingEngine:
                 "profit_factor_by_day": profit_factor_by_day,
                 "win_rate_by_day": win_rate_by_day,
                 "avg_duration_by_day": avg_duration_by_day,
+                "profit_factor_by_month": profit_factor_by_month,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
