@@ -481,6 +481,7 @@ class RealTimeTradingEngine:
         self.avoid_low_liquidity = True
         self.last_rebalance_check = 0.0
         self.last_overnight_check = 0.0
+        self.last_correlation_check = 0.0
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -789,6 +790,22 @@ class RealTimeTradingEngine:
                         print(f"OVERNIGHT: closed {instrument} before market close")
             except Exception as e:
                 print(f"Overnight check error: {e}")
+        
+        # Position correlation monitoring: check if open positions are too correlated
+        if self.use_correlation and self.correlation_analyzer:
+            if now - self.last_correlation_check > 60:
+                self.last_correlation_check = now
+                try:
+                    # Check correlation between all open positions
+                    instruments = list(self.positions.keys())
+                    for i, inst1 in enumerate(instruments):
+                        for j, inst2 in enumerate(instruments):
+                            if i < j:
+                                corr = self.correlation_analyzer.calculate_correlation(inst1, inst2)
+                                if corr > 0.9:
+                                    print(f"WARNING: {inst1} and {inst2} highly correlated ({corr:.2f})")
+                except Exception as e:
+                    print(f"Correlation monitoring error: {e}")
         
         for instrument, price in prices.items():
             try:
