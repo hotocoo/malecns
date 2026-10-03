@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trading_agent import TradingAgent
 from trading_env import TradingConfig
 from news_sentiment import NewsSentimentAnalyzer
+from correlation import CorrelationAnalyzer
 
 
 # --- Order Types ---
@@ -431,6 +432,7 @@ class RealTimeTradingEngine:
         trading_sessions: list[str] | None = None,  # ["london", "ny", "tokyo"]
         avoid_low_liquidity: bool = True,
         use_news_sentiment: bool = True,
+        use_correlation: bool = True,
     ):
         self.broker = broker
         self.graph_dir = graph_dir
@@ -454,6 +456,8 @@ class RealTimeTradingEngine:
         self.avoid_low_liquidity = avoid_low_liquidity
         self.use_news_sentiment = use_news_sentiment
         self.news_analyzer = NewsSentimentAnalyzer(instruments=instruments) if use_news_sentiment else None
+        self.use_correlation = use_correlation
+        self.correlation_analyzer = CorrelationAnalyzer(instruments=instruments) if use_correlation else None
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -642,11 +646,24 @@ class RealTimeTradingEngine:
             except Exception as e:
                 print(f"News sentiment error: {e}")
         
+        # Adjust for correlation
+        if self.use_correlation and self.correlation_analyzer and instrument:
+            try:
+                corr_factor = self.correlation_analyzer.get_position_adjustment(instrument)
+                position_size *= corr_factor
+            except Exception as e:
+                print(f"Correlation error: {e}")
+        
         return min(position_size, 100000)  # Max 1 standard lot
 
     def on_price_update(self, prices: dict[str, float]):
         """Handle real-time price updates."""
         self.last_heartbeat = time.time()
+        
+        # Update correlation analyzer
+        if self.use_correlation and self.correlation_analyzer:
+            self.correlation_analyzer.update_prices(prices)
+        
         for instrument, price in prices.items():
             try:
                 self._process_instrument(instrument, price)
@@ -758,6 +775,14 @@ class RealTimeTradingEngine:
             # Check if it's a good time to trade
             if not self._is_trading_time():
                 return
+
+            # Check correlation analysis
+            if self.use_correlation and self.correlation_analyzer:
+                try:
+                    if not self.correlation_analyzer.should_trade(instrument):
+                        return
+                except Exception as e:
+                    print(f"Correlation check error: {e}")
 
             # Get brain decision
             if self.agent is None:
