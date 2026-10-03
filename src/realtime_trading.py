@@ -499,6 +499,7 @@ class RealTimeTradingEngine:
         self.best_trade_instrument = ""
         self.worst_trade_instrument = ""
         self.trades_per_day = {}
+        self.position_size_history = []
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -1194,6 +1195,10 @@ class RealTimeTradingEngine:
                         "max_favorable_excursion": 0.0,
                     }
                     self.trade_count += 1
+                    # Track position size history
+                    self.position_size_history.append(units)
+                    if len(self.position_size_history) > 1000:
+                        self.position_size_history.pop(0)
                     if self.use_risk_parity and self.risk_parity_sizer:
                         self.risk_parity_sizer.update_position(instrument, units)
 
@@ -1238,6 +1243,10 @@ class RealTimeTradingEngine:
                         "max_favorable_excursion": 0.0,
                     }
                     self.trade_count += 1
+                    # Track position size history
+                    self.position_size_history.append(units)
+                    if len(self.position_size_history) > 1000:
+                        self.position_size_history.pop(0)
                     if self.use_risk_parity and self.risk_parity_sizer:
                         self.risk_parity_sizer.update_position(instrument, units)
 
