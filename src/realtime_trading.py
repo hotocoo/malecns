@@ -633,9 +633,22 @@ class RealTimeTradingEngine:
             print(f"Closed {instrument}: P&L = {pnl:.2f} USD")
 
     def run(self):
-        """Start the real-time trading engine."""
+        """Start the real-time trading engine with connection retry."""
         print("Starting real-time trading engine...")
-        self.broker.connect()
+        
+        # Retry broker connection up to 3 times
+        connected = False
+        for attempt in range(3):
+            if self.broker.connect():
+                connected = True
+                break
+            print(f"Connection attempt {attempt+1}/3 failed, retrying in 5s...")
+            time.sleep(5)
+        
+        if not connected:
+            print("Failed to connect to broker after 3 attempts")
+            return
+        
         self.init_brain()
 
         self.balance = self.broker.get_account_balance()
