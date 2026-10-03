@@ -675,17 +675,31 @@ class RealTimeTradingEngine:
             self._shutdown()
 
     def _shutdown(self):
-        """Close all positions and disconnect."""
+        """Close all positions and disconnect with summary report."""
         self.running = False
+        print("\n" + "=" * 50)
+        print("TRADING SESSION SUMMARY")
+        print("=" * 50)
         print("Closing all positions...")
         for instrument in list(self.positions.keys()):
             pos = self.positions[instrument]
             self._close_position(instrument, pos["units"])
         self.broker.disconnect()
-        print(f"Total P&L: ${self.total_pnl:.2f}")
-        print(f"Trades: {self.trade_count}, Wins: {self.win_count}")
+        
+        # Calculate summary stats
+        final_balance = self.broker.get_account_balance()
+        return_pct = ((final_balance - self.balance) / self.balance) * 100 if self.balance > 0 else 0
+        
+        print(f"\nInitial Balance: ${self.balance:,.2f}")
+        print(f"Final Balance:   ${final_balance:,.2f}")
+        print(f"Total P&L:       ${self.total_pnl:,.2f} ({return_pct:+.2f}%)")
+        print(f"Total Trades:    {self.trade_count}")
+        print(f"Wins:            {self.win_count}")
         if self.trade_count > 0:
-            print(f"Win rate: {self.win_count/self.trade_count*100:.1f}%")
+            print(f"Win Rate:        {self.win_count/self.trade_count*100:.1f}%")
+            avg_win = self.total_pnl / self.win_count if self.win_count > 0 else 0
+            print(f"Avg Win:         ${avg_win:,.2f}")
+        print("=" * 50)
 
 
 def get_demo_broker():
