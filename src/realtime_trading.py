@@ -766,6 +766,20 @@ class RealTimeTradingEngine:
                 else:
                     avg_duration_by_hour[hour] = 0.0
             
+            # Calculate profit factor by day of week
+            profit_factor_by_day = {}
+            for day in range(7):
+                day_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 86400 % 7 == day]
+                if day_trades:
+                    day_wins = sum(t[2] for t in day_trades if t[2] > 0)
+                    day_losses = sum(abs(t[2]) for t in day_trades if t[2] < 0)
+                    if day_losses > 0:
+                        profit_factor_by_day[day] = day_wins / day_losses
+                    else:
+                        profit_factor_by_day[day] = float('inf') if day_wins > 0 else 0.0
+                else:
+                    profit_factor_by_day[day] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -798,6 +812,7 @@ class RealTimeTradingEngine:
                 "profit_factor_by_hour": profit_factor_by_hour,
                 "win_rate_by_hour": win_rate_by_hour,
                 "avg_duration_by_hour": avg_duration_by_hour,
+                "profit_factor_by_day": profit_factor_by_day,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
