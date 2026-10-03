@@ -500,6 +500,8 @@ class RealTimeTradingEngine:
         self.worst_trade_instrument = ""
         self.trades_per_day = {}
         self.position_size_history = []
+        self.wins_by_instrument = {inst: 0 for inst in instruments}
+        self.losses_by_instrument = {inst: 0 for inst in instruments}
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -1472,12 +1474,14 @@ class RealTimeTradingEngine:
                 self.loss_streak = 0
                 if self.win_streak > self.max_win_streak:
                     self.max_win_streak = self.win_streak
+                self.wins_by_instrument[instrument] += 1
             else:
                 self.loss_streak += 1
                 self.gross_loss += abs(pnl)
                 self.win_streak = 0
                 if self.loss_streak > self.max_loss_streak:
                     self.max_loss_streak = self.loss_streak
+                self.losses_by_instrument[instrument] += 1
             
             # Calculate profit factor
             if self.gross_loss > 0:
