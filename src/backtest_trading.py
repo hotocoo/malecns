@@ -158,6 +158,7 @@ def main():
     parser.add_argument("--take-profit", type=float, default=0.04, help="Take profit pct")
     parser.add_argument("--sweep", action="store_true", help="Sweep risk parameters (0.5%, 1%, 2%, 3%)")
     parser.add_argument("--output", default=None, help="Export results to CSV file")
+    parser.add_argument("--periods", default=None, help="Comma-separated periods to test (e.g., 1mo,3mo,6mo)")
     args = parser.parse_args()
     
     # Determine instruments
@@ -176,44 +177,52 @@ def main():
     else:
         risk_levels = [args.risk]
     
+    # Determine periods to test
+    if args.periods:
+        periods = args.periods.split(",")
+    else:
+        periods = [args.period]
+    
     # Collect results for CSV export
     all_results = []
     
-    # Run backtest for each instrument and risk level
+    # Run backtest for each instrument, period, and risk level
     for instrument in instruments:
-        print(f"\n{'=' * 50}")
-        print(f"Backtesting {instrument}")
-        print(f"{'=' * 50}")
-        
-        df = load_historical_data(instrument, args.period, args.interval)
-        if df is None:
-            continue
-        
-        for risk in risk_levels:
-            results = run_backtest(
-                agent, df, instrument,
-                risk_per_trade=risk,
-                stop_loss_pct=args.stop_loss,
-                take_profit_pct=args.take_profit,
-            )
+        for period in periods:
+            print(f"\n{'=' * 50}")
+            print(f"Backtesting {instrument} ({period})")
+            print(f"{'=' * 50}")
             
-            risk_label = f" (risk={risk*100:.1f}%)" if args.sweep else ""
-            print(f"\nResults for {instrument}{risk_label}:")
-            print(f"  Total Return:  {results['total_return']*100:.2f}%")
-            print(f"  Final Equity:  ${results['final_equity']:,.2f}")
-            print(f"  Number of Trades: {results['num_trades']}")
-            print(f"  Win Rate:      {results['win_rate']*100:.1f}%")
-            print(f"  Max Drawdown:  {results['max_drawdown']*100:.2f}%")
+            df = load_historical_data(instrument, period, args.interval)
+            if df is None:
+                continue
             
-            all_results.append({
-                "instrument": instrument,
-                "risk": risk,
-                "total_return": results["total_return"],
-                "final_equity": results["final_equity"],
-                "num_trades": results["num_trades"],
-                "win_rate": results["win_rate"],
-                "max_drawdown": results["max_drawdown"],
-            })
+            for risk in risk_levels:
+                results = run_backtest(
+                    agent, df, instrument,
+                    risk_per_trade=risk,
+                    stop_loss_pct=args.stop_loss,
+                    take_profit_pct=args.take_profit,
+                )
+                
+                risk_label = f" (risk={risk*100:.1f}%)" if args.sweep else ""
+                print(f"\nResults for {instrument} ({period}){risk_label}:")
+                print(f"  Total Return:  {results['total_return']*100:.2f}%")
+                print(f"  Final Equity:  ${results['final_equity']:,.2f}")
+                print(f"  Number of Trades: {results['num_trades']}")
+                print(f"  Win Rate:      {results['win_rate']*100:.1f}%")
+                print(f"  Max Drawdown:  {results['max_drawdown']*100:.2f}%")
+                
+                all_results.append({
+                    "instrument": instrument,
+                    "period": period,
+                    "risk": risk,
+                    "total_return": results["total_return"],
+                    "final_equity": results["final_equity"],
+                    "num_trades": results["num_trades"],
+                    "win_rate": results["win_rate"],
+                    "max_drawdown": results["max_drawdown"],
+                })
     
     # Export to CSV if requested
     if args.output and all_results:
