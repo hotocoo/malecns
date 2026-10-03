@@ -491,6 +491,7 @@ class RealTimeTradingEngine:
         self.gross_profit = 0.0
         self.gross_loss = 0.0
         self.total_trade_duration = 0.0
+        self.balance_history = []
 
         # Trading state
         self.positions: dict[str, dict] = {}
@@ -519,6 +520,24 @@ class RealTimeTradingEngine:
             current_balance = self.broker.get_account_balance()
             self.daily_pnl = current_balance - self.daily_start_balance
             
+            # Track balance history for Sharpe ratio calculation
+            self.balance_history.append(current_balance)
+            if len(self.balance_history) > 1000:
+                self.balance_history.pop(0)
+            
+            # Calculate Sharpe ratio (simplified)
+            sharpe_ratio = 0.0
+            if len(self.balance_history) >= 10:
+                returns = []
+                for i in range(1, len(self.balance_history)):
+                    r = (self.balance_history[i] - self.balance_history[i-1]) / self.balance_history[i-1]
+                    returns.append(r)
+                mean_return = sum(returns) / len(returns)
+                variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
+                std_return = variance ** 0.5
+                if std_return > 0:
+                    sharpe_ratio = mean_return / std_return * (252 ** 0.5)  # Annualized
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -528,6 +547,7 @@ class RealTimeTradingEngine:
                 "win_count": self.win_count,
                 "positions": len(self.positions),
                 "position_details": {k: {"units": v["units"], "entry": v["entry_price"], "side": v["side"]} for k, v in self.positions.items()},
+                "sharpe_ratio": sharpe_ratio,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
