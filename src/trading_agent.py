@@ -66,6 +66,11 @@ class TradingAgent:
         self.obs_mean = np.zeros(self.n_obs)
         self.obs_std = np.ones(self.n_obs)
         self.n_obs_samples = 0
+        # Performance tracking
+        self.n_decisions = 0
+        self.n_buys = 0
+        self.n_sells = 0
+        self.n_holds = 0
 
         self.env = TradingEnvironment(self.trading_config)
         self.obs = self.env.reset()
@@ -139,7 +144,16 @@ class TradingAgent:
             obs = self.obs
         input_tensor = self._obs_to_tensor(obs)
         output = self.agent.act(input_tensor, self.theta)
-        return self._output_to_action(output)
+        action = self._output_to_action(output)
+        # Track decision
+        self.n_decisions += 1
+        if action in [TradeAction.BUY_SMALL, TradeAction.BUY_MEDIUM, TradeAction.BUY_LARGE]:
+            self.n_buys += 1
+        elif action in [TradeAction.SELL_SMALL, TradeAction.SELL_MEDIUM, TradeAction.SELL_LARGE]:
+            self.n_sells += 1
+        else:
+            self.n_holds += 1
+        return action
 
     def step(self) -> tuple[dict, float, bool, dict]:
         action = self.act(self.obs)
@@ -157,7 +171,14 @@ class TradingAgent:
         return self.obs
 
     def get_performance(self) -> dict:
-        return self.env.get_performance_metrics()
+        metrics = self.env.get_performance_metrics()
+        metrics["decisions"] = {
+            "total": self.n_decisions,
+            "buys": self.n_buys,
+            "sells": self.n_sells,
+            "holds": self.n_holds,
+        }
+        return metrics
 
     def get_brain_activity(self) -> dict:
         rates = self.brain.v.cpu().numpy().flatten()
