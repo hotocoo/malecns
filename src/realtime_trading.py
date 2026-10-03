@@ -914,6 +914,12 @@ class RealTimeTradingEngine:
                 day_trades = [t for t in self.trades_by_session.values() for t in t if t[4] % 604800 // 86400 == day]
                 trade_count_by_day[day] = len(day_trades)
             
+            # Calculate trade count by month
+            trade_count_by_month = {}
+            for month in range(12):
+                month_trades = [t for t in self.trades_by_session.values() for t in t if t[4] // 2629800 % 12 == month]
+                trade_count_by_month[month] = len(month_trades)
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -960,6 +966,7 @@ class RealTimeTradingEngine:
                 "avg_duration_by_year": avg_duration_by_year,
                 "trade_count_by_hour": trade_count_by_hour,
                 "trade_count_by_day": trade_count_by_day,
+                "trade_count_by_month": trade_count_by_month,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
