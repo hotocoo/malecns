@@ -709,6 +709,20 @@ class RealTimeTradingEngine:
             except Exception as e:
                 print(f"Market regime error: {e}")
         
+        # Volatility targeting: adjust position size to target specific volatility
+        if instrument and self.price_history.get(instrument):
+            try:
+                history = self.price_history[instrument]
+                if len(history) >= 20:
+                    returns = [history[i] - history[i-1] for i in range(1, len(history))]
+                    realized_vol = (sum(r**2 for r in returns) / len(returns)) ** 0.5
+                    # Target 1% daily volatility
+                    target_vol = 0.01
+                    vol_factor = target_vol / realized_vol if realized_vol > 0 else 1.0
+                    position_size *= min(vol_factor, 2.0)  # Cap at 2x
+            except Exception as e:
+                print(f"Volatility targeting error: {e}")
+        
         return min(position_size, 100000)  # Max 1 standard lot
 
     def on_price_update(self, prices: dict[str, float]):
