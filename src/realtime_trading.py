@@ -1138,6 +1138,16 @@ class RealTimeTradingEngine:
                         else:
                             avg_duration_by_hour_inst_session[hour][inst][session] = 0.0
             
+            # Calculate trade count by day of week, instrument, and session
+            trade_count_by_day_inst_session = {}
+            for day in range(7):
+                trade_count_by_day_inst_session[day] = {}
+                for inst in self.instruments:
+                    trade_count_by_day_inst_session[day][inst] = {}
+                    for session in self.trades_by_session:
+                        day_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 86400 % 7 == day]
+                        trade_count_by_day_inst_session[day][inst][session] = len(day_inst_session_trades)
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1202,6 +1212,7 @@ class RealTimeTradingEngine:
                 "profit_factor_by_hour_inst_session": profit_factor_by_hour_inst_session,
                 "win_rate_by_hour_inst_session": win_rate_by_hour_inst_session,
                 "avg_duration_by_hour_inst_session": avg_duration_by_hour_inst_session,
+                "trade_count_by_day_inst_session": trade_count_by_day_inst_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
