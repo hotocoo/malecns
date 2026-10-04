@@ -1456,6 +1456,24 @@ class RealTimeTradingEngine:
                         else:
                             win_rate_by_month_inst_session[month][inst][session] = 0.0
             
+            # Calculate profit factor by month, instrument, and session
+            profit_factor_by_month_inst_session = {}
+            for month in range(12):
+                profit_factor_by_month_inst_session[month] = {}
+                for inst in self.instruments:
+                    profit_factor_by_month_inst_session[month][inst] = {}
+                    for session in self.trades_by_session:
+                        month_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 2629800 % 12 == month]
+                        if month_inst_session_trades:
+                            month_inst_session_wins = sum(t[2] for t in month_inst_session_trades if t[2] > 0)
+                            month_inst_session_losses = sum(abs(t[2]) for t in month_inst_session_trades if t[2] < 0)
+                            if month_inst_session_losses > 0:
+                                profit_factor_by_month_inst_session[month][inst][session] = month_inst_session_wins / month_inst_session_losses
+                            else:
+                                profit_factor_by_month_inst_session[month][inst][session] = float('inf') if month_inst_session_wins > 0 else 0.0
+                        else:
+                            profit_factor_by_month_inst_session[month][inst][session] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1543,6 +1561,7 @@ class RealTimeTradingEngine:
                 "trade_count_by_month_inst_session": trade_count_by_month_inst_session,
                 "avg_duration_by_month_inst_session": avg_duration_by_month_inst_session,
                 "win_rate_by_month_inst_session": win_rate_by_month_inst_session,
+                "profit_factor_by_month_inst_session": profit_factor_by_month_inst_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
