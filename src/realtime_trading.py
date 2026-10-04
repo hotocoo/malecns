@@ -1316,6 +1316,20 @@ class RealTimeTradingEngine:
                         year_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 31557600 == year - 1970]
                         trade_count_by_year_inst_session[year][inst][session] = len(year_inst_session_trades)
             
+            # Calculate average trade duration by year, instrument, and session
+            avg_duration_by_year_inst_session = {}
+            for year in range(1970, 2030):
+                avg_duration_by_year_inst_session[year] = {}
+                for inst in self.instruments:
+                    avg_duration_by_year_inst_session[year][inst] = {}
+                    for session in self.trades_by_session:
+                        year_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 31557600 == year - 1970]
+                        if year_inst_session_trades:
+                            year_inst_session_durations = [t[3] for t in year_inst_session_trades]
+                            avg_duration_by_year_inst_session[year][inst][session] = sum(year_inst_session_durations) / len(year_inst_session_durations)
+                        else:
+                            avg_duration_by_year_inst_session[year][inst][session] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1393,6 +1407,7 @@ class RealTimeTradingEngine:
                 "win_rate_by_quarter_inst_session": win_rate_by_quarter_inst_session,
                 "profit_factor_by_quarter_inst_session": profit_factor_by_quarter_inst_session,
                 "trade_count_by_year_inst_session": trade_count_by_year_inst_session,
+                "avg_duration_by_year_inst_session": avg_duration_by_year_inst_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
