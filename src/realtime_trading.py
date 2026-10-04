@@ -960,6 +960,18 @@ class RealTimeTradingEngine:
                     else:
                         win_rate_by_session_inst[session][inst] = 0.0
             
+            # Calculate average trade duration by session and instrument
+            avg_duration_by_session_inst = {}
+            for session in self.trades_by_session:
+                avg_duration_by_session_inst[session] = {}
+                for inst in self.instruments:
+                    session_inst_trades = [t for t in self.trades_by_session[session] if t[5] == inst]
+                    if session_inst_trades:
+                        session_inst_durations = [t[3] for t in session_inst_trades]
+                        avg_duration_by_session_inst[session][inst] = sum(session_inst_durations) / len(session_inst_durations)
+                    else:
+                        avg_duration_by_session_inst[session][inst] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1011,6 +1023,7 @@ class RealTimeTradingEngine:
                 "trade_count_by_year": trade_count_by_year,
                 "profit_factor_by_session_inst": profit_factor_by_session_inst,
                 "win_rate_by_session_inst": win_rate_by_session_inst,
+                "avg_duration_by_session_inst": avg_duration_by_session_inst,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
