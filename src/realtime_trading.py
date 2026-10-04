@@ -1092,6 +1092,24 @@ class RealTimeTradingEngine:
                         inst_hour_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and (t[4] // 3600) % 24 == hour]
                         trade_count_by_inst_hour_session[inst][hour][session] = len(inst_hour_session_trades)
             
+            # Calculate profit factor by time of day, instrument, and session
+            profit_factor_by_hour_inst_session = {}
+            for hour in range(24):
+                profit_factor_by_hour_inst_session[hour] = {}
+                for inst in self.instruments:
+                    profit_factor_by_hour_inst_session[hour][inst] = {}
+                    for session in self.trades_by_session:
+                        hour_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and (t[4] // 3600) % 24 == hour]
+                        if hour_inst_session_trades:
+                            hour_inst_session_wins = sum(t[2] for t in hour_inst_session_trades if t[2] > 0)
+                            hour_inst_session_losses = sum(abs(t[2]) for t in hour_inst_session_trades if t[2] < 0)
+                            if hour_inst_session_losses > 0:
+                                profit_factor_by_hour_inst_session[hour][inst][session] = hour_inst_session_wins / hour_inst_session_losses
+                            else:
+                                profit_factor_by_hour_inst_session[hour][inst][session] = float('inf') if hour_inst_session_wins > 0 else 0.0
+                        else:
+                            profit_factor_by_hour_inst_session[hour][inst][session] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1153,6 +1171,7 @@ class RealTimeTradingEngine:
                 "win_rate_by_inst_hour_session": win_rate_by_inst_hour_session,
                 "avg_duration_by_inst_hour_session": avg_duration_by_inst_hour_session,
                 "trade_count_by_inst_hour_session": trade_count_by_inst_hour_session,
+                "profit_factor_by_hour_inst_session": profit_factor_by_hour_inst_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
