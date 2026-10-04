@@ -1344,6 +1344,24 @@ class RealTimeTradingEngine:
                         else:
                             win_rate_by_year_inst_session[year][inst][session] = 0.0
             
+            # Calculate profit factor by year, instrument, and session
+            profit_factor_by_year_inst_session = {}
+            for year in range(1970, 2030):
+                profit_factor_by_year_inst_session[year] = {}
+                for inst in self.instruments:
+                    profit_factor_by_year_inst_session[year][inst] = {}
+                    for session in self.trades_by_session:
+                        year_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 31557600 == year - 1970]
+                        if year_inst_session_trades:
+                            year_inst_session_wins = sum(t[2] for t in year_inst_session_trades if t[2] > 0)
+                            year_inst_session_losses = sum(abs(t[2]) for t in year_inst_session_trades if t[2] < 0)
+                            if year_inst_session_losses > 0:
+                                profit_factor_by_year_inst_session[year][inst][session] = year_inst_session_wins / year_inst_session_losses
+                            else:
+                                profit_factor_by_year_inst_session[year][inst][session] = float('inf') if year_inst_session_wins > 0 else 0.0
+                        else:
+                            profit_factor_by_year_inst_session[year][inst][session] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1423,6 +1441,7 @@ class RealTimeTradingEngine:
                 "trade_count_by_year_inst_session": trade_count_by_year_inst_session,
                 "avg_duration_by_year_inst_session": avg_duration_by_year_inst_session,
                 "win_rate_by_year_inst_session": win_rate_by_year_inst_session,
+                "profit_factor_by_year_inst_session": profit_factor_by_year_inst_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
