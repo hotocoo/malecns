@@ -1400,6 +1400,24 @@ class RealTimeTradingEngine:
                         else:
                             win_rate_by_day_inst_session[day][inst][session] = 0.0
             
+            # Calculate profit factor by day of week, instrument, and session
+            profit_factor_by_day_inst_session = {}
+            for day in range(7):
+                profit_factor_by_day_inst_session[day] = {}
+                for inst in self.instruments:
+                    profit_factor_by_day_inst_session[day][inst] = {}
+                    for session in self.trades_by_session:
+                        day_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 86400 % 7 == day]
+                        if day_inst_session_trades:
+                            day_inst_session_wins = sum(t[2] for t in day_inst_session_trades if t[2] > 0)
+                            day_inst_session_losses = sum(abs(t[2]) for t in day_inst_session_trades if t[2] < 0)
+                            if day_inst_session_losses > 0:
+                                profit_factor_by_day_inst_session[day][inst][session] = day_inst_session_wins / day_inst_session_losses
+                            else:
+                                profit_factor_by_day_inst_session[day][inst][session] = float('inf') if day_inst_session_wins > 0 else 0.0
+                        else:
+                            profit_factor_by_day_inst_session[day][inst][session] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1483,6 +1501,7 @@ class RealTimeTradingEngine:
                 "trade_count_by_day_inst_session": trade_count_by_day_inst_session,
                 "avg_duration_by_day_inst_session": avg_duration_by_day_inst_session,
                 "win_rate_by_day_inst_session": win_rate_by_day_inst_session,
+                "profit_factor_by_day_inst_session": profit_factor_by_day_inst_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
