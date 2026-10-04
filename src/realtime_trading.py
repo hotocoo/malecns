@@ -1530,6 +1530,17 @@ class RealTimeTradingEngine:
                         else:
                             profit_factor_by_quarter_inst_session[quarter][inst][session] = 0.0
             
+            # Calculate trade count by year, instrument, and session
+            trade_count_by_year_inst_session = {}
+            current_year = time.gmtime()[0]
+            for year in range(current_year - 1, current_year + 2):
+                trade_count_by_year_inst_session[year] = {}
+                for inst in self.instruments:
+                    trade_count_by_year_inst_session[year][inst] = {}
+                    for session in self.trades_by_session:
+                        year_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 31557600 == year - 1970]
+                        trade_count_by_year_inst_session[year][inst][session] = len(year_inst_session_trades)
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1622,6 +1633,7 @@ class RealTimeTradingEngine:
                 "avg_duration_by_quarter_inst_session": avg_duration_by_quarter_inst_session,
                 "win_rate_by_quarter_inst_session": win_rate_by_quarter_inst_session,
                 "profit_factor_by_quarter_inst_session": profit_factor_by_quarter_inst_session,
+                "trade_count_by_year_inst_session": trade_count_by_year_inst_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
