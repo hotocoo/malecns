@@ -1274,6 +1274,20 @@ class RealTimeTradingEngine:
                         else:
                             avg_duration_by_quarter_inst_session[quarter][inst][session] = 0.0
             
+            # Calculate win rate by quarter, instrument, and session
+            win_rate_by_quarter_inst_session = {}
+            for quarter in range(4):
+                win_rate_by_quarter_inst_session[quarter] = {}
+                for inst in self.instruments:
+                    win_rate_by_quarter_inst_session[quarter][inst] = {}
+                    for session in self.trades_by_session:
+                        quarter_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 7889400 % 4 == quarter]
+                        if quarter_inst_session_trades:
+                            quarter_inst_session_win_count = sum(1 for t in quarter_inst_session_trades if t[2] > 0)
+                            win_rate_by_quarter_inst_session[quarter][inst][session] = quarter_inst_session_win_count / len(quarter_inst_session_trades)
+                        else:
+                            win_rate_by_quarter_inst_session[quarter][inst][session] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1348,6 +1362,7 @@ class RealTimeTradingEngine:
                 "profit_factor_by_month_inst_session": profit_factor_by_month_inst_session,
                 "trade_count_by_quarter_inst_session": trade_count_by_quarter_inst_session,
                 "avg_duration_by_quarter_inst_session": avg_duration_by_quarter_inst_session,
+                "win_rate_by_quarter_inst_session": win_rate_by_quarter_inst_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
