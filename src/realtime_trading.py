@@ -1474,6 +1474,16 @@ class RealTimeTradingEngine:
                         else:
                             profit_factor_by_month_inst_session[month][inst][session] = 0.0
             
+            # Calculate trade count by quarter, instrument, and session
+            trade_count_by_quarter_inst_session = {}
+            for quarter in range(4):
+                trade_count_by_quarter_inst_session[quarter] = {}
+                for inst in self.instruments:
+                    trade_count_by_quarter_inst_session[quarter][inst] = {}
+                    for session in self.trades_by_session:
+                        quarter_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 7889400 % 4 == quarter]
+                        trade_count_by_quarter_inst_session[quarter][inst][session] = len(quarter_inst_session_trades)
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1562,6 +1572,7 @@ class RealTimeTradingEngine:
                 "avg_duration_by_month_inst_session": avg_duration_by_month_inst_session,
                 "win_rate_by_month_inst_session": win_rate_by_month_inst_session,
                 "profit_factor_by_month_inst_session": profit_factor_by_month_inst_session,
+                "trade_count_by_quarter_inst_session": trade_count_by_quarter_inst_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
