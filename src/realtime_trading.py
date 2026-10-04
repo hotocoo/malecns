@@ -1768,6 +1768,20 @@ class RealTimeTradingEngine:
                         month_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 2629800 % 12 == month]
                         trade_count_by_month_inst_session[month][inst][session] = len(month_inst_session_trades)
             
+            # Calculate average trade duration by month, instrument, and session
+            avg_duration_by_month_inst_session = {}
+            for month in range(12):
+                avg_duration_by_month_inst_session[month] = {}
+                for inst in self.instruments:
+                    avg_duration_by_month_inst_session[month][inst] = {}
+                    for session in self.trades_by_session:
+                        month_inst_session_trades = [t for t in self.trades_by_session[session] if t[5] == inst and t[4] // 2629800 % 12 == month]
+                        if month_inst_session_trades:
+                            month_inst_session_durations = [t[3] for t in month_inst_session_trades]
+                            avg_duration_by_month_inst_session[month][inst][session] = sum(month_inst_session_durations) / len(month_inst_session_durations)
+                        else:
+                            avg_duration_by_month_inst_session[month][inst][session] = 0.0
+            
             monitor = {
                 "timestamp": time.time(),
                 "balance": current_balance,
@@ -1877,6 +1891,7 @@ class RealTimeTradingEngine:
                 "win_rate_by_year_inst_session": win_rate_by_year_inst_session,
                 "profit_factor_by_year_inst_session": profit_factor_by_year_inst_session,
                 "trade_count_by_month_inst_session": trade_count_by_month_inst_session,
+                "avg_duration_by_month_inst_session": avg_duration_by_month_inst_session,
                 "last_heartbeat": self.last_heartbeat,
             }
             with open(self._monitor_path, "w") as f:
