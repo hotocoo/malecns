@@ -18,24 +18,26 @@ def straight(n: int = 400, spacing: float = 1.0) -> np.ndarray:
     return np.stack([np.arange(n) * spacing, np.zeros(n)], axis=1)
 
 
-def test_a_car_on_a_straight_centreline_reads_no_offset_and_dead_ahead():
+def test_a_car_on_its_lane_path_reads_no_offset_and_dead_ahead():
     line = straight()
-    y = labels_for(line, np.array([100]), line[[100]], np.array([0.0]), CFG)
+    on_lane = line[[100]] + [0.0, CFG.lane_offset_m]  # left normal of a +x road is +y
+    y = labels_for(line, np.array([100]), on_lane, np.array([0.0]), CFG)
     assert np.allclose(y, 0.0, atol=1e-6)
 
 
-def test_left_of_the_road_reads_positive_offset_and_the_road_lies_to_the_right():
+def test_left_of_the_lane_reads_positive_offset_and_the_road_lies_to_the_right():
     line = straight()
-    y = labels_for(line, np.array([100]), line[[100]] + [0.0, 1.5], np.array([0.0]), CFG)
-    assert y[0, 0] * CFG.offset_scale_m == np.float32(1.5)
-    assert (y[0, 1:] < 0.0).all()  # every bearing points back right, towards the centreline
+    y = labels_for(line, np.array([100]), line[[100]] + [0.0, CFG.lane_offset_m + 1.5], np.array([0.0]), CFG)
+    assert np.isclose(y[0, 0] * CFG.offset_scale_m, 1.5)
+    assert (y[0, 1:] < 0.0).all()  # every bearing points back right, towards the lane
     assert abs(y[0, 1]) > abs(y[0, -1])  # nearer points need the sharper turn
 
 
 def test_a_left_bend_ahead_reads_as_a_bearing_to_the_left():
     theta = np.linspace(0.0, np.pi, 400)
     line = np.stack([50.0 * np.sin(theta), 50.0 * (1.0 - np.cos(theta))], axis=1)  # turns left
-    y = labels_for(line, np.array([10]), line[[10]], np.array([theta[10]]), CFG)
+    normal = np.array([-np.sin(theta[10]), np.cos(theta[10])])
+    y = labels_for(line, np.array([10]), line[[10]] + normal * CFG.lane_offset_m, np.array([theta[10]]), CFG)
     assert (y[0, 1:] > 0.0).all()
 
 

@@ -1162,10 +1162,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--lane-head",
-        default=default_lane_head(),
-        help="learned lane model for the eye's lane slots; '' for the pixel rules (must match how the driver was trained)",
+        default=None,
+        help="learned lane model for the eye's lane slots; '' for the pixel rules. Default: what the checkpoint was trained with",
     )
     args = parser.parse_args(argv)
+    if args.lane_head is None:
+        # the eye must match the one the driver learned on; old checkpoints recorded none
+        if args.checkpoint is not None and Path(args.checkpoint).exists():
+            args.lane_head = torch.load(args.checkpoint, map_location="cpu", weights_only=False).get("lane_head")
+        else:
+            args.lane_head = default_lane_head()
 
     shared = Shared()
     built: dict[str, Simulation] = {}

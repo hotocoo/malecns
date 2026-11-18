@@ -301,7 +301,7 @@ def agent_for(saved: dict | None, sensor: CameraSensor, substeps: int) -> AgentC
     base = AgentConfig(substeps=substeps, readout_norm="channel")
     if saved and saved.get("agent_cfg"):
         base = AgentConfig.from_saved(saved["agent_cfg"], substeps=substeps)
-    return agent_config_for(sensor, base)
+    return agent_config_for(sensor, base, retinotopic=not (saved and saved.get("agent_cfg")))
 
 
 def install_stage(args, scene, traffic, director, sensor, device, stage_index: int):
@@ -356,8 +356,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--lane-head",
-        default=default_lane_head(),
-        help="learned lane model (lane_head.py) for the eye's lane slots; '' for the pixel rules",
+        default=None,
+        help="learned lane model (lane_head.py) for the eye's lane slots; '' for the pixel rules. "
+        "Default: what the checkpoint was trained with, else the trained head when present",
     )
     parser.add_argument(
         "--pool",
@@ -402,6 +403,10 @@ def main(argv: list[str] | None = None) -> int:
     saved = None
     if args.checkpoint.exists():
         saved = torch.load(args.checkpoint, map_location="cpu")
+    if args.lane_head is None:
+        # a driver keeps the eye it was trained with; a checkpoint from before the
+        # lane head recorded none and so keeps the pixel rules
+        args.lane_head = saved.get("lane_head") if saved is not None else default_lane_head()
 
     stage_index = min(max(args.stage, 0), len(CURRICULUM) - 1)
     if saved is not None and args.stage == 0:

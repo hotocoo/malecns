@@ -56,12 +56,19 @@ class LaneHeadConfig:
     input_width: int = 160
     input_height: int = 96
     # Physical units mapped to ~1 so the targets share a scale.
-    offset_scale_m: float = 3.0
-    bearing_scale_rad: float = 0.5
-    # Pose noise around the centreline while capturing, so the frames cover
-    # the offsets and headings the driver must recover from.
-    capture_offset_m: float = 2.2
-    capture_heading_rad: float = 0.30
+    offset_scale_m: float = 1.5
+    bearing_scale_rad: float = 0.25
+    # The lane the car keeps, as a signed offset along the road's left normal
+    # (calibrate_camera/train_camera --lane-offset). Labels are measured to
+    # this lane path, not the centreline: against the centreline every label
+    # carried a constant bias (-1.86 m) that hid the small on-lane variation.
+    lane_offset_m: float = -1.9
+    # Pose noise around the lane while capturing: what a driver in its lane
+    # sees, plus enough drift to learn the recovery. Capturing over the whole
+    # carriageway left the on-lane error (5 m bearing RMSE 0.21 rad) larger
+    # than the on-lane spread (0.085 rad).
+    capture_offset_m: float = 1.2
+    capture_heading_rad: float = 0.12
     # Share of each route's traffic on the road while capturing.
     capture_traffic: float = 0.5
 
@@ -79,17 +86,18 @@ def channel_names(cfg: LaneHeadConfig, width: int) -> tuple[str, ...]:
 
 
 def labels_for(centerline: np.ndarray, index: np.ndarray, pos: np.ndarray, heading: np.ndarray, cfg: LaneHeadConfig) -> np.ndarray:
-    """(batch, outputs) scaled targets: offset from the centreline, bearings to it ahead."""
+    """(batch, outputs) scaled targets: offset from the lane path, bearings to it ahead."""
     n = centerline.shape[0]
     seg = np.hypot(*np.diff(centerline, axis=0, append=centerline[:1]).T)
     spacing = float(seg.mean())
     tangent = np.roll(centerline, -1, axis=0) - np.roll(centerline, 1, axis=0)
     tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
     left = np.stack([-tangent[:, 1], tangent[:, 0]], axis=1)
-    offset = ((pos - centerline[index]) * left[index]).sum(1)
+    lane = centerline + left * cfg.lane_offset_m
+    offset = ((pos - lane[index]) * left[index]).sum(1)
     out = [offset / cfg.offset_scale_m]
     for metres in cfg.bearings_m:
-        ahead = centerline[(index + int(round(metres / max(spacing, 1e-6)))) % n] - pos
+        ahead = lane[(index + int(round(metres / max(spacing, 1e-6)))) % n] - pos
         bearing = np.arctan2(ahead[:, 1], ahead[:, 0]) - heading
         out.append(np.arctan2(np.sin(bearing), np.cos(bearing)) / cfg.bearing_scale_rad)
     return np.stack(out, axis=1).astype(np.float32)
@@ -157,7 +165,7 @@ def capture(track: Path, frames_per_route: int, cfg: LaneHeadConfig, seed: int, 
     actors = scene.fixtures + traffic.actors
 
     index = rng.integers(0, n, frames_per_route)
-    offset = rng.uniform(-cfg.capture_offset_m, cfg.capture_offset_m, frames_per_route)
+    offset = cfg.lane_offset_m + rng.uniform(-cfg.capture_offset_m, cfg.capture_offset_m, frames_per_route)
     pos = centerline[index] + left[index] * offset[:, None]
     heading = road_heading[index] + rng.normal(0.0, cfg.capture_heading_rad, frames_per_route)
     images = np.zeros((frames_per_route, cfg.input_height, cfg.input_width, 3), dtype=np.uint8)

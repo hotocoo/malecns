@@ -63,6 +63,10 @@ from train_camera import (
 # lags (`(target - speed) / 3`) and pure pursuit cuts in, so taking `speed_ref`
 # point by point brakes too late: 2 of 8 cars crashed in the teacher-only round.
 TEACHER_PREVIEW_M = 35.0
+# Control steps at the start of each round left out of the fit: the launch from
+# standstill and the brain settling from rest are not driving, and sitting all
+# in one side of the split they pushed held-out pedal R^2 to -2.96.
+WARMUP_STEPS = 100
 # Share of the car's grip the teacher corners on; the profile itself uses all of it.
 TEACHER_GRIP_SHARE = 0.85
 
@@ -170,7 +174,6 @@ def collect(agent: ConnectomeAgent, env: CarEnv, sensor, teacher: LaneTeacher, t
     reason = torch.zeros(batch, dtype=torch.long)
     speed_sum = torch.zeros(batch, device=env.device)
     xs, ys, cars = [], [], []
-    car_index = torch.arange(batch)
     with torch.inference_mode():
         for step in range(steps):
             target = teacher.act()
@@ -178,12 +181,12 @@ def collect(agent: ConnectomeAgent, env: CarEnv, sensor, teacher: LaneTeacher, t
             executed = target.clone()
             executed[:, 0] = (executed[:, 0] + teacher.wander()).clamp(-1.0, 1.0)
             action = beta * executed + (1.0 - beta) * student
-            if record:
+            if record and step >= WARMUP_STEPS:
                 signal = agent.motor_state - agent.motor_state.mean(dim=1, keepdim=True)
                 keep = alive.cpu()
                 xs.append(signal[alive].half().cpu())
                 ys.append(target[alive].cpu())
-                cars.append(car_index[keep])
+                cars.append(torch.arange(batch)[keep])
             obs, _, done = env.step(action)
             speed_sum += env.speed * alive
             ended = done & alive

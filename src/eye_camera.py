@@ -159,7 +159,44 @@ class CameraSensor:
         self.camera.release()
 
 
-def agent_config_for(sensor: CameraSensor, base=None):
+# Where each lane-head output points in the visual field. "+" on a bearing is
+# road to the left; "+" on the offset is the car left of the centre, so road to
+# the right.
+LANE_LEFT, LANE_RIGHT, LANE_CENTRE = 0.25, 0.75, 0.5
+# Readout low-pass for camera drivers. One control step of descending-neuron
+# spikes is mostly Poisson noise: with perfect lane input the readout carried
+# steering at R^2 0.16 under the ray-eye default (0.2, ~80 ms) and 0.39 when
+# smoothed to ~240 ms. Costs ~0.2 s of reaction, ~2.5 m at 40 km/h.
+CAMERA_MOTOR_TAU = 0.07
+
+
+def channel_azimuth(sensor: CameraSensor) -> tuple[float, ...]:
+    """Visual-field position (0 left .. 1 right) of every eye channel, in eye order."""
+    cfg = sensor.eye.config
+    out: list[float] = []
+    for name in sensor.eye.channel_names():
+        if name.startswith("left_edge"):
+            out.append(0.0)
+        elif name.startswith("right_edge"):
+            out.append(1.0)
+        elif name.startswith(("lane_", "unused")):
+            out.append(LANE_CENTRE)
+        else:  # "kind[column]": the image column it was seen in
+            column = int(name.rsplit("[", 1)[1].rstrip("]"))
+            out.append((column + 0.5) / cfg.columns)
+    if sensor.lane is not None:
+        from lane_head import channel_names as lane_names
+
+        slots = len(LANE_CHANNELS)
+        for k, name in enumerate(lane_names(sensor.lane.cfg, slots)):
+            if name.startswith("unused"):
+                continue
+            road_left = name.endswith("+") != name.startswith("offset")
+            out[len(out) - slots + k] = LANE_LEFT if road_left else LANE_RIGHT
+    return tuple(out)
+
+
+def agent_config_for(sensor: CameraSensor, base=None, retinotopic: bool = False):
     """An `AgentConfig` whose visual groups match this sensor's channels.
 
     The agent splits its visual projection neurons evenly across `n_rays`
@@ -185,6 +222,11 @@ def agent_config_for(sensor: CameraSensor, base=None):
 
     base = base or AgentConfig()
     tweaks = {"n_rays": sensor.eye.width, "eye_encoding": "direct"}
+    # A new driver is wired retinotopically; a saved one keeps the wiring its
+    # readout was fitted under.
+    if retinotopic and base.channel_azimuth is None:
+        tweaks["channel_azimuth"] = channel_azimuth(sensor)
+        tweaks["motor_tau"] = CAMERA_MOTOR_TAU
     # A checkpoint that recorded its own drive keeps it; only the ray eye's
     # defaults are replaced, so a saved readout still means what it meant.
     ray_defaults = AgentConfig()

@@ -62,17 +62,24 @@ def r_squared(pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def fit_readout(x: torch.Tensor, y: torch.Tensor, car: torch.Tensor, lams: tuple[float, ...]) -> tuple[torch.Tensor, torch.Tensor, float, torch.Tensor]:
-    """Ridge with the penalty picked by held-out cars (odd car indices)."""
+    """Ridge with the penalty picked by held-out cars (odd car indices), per output.
+
+    One shared penalty was chosen on the mean of steer and pedal R^2, so a
+    badly fitting pedal could force the strongest penalty onto steering and
+    shrink its gain to nothing. Returns the largest penalty used.
+    """
     train, test = car % 2 == 0, car % 2 == 1
-    best = None
+    k = y.shape[1]
+    best_r2 = torch.full((k,), -float("inf"))
+    best_lam = [lams[0]] * k
     for lam in lams:
         w, b = ridge(x[train], y[train], lam)
         r2 = r_squared(x[test] @ w + b, y[test])
-        if best is None or float(r2.mean()) > best[0]:
-            best = (float(r2.mean()), lam, r2)
-    _, lam, r2 = best
-    w, b = ridge(x, y, lam)
-    return w, b, lam, r2
+        for j in range(k):
+            if float(r2[j]) > float(best_r2[j]):
+                best_r2[j], best_lam[j] = r2[j], lam
+    ws, bs = zip(*(ridge(x, y[:, j : j + 1], best_lam[j]) for j in range(k)))
+    return torch.cat(ws, dim=1), torch.cat(bs), max(best_lam), best_r2
 
 
 class Collector:

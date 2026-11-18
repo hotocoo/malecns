@@ -98,6 +98,12 @@ class AgentConfig:
     # Looming: positive change in proximity per control step, scaled so a wall
     # approached at speed gives values of order 0.1-1.
     loom: bool = True
+    # Retinotopic wiring: where in the visual field (0 = far left, 1 = far
+    # right) each input channel looks. Set, channels feed the visual neurons at
+    # their own azimuth, so left things drive the left eye. Unset, groups are
+    # handed out in channel order (the lidar fan is already ordered left to
+    # right; the camera eye's row-major layout is not).
+    channel_azimuth: tuple[float, ...] | None = None
     loom_scale: float = 10.0
     substeps: int = 8
     max_dn: int = 1314
@@ -201,10 +207,16 @@ class ConnectomeAgent:
         self.neurons = neurons
 
         ordered = _azimuth_order(brain.roles, neurons, self.cfg.input_role)
-        self.ray_groups = [
-            torch.tensor(g, dtype=torch.long, device=self.device)
-            for g in np.array_split(ordered, self.cfg.n_rays)
-        ]
+        splits = np.array_split(ordered, self.cfg.n_rays)
+        if self.cfg.channel_azimuth is not None:
+            azimuth = np.asarray(self.cfg.channel_azimuth, dtype=np.float64)
+            if azimuth.shape != (self.cfg.n_rays,):
+                raise ValueError(f"channel_azimuth has {azimuth.size} entries for {self.cfg.n_rays} channels")
+            # channel k takes the slice of the azimuth-sorted population at its rank
+            rank = np.empty(self.cfg.n_rays, dtype=np.int64)
+            rank[np.argsort(azimuth, kind="stable")] = np.arange(self.cfg.n_rays)
+            splits = [splits[r] for r in rank]
+        self.ray_groups = [torch.tensor(g, dtype=torch.long, device=self.device) for g in splits]
         self.speed_index = torch.tensor(
             brain.roles[self.cfg.speed_role], dtype=torch.long, device=self.device
         )
