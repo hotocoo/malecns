@@ -631,8 +631,15 @@ class ConnectomeAgent:
         cfg = self.cfg
         if cfg.eye_encoding == "linear":
             return (1.0 - lidar).clamp(0.0, 1.0)
+        if cfg.eye_encoding == "direct":
+            # The camera eye (`perceive.DetectionEye`) already hands over
+            # nearness in [0, 1]: an empty channel is 0 and drives nothing. Read
+            # through the "road" mapping below, 0 would clamp to 0.1 m and every
+            # empty channel would saturate at full drive, which is how the first
+            # camera driver saw a wall of light and learned nothing.
+            return lidar.clamp(0.0, 1.0)
         if cfg.eye_encoding != "road":
-            raise ValueError(f"unknown eye_encoding {cfg.eye_encoding!r}; expected 'road' or 'linear'")
+            raise ValueError(f"unknown eye_encoding {cfg.eye_encoding!r}; expected 'road', 'linear' or 'direct'")
         metres = (lidar * cfg.eye_range_m).clamp(min=0.1)
         octaves = torch.log2(self.ray_ref_m / metres)
         return (cfg.eye_octave_gain * octaves + 0.5).clamp(0.0, 1.0)
