@@ -1,12 +1,13 @@
 #!/bin/bash
 # Run training detached from terminal
 cd /Users/acotech/workspace/malecns
+PY=$([ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)  # project venv carries torch
 
 # Ignore all terminal signals
 trap '' INT TERM HUP
 
 # Run training, redirect all output
-python3 -W ignore src/train.py \
+"$PY" -W ignore src/train.py \
   --checkpoint checkpoints/es.pt \
   --best checkpoints/best.pt \
   --log logs/train.jsonl \

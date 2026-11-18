@@ -6,6 +6,7 @@
 # getting faster" independently of the trainer's own numbers.
 set -u
 cd "$(dirname "$0")"
+PY=$([ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)  # project venv carries torch
 BEST=${BEST:-checkpoints/best.pt}
 ES=${ES:-checkpoints/es.pt}
 POLL=${POLL:-120}
@@ -19,13 +20,13 @@ while true; do
     if [ "$stamp" != "$last_best" ]; then
       last_best=$stamp
       echo "[verify] $(date '+%H:%M:%S') best.pt changed; verifying"
-      python3 -W ignore src/verify_laps.py --checkpoint "$BEST" --steps 16000
+      "$PY" -W ignore src/verify_laps.py --checkpoint "$BEST" --steps 16000
     fi
   fi
   if [ $((now - last_es)) -ge "$ES_EVERY" ]; then
     last_es=$now
     echo "[verify] $(date '+%H:%M:%S') es.pt periodic check"
-    python3 -W ignore src/verify_laps.py --checkpoint "$ES" --steps 16000
+    "$PY" -W ignore src/verify_laps.py --checkpoint "$ES" --steps 16000
   fi
   sleep "$POLL"
 done

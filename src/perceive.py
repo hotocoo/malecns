@@ -67,6 +67,9 @@ LANE_CHANNELS = tuple(f"lane_offset[{k}]" for k in range(len(LANE_ROWS))) + tupl
 ) + ("lane_heading", "lane_curvature", "lane_seen")
 
 DEFAULT_WEIGHTS = "yolo26n.pt"
+# Detector fine-tuned on the textured KL street scene (mAP50 0.363, best of kl..kl_v3);
+# the CLIs drive with it. kl (v1) hallucinated "person" on kerb strips.
+TRAINED_WEIGHTS = "checkpoints/perception/kl_v3/weights/best.pt"
 
 
 @dataclass(frozen=True)

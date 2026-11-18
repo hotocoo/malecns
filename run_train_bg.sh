@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run training in background, logging to file
 cd /Users/acotech/workspace/malecns
-exec python3 -W ignore src/train.py \
+PY=$([ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)  # project venv carries torch
+exec "$PY" -W ignore src/train.py \
   --checkpoint checkpoints/es.pt \
   --best checkpoints/best.pt \
   --log logs/train.jsonl \

@@ -9,7 +9,7 @@ reward charges under its road law.
 
     python3 src/calibrate_camera.py --out checkpoints/camera/driver.pt   # first
     python3 src/train_camera.py --track data/tracks/kl.geojson \\
-        --weights checkpoints/perception/kl/weights/best.pt --generations 200
+        --weights checkpoints/perception/kl_v3/weights/best.pt --generations 200
 
 Start from a calibrated checkpoint. Evolution strategies over a random
 readout of a 166,700-neuron brain found nothing in 24 generations here, as it
@@ -51,7 +51,7 @@ from events import Director, HazardRates
 from eye_camera import CameraSensor, SensorConfig, agent_config_for
 from law import load_law
 from lawreward import LawEnforcer, LawWeights
-from perceive import EyeConfig
+from perceive import TRAINED_WEIGHTS, EyeConfig
 from roadlaw import control_points_for_circuit, legal_profile_for_circuit
 from scene import SceneConfig, Traffic
 
@@ -320,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--track", type=Path, default=Path("data/tracks/kl.geojson"))
     parser.add_argument("--graph", type=Path, default=Path("data/graph"))
-    parser.add_argument("--weights", default="checkpoints/perception/kl/weights/best.pt")
+    parser.add_argument("--weights", default=TRAINED_WEIGHTS)
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_DIR / "driver.pt")
     parser.add_argument("--best", type=Path, default=CHECKPOINT_DIR / "driver_best.pt")
     parser.add_argument("--log", type=Path, default=CHECKPOINT_DIR / "log.csv")
@@ -348,6 +348,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--revert-after", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--pool",
+        type=Path,
+        default=None,
+        help="directory of extra OSM routes (route.py output); generations rotate over --track plus these",
+    )
+    parser.add_argument(
+        "--holdout",
+        type=Path,
+        default=None,
+        help="route never trained on; with --pool, the best/revert guard and driver_best.pt are judged here",
+    )
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--height", type=int, default=192)
     parser.add_argument("--columns", type=int, default=12)
@@ -383,8 +395,23 @@ def main(argv: list[str] | None = None) -> int:
     stage_index = min(max(args.stage, 0), len(CURRICULUM) - 1)
     if saved is not None and args.stage == 0:
         stage_index = min(int(saved.get("stage", 0)), len(CURRICULUM) - 1)
-    scene, traffic, sensor, director = build_world(args, device, CURRICULUM[stage_index])
+    routes = [args.track] + (sorted(p for p in args.pool.glob("*.geojson") if not p.stem.endswith("_buildings")) if args.pool else [])
+    if args.holdout is not None and args.holdout.resolve() in {r.resolve() for r in routes}:
+        raise SystemExit(f"--holdout {args.holdout} is also a training route; hold out one the pool lacks")
+    if len(routes) > 1 and args.holdout is None:
+        raise SystemExit("--pool needs --holdout: the guard cannot compare scores across routes")
+    worlds: dict[Path, list] = {}
+
+    def world(track: Path) -> list:
+        """[scene, traffic, sensor, director, env, law, stage] for one route, built once."""
+        if track not in worlds:
+            route_args = argparse.Namespace(**{**vars(args), "track": track})
+            worlds[track] = [*build_world(route_args, device, CURRICULUM[stage_index]), None, None, None]
+        return worlds[track]
+
+    scene, traffic, sensor, director, *_ = world(args.track)
     print(f"[world] eye {sensor.eye.width} channels, camera {args.width}x{args.height}, detector {args.weights}")
+    print(f"[world] {len(routes)} training route(s); holdout {args.holdout or 'none'}")
 
     brain = Brain(
         connectome,
@@ -396,7 +423,15 @@ def main(argv: list[str] | None = None) -> int:
     agent_cfg = agent_for(saved, sensor, args.substeps)
     agent = ConnectomeAgent(brain, neurons, agent_cfg)
 
-    env, law, stage = install_stage(args, scene, traffic, director, sensor, device, stage_index)
+    def staged(track: Path) -> list:
+        """The route's world with the current curriculum rung installed."""
+        w = world(track)
+        if w[6] is not CURRICULUM[stage_index]:
+            route_args = argparse.Namespace(**{**vars(args), "track": track})
+            w[4], w[5], w[6] = install_stage(route_args, w[0], w[1], w[3], w[2], device, stage_index)
+        return w
+
+    env, law, stage = staged(args.track)[4:7]
     print(f"[world] {law.summary()}")
 
     mu = agent.initial_params().to(device)
@@ -464,14 +499,27 @@ def main(argv: list[str] | None = None) -> int:
         params = agent.clamp_params(mu.unsqueeze(0) + sigma * perturb)
         theta = agent.unpack(params)
 
+        # Every body drives the same route this generation, so ranks compare
+        # like with like; the route rotates so no one street is learnt by heart.
+        track = routes[generation % len(routes)]
+        scene, traffic, sensor, director, env, law, stage = staged(track)
         result = run_episode(agent, env, sensor, director, theta, args.steps, args.seed + generation)
         fitness = result["fitness"]
         mu_fitness = float(fitness[0])
         survived = result["endings"].get("alive", 0) / max(args.popsize, 1)
+        # Scores on different routes are not comparable, so with a pool the
+        # guard reads the mean alone on the held-out route (all bodies = mu,
+        # spread along it); with one route it reads mu's own training score.
+        guard_fitness = mu_fitness
+        if args.holdout is not None and len(routes) > 1:
+            h = staged(args.holdout)
+            held = run_episode(agent, h[4], h[2], h[3], agent.unpack(mu.unsqueeze(0).repeat(args.popsize, 1)), args.steps, args.seed)
+            guard_fitness = float(held["fitness"].mean())
 
         # The mean's own score is the thing being improved; a mean that has
         # drifted somewhere worse for several generations goes back to the
         # best one seen and searches more narrowly from there.
+        mu_fitness = guard_fitness
         if mu_fitness > best_mu_fitness:
             best_mu_fitness = mu_fitness
             best_mu = mu.clone()
@@ -512,6 +560,8 @@ def main(argv: list[str] | None = None) -> int:
             "events": sum(result["events"].values()),
             "sigma": sigma,
             "stage": stage_index,
+            "track": track.stem,
+            "fitness_train_mu": float(fitness[0]),
             "width_mult": stage.width_mult * args.width_mult,
             "survived": round(survived, 3),
             "reverted": reverted,
@@ -531,7 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         if steady >= args.advance_after and stage_index + 1 < len(CURRICULUM):
             stage_index += 1
             steady = 0
-            env, law, stage = install_stage(args, scene, traffic, director, sensor, device, stage_index)
+            env, law, stage = staged(track)[4:7]
             # A new rung is a new objective: the best score on the old one no
             # longer says anything about this one.
             best_mu_fitness = -float("inf")
@@ -540,7 +590,8 @@ def main(argv: list[str] | None = None) -> int:
         save(args.checkpoint, generation, mu_fitness)
         pd.DataFrame(rows).to_csv(args.log, index=False)
 
-    sensor.release()
+    for w in worlds.values():
+        w[2].release()
     return 0
 
 

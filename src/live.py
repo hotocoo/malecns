@@ -7,7 +7,7 @@ detector misses a motorcycle, the stream shows no box on that motorcycle, and
 the driver did not see it either.
 
   python3 src/live.py --track data/tracks/kl.geojson \\
-      --weights checkpoints/perception/kl/weights/best.pt
+      --weights checkpoints/perception/kl_v3/weights/best.pt
 
 Then open http://127.0.0.1:8near/ . Two endpoints do the work:
 
@@ -38,7 +38,7 @@ import defaults
 from defaults import CONTROL_DT_S
 from law import load_law
 from lawreward import GREEN, AMBER, RED, LawEnforcer, SignalTiming, signal_phase
-from perceive import CHANNELS, DEFAULT_WEIGHTS, Detector, DetectionEye, EyeConfig, describe
+from perceive import CHANNELS, TRAINED_WEIGHTS, Detector, DetectionEye, EyeConfig, describe
 from roadlaw import control_points_for_circuit, legal_profile_for_circuit
 
 BOX_COLOUR = {
@@ -1025,7 +1025,7 @@ def make_handler(shared: Shared):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--track", type=Path, default=Path("data/tracks/kl.geojson"))
-    parser.add_argument("--weights", default=DEFAULT_WEIGHTS, help="detector weights; the fine-tuned ones by default")
+    parser.add_argument("--weights", default=TRAINED_WEIGHTS, help="detector weights; the fine-tuned ones by default")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8808)
     parser.add_argument("--fps", type=float, default=60.0)

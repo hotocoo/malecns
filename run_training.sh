@@ -10,6 +10,7 @@
 # python3 src/evaluate.py --record logs/run.npz and replay it.
 set -u
 cd "$(dirname "$0")"
+PY=$([ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)  # project venv carries torch
 
 CHECKPOINT=${CHECKPOINT:-checkpoints/es.pt}
 BEST=${BEST:-checkpoints/best.pt}
@@ -44,7 +45,7 @@ MAX_STEP_FRAC=${MAX_STEP_FRAC:-0.03}
 EVAL_EVERY=${EVAL_EVERY:-1}
 
 while true; do
-  python3 -W ignore src/train.py \
+  "$PY" -W ignore src/train.py \
     --checkpoint "$CHECKPOINT" \
     --best "$BEST" \
     --log "$LOG" \

@@ -44,6 +44,7 @@ from agent import ConnectomeAgent
 from brain import Brain, LIFConfig, load_connectome, pick_device, synchronize
 from calibrate import PRE_CLIP, fit_readout, install_fit
 from car_env import DONE_NAMES, CarEnv
+from perceive import TRAINED_WEIGHTS
 from train_camera import (
     CURRICULUM,
     Stage,
@@ -57,6 +58,13 @@ from train_camera import (
 # Sensory gains the fit is made under; ES refines them afterwards. Eye values
 # are nearness in [0, 1] read directly (`eye_encoding="direct"`), so a gain of
 # one puts a filled channel at ~190 Hz and an empty one at the bias.
+# Distance ahead the teacher reads the minimum-lap-time profile over. Its pedal
+# lags (`(target - speed) / 3`) and pure pursuit cuts in, so taking `speed_ref`
+# point by point brakes too late: 2 of 8 cars crashed in the teacher-only round.
+TEACHER_PREVIEW_M = 35.0
+# Share of the car's grip the teacher corners on; the profile itself uses all of it.
+TEACHER_GRIP_SHARE = 0.85
+
 SENSORY = {"ray_gain": 1.0, "bias_hz": 0.05, "speed_gain": 0.5, "loom_gain": 0.5}
 
 
@@ -99,13 +107,16 @@ class LaneTeacher:
         # grip circle, braking zones, traction, grade), so the teacher DAgger
         # copies is already the fastest driver the car allows; the posted limit
         # still caps it in `act`. `corner_g > 0` adds a comfort cap on top.
-        corner = env.track.speed_ref.clone()
+        # speed scales with sqrt(grip), so a grip share is a sqrt-share of speed
+        profile = env.track.speed_ref * TEACHER_GRIP_SHARE**0.5
+        preview = max(1, int(round(TEACHER_PREVIEW_M / max(spacing, 1e-6))))
+        corner = torch.stack([torch.roll(profile, -k, dims=0) for k in range(preview)], dim=1).min(dim=1).values
         if corner_g > 0.0:
             angle = torch.atan2(tangent[:, 1], tangent[:, 0])
             turn = torch.remainder(torch.roll(angle, -1, dims=0) - angle + torch.pi, 2 * torch.pi) - torch.pi
             radius = spacing / turn.abs().clamp(min=1e-4)
             comfort = torch.sqrt(corner_g * 9.81 * radius).clamp(max=env.cfg.max_speed)
-            window = max(1, int(round(35.0 / max(spacing, 1e-6))))
+            window = max(1, int(round(TEACHER_PREVIEW_M / max(spacing, 1e-6))))
             comfort = torch.stack([torch.roll(comfort, -k, dims=0) for k in range(window)], dim=1).min(dim=1).values
             corner = torch.minimum(corner, comfort)
         self.corner_speed = corner
@@ -209,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--track", type=Path, default=Path("data/tracks/kl.geojson"))
     parser.add_argument("--graph", type=Path, default=Path("data/graph"))
-    parser.add_argument("--weights", default="checkpoints/perception/kl/weights/best.pt")
+    parser.add_argument("--weights", default=TRAINED_WEIGHTS)
     parser.add_argument("--cars", type=int, default=12, help="cars (brain bodies) driven per round, spread along the street")
     parser.add_argument("--steps", type=int, default=1500, help="control steps per collection round")
     parser.add_argument("--rounds", type=int, default=2, help="DAgger rounds after the teacher-driven one")
@@ -240,6 +251,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=Path("checkpoints/camera/driver.pt"))
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--pool", type=Path, default=None, help="directory of extra OSM routes; collection rounds rotate over --track plus these")
+    parser.add_argument("--holdout", type=Path, default=None, help="route the final brain-alone check drives (default: --track)")
     args = parser.parse_args(argv)
     if args.out.exists() and not args.force:
         raise SystemExit(f"{args.out} exists; pass --force to overwrite the driver")
@@ -249,12 +262,27 @@ def main(argv: list[str] | None = None) -> int:
     device = pick_device(args.device)
     connectome = load_connectome(args.graph)
     stage = Stage("calibration", args.traffic, 0.0)
-    scene, traffic, sensor, director = build_world(args, device, stage)
-    env, law = build_env(args, scene, device, args.cars, 1.0)
-    removed = clear_starts(traffic, env)
-    env.attach_traffic(obstacle_provider(traffic, scene.fixtures))
-    print(f"[world] eye {sensor.eye.width} channels; {len(traffic.actors)} road users ({removed} cleared off the starts)")
-    print(f"[world] {law.summary()}")
+    routes = [args.track] + (sorted(p for p in args.pool.glob("*.geojson") if not p.stem.endswith("_buildings")) if args.pool else [])
+    rigs: dict[Path, tuple] = {}
+
+    def rig(track: Path) -> tuple:
+        """(env, sensor, teacher) for one route, built once."""
+        if track not in rigs:
+            route_args = argparse.Namespace(**{**vars(args), "track": track})
+            scene, traffic, sensor, _ = build_world(route_args, device, stage)
+            env, law = build_env(route_args, scene, device, args.cars, 1.0)
+            removed = clear_starts(traffic, env)
+            env.attach_traffic(obstacle_provider(traffic, scene.fixtures))
+            print(f"[world] {track.stem}: eye {sensor.eye.width} channels; {len(traffic.actors)} road users ({removed} cleared off the starts)")
+            print(f"[world] {law.summary()}")
+            teacher = LaneTeacher(
+                env, law, args.lane_offset, args.lookahead, args.pace_fraction, args.steer_gain,
+                corner_g=args.corner_g, explore=args.explore,
+            )
+            rigs[track] = (env, sensor, teacher)
+        return rigs[track]
+
+    env, sensor, teacher = rig(args.track)
 
     brain = Brain(
         connectome,
@@ -265,10 +293,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     agent_cfg = agent_for(None, sensor, args.substeps)
     agent = ConnectomeAgent(brain, connectome.neurons, agent_cfg)
-    teacher = LaneTeacher(
-        env, law, args.lane_offset, args.lookahead, args.pace_fraction, args.steer_gain,
-        corner_g=args.corner_g, explore=args.explore,
-    )
 
     params = agent.initial_params()
     offset = 0
@@ -289,6 +313,7 @@ def main(argv: list[str] | None = None) -> int:
     r2 = torch.zeros(2)
     for round_index in range(args.rounds + 1):
         beta = 1.0 if round_index == 0 else (args.beta if round_index < args.rounds else 0.0)
+        env, sensor, teacher = rig(routes[round_index % len(routes)])
         result = collect(agent, env, sensor, teacher, theta, args.steps, beta, args.seed + round_index, record=True)
         print(f"[round {round_index}] beta {beta:.2f} " + describe("drive", result, args.steps) + f" ({time.time() - started:.0f}s)")
         pooled_x.append(result["x"])
@@ -304,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
             f"[fit] {x.shape[0]:,} samples, lambda {lam:g}, held-out R^2 steer {float(r2[0]):.3f} pedal {float(r2[1]):.3f}; {notes}"
         )
 
+    env, sensor, teacher = rig(args.holdout or args.track)
     teacher.explore = 0.0
     final = collect(agent, env, sensor, teacher, theta, args.eval_steps, 0.0, args.seed + 100, record=False)
     print("[final] " + describe(f"brain alone, {args.eval_steps} steps", final, args.eval_steps))
@@ -342,7 +368,8 @@ def main(argv: list[str] | None = None) -> int:
         args.out,
     )
     print(f"[ok] wrote {args.out}; refine with train_camera.py")
-    sensor.release()
+    for _, rig_sensor, _ in rigs.values():
+        rig_sensor.release()
     return 0
 
 
