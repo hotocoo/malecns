@@ -225,3 +225,36 @@ class TestTrafficStepping:
         stats = eye.stats()
         assert stats["frames_rendered"] == 3.0
         assert stats["detector_calls"] == 1.0
+
+
+class TestNavigation:
+    """The sat-nav cue: which way the route turns ahead, measured on the road."""
+
+    def nav(self, ccw: bool) -> np.ndarray:
+        from types import SimpleNamespace
+
+        theta = np.linspace(0.0, 2.0 * np.pi, N, endpoint=False)
+        heading = theta + np.pi / 2  # tangent of a counter-clockwise ring
+        stub = SimpleNamespace(_road_heading=heading if ccw else -heading, _nav_look=[4, 12])
+        return CameraSensor.nav(stub, np.array([0.1, 0.6]))
+
+    def test_a_left_bend_lights_the_left_channels_only(self):
+        out = self.nav(ccw=True)
+        assert (out[:, 0::2] > 0).all() and (out[:, 1::2] == 0).all()
+
+    def test_a_right_bend_lights_the_right_channels_only(self):
+        out = self.nav(ccw=False)
+        assert (out[:, 1::2] > 0).all() and (out[:, 0::2] == 0).all()
+
+    def test_farther_look_ahead_sees_more_of_the_bend(self):
+        out = self.nav(ccw=True)
+        assert (out[:, 2] > out[:, 0]).all()
+
+    def test_nav_channels_sit_in_the_spare_lane_slots(self):
+        from eye_camera import nav_names
+        from lane_head import LaneHeadConfig, channel_names
+        from perceive import LANE_CHANNELS
+
+        names = channel_names(LaneHeadConfig(), len(LANE_CHANNELS), nav_names())
+        assert len(names) == len(LANE_CHANNELS)
+        assert names[10:14] == nav_names()

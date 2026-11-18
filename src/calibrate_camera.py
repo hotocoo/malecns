@@ -268,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.out.exists() and not args.force:
         raise SystemExit(f"{args.out} exists; pass --force to overwrite the driver")
     args.popsize = args.cars
+    # new drivers get the sat-nav cue; it rides in the lane head's spare slots
+    args.navigation = bool(args.lane_head)
     args.width_mult = 1.0
 
     device = pick_device(args.device)
@@ -348,7 +350,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Gauge on the held-out route, teacher driving: the pooled readout scored
     # on frames it never saw, against a ridge straight from the eye vector
-    # fitted there (held-out cars), the ceiling perception sets.
+    # fitted there (held-out cars), the ceiling perception sets. The wander
+    # stays on: without it the car tracks the lane so closely that steering
+    # barely varies and every R^2 reads near zero.
+    teacher.explore = args.explore
     gauge = collect(agent, env, sensor, teacher, theta, args.eval_steps, 1.0, args.seed + 200, record=True)
     y_gauge = torch.atanh(gauge["y"].clamp(-PRE_CLIP, PRE_CLIP))
     brain_r2 = r_squared(gauge["x"].float() @ w + b, y_gauge)
@@ -375,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
             "track": str(args.track),
             "weights": args.weights,
             "lane_head": args.lane_head or None,
+            "navigation": bool(args.navigation),
             "columns": args.columns,
             "camera": {"width": args.width, "height": args.height},
             "curriculum": [asdict(s) for s in CURRICULUM],

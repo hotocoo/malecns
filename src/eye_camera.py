@@ -41,6 +41,22 @@ class SensorConfig:
     # Learned lane model (lane_head.py); when set, its mirrored left/right
     # channels replace the pixel-rule lane measurement in the eye's lane slots.
     lane_head: str | None = None
+    # Sat-nav cue in the lane slots after the lane head's: which way the route
+    # turns ahead. At a junction the camera cannot see which branch the route
+    # takes (lane head bearing R^2 0.15 on turning stretches of kl_r6, 0.75
+    # on straights), and the corridor ends the car on the wrong one.
+    navigation: bool = False
+
+
+# Sat-nav look-ahead distances (m) and the route turn (rad, measured on the
+# road, not against the car's heading) that saturates a channel.
+NAV_AHEAD_M = (15.0, 40.0)
+NAV_SCALE_RAD = 1.0
+
+
+def nav_names() -> tuple[str, ...]:
+    """Mirrored pair per look-ahead; '+' is a turn to the left."""
+    return tuple(f"nav_{int(m)}m{sign}" for m in NAV_AHEAD_M for sign in "+-")
 
 
 class CameraSensor:
@@ -77,6 +93,16 @@ class CameraSensor:
             from lane_head import LaneHead
 
             self.lane = LaneHead(self.cfg.lane_head)
+        if self.cfg.navigation:
+            if self.lane is None:
+                raise ValueError("the sat-nav cue sits after the lane head's channels; it needs a lane head")
+            cl = np.asarray(scene.centerline, dtype=np.float64)[:, :2]
+            tangent = np.roll(cl, -1, axis=0) - np.roll(cl, 1, axis=0)
+            self._road_heading = np.arctan2(tangent[:, 1], tangent[:, 0])
+            spacing = float(np.linalg.norm(np.diff(cl, axis=0), axis=1).mean())
+            self._nav_look = [max(1, int(round(m / max(spacing, 1e-6)))) for m in NAV_AHEAD_M]
+            start = self.eye.width - len(LANE_CHANNELS) + 2 * self.lane.cfg.outputs  # after the lane head's pairs
+            self._nav_slice = slice(start, start + 2 * len(NAV_AHEAD_M))
         self.timing = timing or SignalTiming()
         self._last: np.ndarray | None = None
         self._step = 0
@@ -96,6 +122,18 @@ class CameraSensor:
     def reset(self) -> None:
         self._last = None
         self._step = 0
+
+    def nav(self, progress: np.ndarray) -> np.ndarray:
+        """(batch, 2 * len(NAV_AHEAD_M)) in [0, 1]: route turn ahead, (left, right) per look-ahead."""
+        n = self._road_heading.shape[0]
+        index = np.clip((progress * n).astype(np.int64), 0, n - 1)
+        here = self._road_heading[index]
+        out = []
+        for look in self._nav_look:
+            turn = self._road_heading[(index + look) % n] - here
+            turn = np.clip(np.arctan2(np.sin(turn), np.cos(turn)) / NAV_SCALE_RAD, -1.0, 1.0)
+            out += [np.maximum(turn, 0.0), np.maximum(-turn, 0.0)]
+        return np.stack(out, axis=1).astype(np.float32)
 
     def road_height_at(self, progress: np.ndarray) -> np.ndarray:
         n = self.scene.centerline.shape[0]
@@ -141,6 +179,9 @@ class CameraSensor:
             self.last_frames = frames
             self.last_detections = detections
 
+        if self.cfg.navigation:
+            # every control step, not only on detector passes: the route is known
+            self._last[:, self._nav_slice] = self.nav(progress.detach().cpu().numpy())
         vector = torch.from_numpy(self._last).to(device=device, dtype=speed.dtype)
         own_speed = (speed / max_speed).unsqueeze(1)
         return torch.cat([vector, own_speed], dim=1)
@@ -195,9 +236,11 @@ def channel_azimuth(sensor: CameraSensor) -> tuple[float, ...]:
         from lane_head import channel_names as lane_names
 
         slots = len(LANE_CHANNELS)
-        for k, name in enumerate(lane_names(sensor.lane.cfg, slots)):
+        extra = nav_names() if sensor.cfg.navigation else ()
+        for k, name in enumerate(lane_names(sensor.lane.cfg, slots, extra)):
             if name.startswith("unused"):
                 continue
+            # bearing/nav '+' = road goes left; offset '+' = car left of lane, road to its right
             road_left = name.endswith("+") != name.startswith("offset")
             out[len(out) - slots + k] = LANE_LEFT if road_left else LANE_RIGHT
     return tuple(out)

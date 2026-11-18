@@ -119,6 +119,7 @@ def build_world(args, device: torch.device, stage: Stage | None = None):
             weights=args.weights,
             device=args.detector_device,
             lane_head=getattr(args, "lane_head", None) or None,
+            navigation=bool(getattr(args, "navigation", False)),
         ),
         scene_cfg,
     )
@@ -407,6 +408,8 @@ def main(argv: list[str] | None = None) -> int:
         # a driver keeps the eye it was trained with; a checkpoint from before the
         # lane head recorded none and so keeps the pixel rules
         args.lane_head = saved.get("lane_head") if saved is not None else default_lane_head()
+    # the sat-nav cue follows the driver: a checkpoint without it keeps those slots empty
+    args.navigation = bool(saved.get("navigation")) if saved is not None else bool(args.lane_head)
 
     stage_index = min(max(args.stage, 0), len(CURRICULUM) - 1)
     if saved is not None and args.stage == 0:
@@ -501,6 +504,7 @@ def main(argv: list[str] | None = None) -> int:
                 "track": str(args.track),
                 "weights": args.weights,
                 "lane_head": args.lane_head or None,
+                "navigation": bool(args.navigation),
                 "columns": args.columns,
                 "camera": {"width": args.width, "height": args.height},
                 "saved_at": time.time(),

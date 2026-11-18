@@ -77,11 +77,14 @@ class LaneHeadConfig:
         return 1 + len(self.bearings_m)
 
 
-def channel_names(cfg: LaneHeadConfig, width: int) -> tuple[str, ...]:
-    """Mirrored pair per output, padded with unused slots to `width`."""
+def channel_names(cfg: LaneHeadConfig, width: int, extra: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Mirrored pair per output, then `extra` names, padded with unused slots to `width`."""
     names = []
     for label in ["offset"] + [f"bearing_{int(m)}m" for m in cfg.bearings_m]:
         names += [f"{label}+", f"{label}-"]
+    names += list(extra)
+    if len(names) > width:
+        raise ValueError(f"{len(names)} lane-slot channels do not fit in {width} slots")
     return tuple(names + [f"unused[{k}]" for k in range(width - len(names))])
 
 

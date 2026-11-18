@@ -139,6 +139,7 @@ class Simulation:
         checkpoint: Path | None = None,
         detect_every: int = 4,
         lane_head: str | None = None,
+        navigation: bool = False,
     ) -> None:
         from car_env import CarEnv, load_geojson_centerline, street_car_config
         from dataset import load_scene
@@ -164,7 +165,7 @@ class Simulation:
             self.traffic,
             camera_cfg,
             eye_cfg,
-            SensorConfig(stride=detect_every, weights=weights, device=device, lane_head=lane_head or None),
+            SensorConfig(stride=detect_every, weights=weights, device=device, lane_head=lane_head or None, navigation=navigation),
             scene_cfg,
         )
         self.detector: Detector = self.sensor.detector
@@ -1166,12 +1167,15 @@ def main(argv: list[str] | None = None) -> int:
         help="learned lane model for the eye's lane slots; '' for the pixel rules. Default: what the checkpoint was trained with",
     )
     args = parser.parse_args(argv)
+    saved_eye = (
+        torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        if args.checkpoint is not None and Path(args.checkpoint).exists()
+        else None
+    )
     if args.lane_head is None:
         # the eye must match the one the driver learned on; old checkpoints recorded none
-        if args.checkpoint is not None and Path(args.checkpoint).exists():
-            args.lane_head = torch.load(args.checkpoint, map_location="cpu", weights_only=False).get("lane_head")
-        else:
-            args.lane_head = default_lane_head()
+        args.lane_head = saved_eye.get("lane_head") if saved_eye is not None else default_lane_head()
+    navigation = bool(saved_eye and saved_eye.get("navigation"))
 
     shared = Shared()
     built: dict[str, Simulation] = {}
@@ -1195,6 +1199,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.checkpoint,
                 args.detect_every,
                 args.lane_head,
+                navigation,
             )
         except Exception as exc:  # the page would otherwise sit blank forever
             print(f"[live] simulation failed to start: {exc}")
