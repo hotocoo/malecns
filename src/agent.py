@@ -109,6 +109,10 @@ class AgentConfig:
     max_dn: int = 1314
     # Populations whose rates feed the motor readout, comma-separated roles.
     readout_roles: str = "descending,motor"
+    # Size of the "visual_downstream" readout role: the cells (input cells
+    # excluded) receiving the most synaptic weight from `input_role`, one
+    # synapse from the eye, before the noisy descending bottleneck.
+    downstream_cells: int = 2000
     # The readout runs through a fixed random projection of the descending
     # population. A per-DN readout is 2,628 parameters, which evolution
     # strategies searches badly at a population of 64; 64 mixed channels keep
@@ -197,6 +201,20 @@ def match_sensing(car_cfg, agent_cfg):
     )
 
 
+def visual_downstream(brain: Brain, source_role: str, k: int) -> np.ndarray:
+    """The `k` cells outside `source_role` with the most |weight| from it, strongest first."""
+    w = brain.W.cpu()
+    w = (w.to_sparse_coo() if w.layout != torch.sparse_coo else w).coalesce()
+    post, pre = w.indices()
+    source = torch.zeros(brain.n, dtype=torch.bool)
+    source[torch.as_tensor(brain.roles[source_role], dtype=torch.long)] = True
+    hit = source[pre]
+    drive = torch.zeros(brain.n, dtype=torch.float64).index_add_(0, post[hit], w.values()[hit].abs().double())
+    drive[source] = 0.0
+    top = torch.argsort(drive, descending=True)[:k]
+    return top[drive[top] > 0].numpy().astype(np.int64)
+
+
 class ConnectomeAgent:
     """Drives a batched `Brain` from observations and reads out motor commands."""
 
@@ -239,7 +257,12 @@ class ConnectomeAgent:
         seen: set[int] = set()
         self.readout_role_of: list[str] = []
         for role in [r.strip() for r in self.cfg.readout_roles.split(",") if r.strip()]:
-            cells = dn if role == "descending" else np.asarray(brain.roles.get(role, []), dtype=np.int64)
+            if role == "descending":
+                cells = dn
+            elif role == "visual_downstream":
+                cells = visual_downstream(brain, self.cfg.input_role, self.cfg.downstream_cells)
+            else:
+                cells = np.asarray(brain.roles.get(role, []), dtype=np.int64)
             for c in cells.tolist():
                 if c not in seen:
                     seen.add(c)

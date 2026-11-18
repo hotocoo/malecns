@@ -168,6 +168,13 @@ LANE_LEFT, LANE_RIGHT, LANE_CENTRE = 0.25, 0.75, 0.5
 # steering at R^2 0.16 under the ray-eye default (0.2, ~80 ms) and 0.39 when
 # smoothed to ~240 ms. Costs ~0.2 s of reaction, ~2.5 m at 40 km/h.
 CAMERA_MOTOR_TAU = 0.07
+# Readout population for new camera drivers. Descending neurons alone carried
+# steering at R^2 0.16 even with perfect lane input; cells one synapse below
+# the visual projection neurons see the eye before that bottleneck.
+CAMERA_READOUT_ROLES = "visual_downstream,descending,motor"
+# Cells in that "visual_downstream" role. 2000 lifted held-out steer R^2 from
+# 0.03 to 0.30 on kl_r6 (teacher-driven rounds).
+CAMERA_DOWNSTREAM_CELLS = 2000
 
 
 def channel_azimuth(sensor: CameraSensor) -> tuple[float, ...]:
@@ -227,6 +234,8 @@ def agent_config_for(sensor: CameraSensor, base=None, retinotopic: bool = False)
     if retinotopic and base.channel_azimuth is None:
         tweaks["channel_azimuth"] = channel_azimuth(sensor)
         tweaks["motor_tau"] = CAMERA_MOTOR_TAU
+        tweaks["readout_roles"] = CAMERA_READOUT_ROLES
+        tweaks["downstream_cells"] = CAMERA_DOWNSTREAM_CELLS
     # A checkpoint that recorded its own drive keeps it; only the ray eye's
     # defaults are replaced, so a saved readout still means what it meant.
     ray_defaults = AgentConfig()

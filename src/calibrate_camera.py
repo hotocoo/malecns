@@ -42,7 +42,7 @@ import torch
 import defaults
 from agent import ConnectomeAgent
 from brain import Brain, LIFConfig, load_connectome, pick_device, synchronize
-from calibrate import PRE_CLIP, fit_readout, install_fit
+from calibrate import PRE_CLIP, fit_readout, install_fit, r_squared
 from car_env import DONE_NAMES, CarEnv
 from lane_head import default_lane_head
 from perceive import TRAINED_WEIGHTS
@@ -173,7 +173,7 @@ def collect(agent: ConnectomeAgent, env: CarEnv, sensor, teacher: LaneTeacher, t
     first_end = torch.full((batch,), -1, dtype=torch.long)
     reason = torch.zeros(batch, dtype=torch.long)
     speed_sum = torch.zeros(batch, device=env.device)
-    xs, ys, cars = [], [], []
+    xs, ys, cars, eyes = [], [], [], []
     with torch.inference_mode():
         for step in range(steps):
             target = teacher.act()
@@ -187,6 +187,7 @@ def collect(agent: ConnectomeAgent, env: CarEnv, sensor, teacher: LaneTeacher, t
                 xs.append(signal[alive].half().cpu())
                 ys.append(target[alive].cpu())
                 cars.append(torch.arange(batch)[keep])
+                eyes.append(obs[alive].float().cpu())
             obs, _, done = env.step(action)
             speed_sum += env.speed * alive
             ended = done & alive
@@ -203,6 +204,7 @@ def collect(agent: ConnectomeAgent, env: CarEnv, sensor, teacher: LaneTeacher, t
         "x": torch.cat(xs) if xs else None,
         "y": torch.cat(ys) if ys else None,
         "car": torch.cat(cars) if cars else None,
+        "eye": torch.cat(eyes) if eyes else None,
         "laps": env.laps.cpu(),
         "steps_alive": steps_alive,
         "reason": reason,
@@ -342,6 +344,20 @@ def main(argv: list[str] | None = None) -> int:
     teacher.explore = 0.0
     final = collect(agent, env, sensor, teacher, theta, args.eval_steps, 0.0, args.seed + 100, record=False)
     print("[final] " + describe(f"brain alone, {args.eval_steps} steps", final, args.eval_steps))
+    print(f"[final] steps alive per car: {final['steps_alive'].tolist()}")
+
+    # Gauge on the held-out route, teacher driving: the pooled readout scored
+    # on frames it never saw, against a ridge straight from the eye vector
+    # fitted there (held-out cars), the ceiling perception sets.
+    gauge = collect(agent, env, sensor, teacher, theta, args.eval_steps, 1.0, args.seed + 200, record=True)
+    y_gauge = torch.atanh(gauge["y"].clamp(-PRE_CLIP, PRE_CLIP))
+    brain_r2 = r_squared(gauge["x"].float() @ w + b, y_gauge)
+    eye_r2 = fit_readout(gauge["eye"], y_gauge, gauge["car"], lams)[3]
+    print(
+        f"[gauge] {(args.holdout or args.track).stem}, {y_gauge.shape[0]:,} teacher frames: "
+        f"steer R^2 brain {float(brain_r2[0]):.3f} eye {float(eye_r2[0]):.3f}; "
+        f"pedal brain {float(brain_r2[1]):.3f} eye {float(eye_r2[1]):.3f}"
+    )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -368,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
                 "r2_pedal": float(r2[1]),
                 "final_laps": final["laps"].tolist(),
                 "final_steps_alive": final["steps_alive"].tolist(),
+                "gauge_r2_steer_brain": float(brain_r2[0]),
+                "gauge_r2_steer_eye": float(eye_r2[0]),
                 "rounds": args.rounds,
                 "steps": args.steps,
                 "cars": args.cars,
