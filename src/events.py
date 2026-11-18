@@ -51,6 +51,14 @@ ANIMAL = "animal_crossing"
 RED_RUNNER = "crossing_vehicle_runs_red"
 BREAKDOWN = "broken_down_vehicle"
 
+# Car following: a lane actor keeps at least this bumper gap, plus this many
+# seconds of its own speed, behind whatever is ahead in its lane (ego included).
+FOLLOW_MIN_GAP_M = 2.5
+FOLLOW_HEADWAY_S = 1.2
+# Two actors share a lane when their lateral offsets differ by less than this
+# share of their summed widths plus the margin.
+FOLLOW_LANE_MARGIN_M = 0.4
+
 HAZARDS = (
     DART_OUT, CHILD_BALL, TAILGATER, SUDDEN_BRAKE, CUT_IN, FILTERING,
     ILLEGAL_UTURN, DOUBLE_PARKED, JAYWALK, BUS_STOPS, ANIMAL, RED_RUNNER, BREAKDOWN,
@@ -130,6 +138,7 @@ class Director:
         self.profile = profile
         self.traffic = traffic
         self.cfg = cfg or SceneConfig()
+        self._caps: dict[int, float] = {}
         self.rates = rates or HazardRates()
         self.rng = np.random.default_rng(seed)
         self.tangent, self.normal = frame_at(self.centerline)
@@ -327,7 +336,37 @@ class Director:
                     self._since_last_s = 0.0
                     return  # one at a time, so events stay legible
 
+    def _follow_caps(self, ego_progress: float, ego_pos: np.ndarray) -> dict[int, float]:
+        """Speed each lane actor may not exceed so it stops short of its leader.
+
+        Leaders are found per lane band: same direction of travel, lateral
+        offsets close enough that the bodies would touch. The ego car leads
+        too, so traffic does not drive into the driver from behind.
+        """
+        lane = [a for a in self.traffic.actors if a.behaviour != "free" and a.progress >= 0.0 and a.behaviour != "uturn"]
+        if not lane:
+            return {}
+        prog = np.array([a.progress for a in lane])
+        off = np.array([a.lane_offset_m for a in lane])
+        length = np.array([float(a.size[0]) for a in lane])
+        width = np.array([float(a.size[1]) for a in lane])
+        i = self.index_at(ego_progress)
+        ego_off = float(np.dot(np.asarray(ego_pos)[:2] - self.centerline[i], self.normal[i]))
+        prog = np.append(prog, ego_progress)
+        off = np.append(off, ego_off)
+        length = np.append(length, self.cfg.car_length_m)
+        width = np.append(width, self.cfg.car_width_m)
+        ahead = ((prog[None, :] - prog[:-1, None]) % 1.0) * self.lap_m  # (lane, lane+ego) metres ahead
+        ahead[np.arange(len(lane)), np.arange(len(lane))] = np.inf
+        same = np.abs(off[None, :] - off[:-1, None]) < 0.5 * (width[None, :] + width[:-1, None]) + FOLLOW_LANE_MARGIN_M
+        ahead = np.where(same & (ahead < 0.5 * self.lap_m), ahead, np.inf)
+        lead = ahead.argmin(axis=1)
+        gap = ahead[np.arange(len(lane)), lead] - 0.5 * (length[:-1] + length[lead])
+        cap = np.maximum(gap - FOLLOW_MIN_GAP_M, 0.0) / FOLLOW_HEADWAY_S
+        return {id(a): float(c) for a, c in zip(lane, cap) if np.isfinite(c)}
+
     def _advance_actors(self, dt_s: float, ego_progress: float, ego_pos: np.ndarray, ego_speed: float) -> None:
+        self._caps = self._follow_caps(ego_progress, ego_pos)
         for actor in self.traffic.actors:
             if actor.ttl_s > 0.0:
                 actor.ttl_s -= dt_s
@@ -365,8 +404,9 @@ class Director:
         elif actor.behaviour == "parked":
             actor.target_speed_mps = 0.0
 
-        rate = 6.0 if actor.target_speed_mps < actor.speed_mps else 2.5
-        actor.speed_mps += np.clip(actor.target_speed_mps - actor.speed_mps, -rate * dt_s, rate * dt_s)
+        target = min(actor.target_speed_mps, self._caps.get(id(actor), np.inf))
+        rate = 6.0 if target < actor.speed_mps else 2.5
+        actor.speed_mps += np.clip(target - actor.speed_mps, -rate * dt_s, rate * dt_s)
         actor.speed_mps = max(actor.speed_mps, 0.0)
         actor.progress = (actor.progress + actor.speed_mps * dt_s / self.lap_m) % 1.0
         actor.pos = self.point_at(actor.progress, actor.lane_offset_m)

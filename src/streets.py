@@ -297,6 +297,21 @@ def _buffer(way: Way, extra_m: float, cfg: StreetConfig):
     return LineString(way.points).buffer(way.half_m + extra_m, cap_style="flat", quad_segs=cfg.buffer_segments)
 
 
+def street_footprint(ways: list[Way], cfg: StreetConfig | None = None):
+    """Ground the streets own: every carriageway, plus kerb and pavement where a footway runs.
+
+    Buildings are cut back to this, so an OSM footprint drawn over the road
+    (common at corners, where mappers trace the plot, not the wall) cannot
+    stand on the asphalt the car drives.
+    """
+    cfg = cfg or StreetConfig()
+    if not ways:
+        return None
+    parts = [_buffer(w, 0.0, cfg) for w in ways]
+    parts += [_buffer(w, cfg.kerb_width_m + cfg.pavement_width_m, cfg) for w in ways if w.highway in FOOTWAY_CLASSES]
+    return unary_union(parts)
+
+
 def build_streets(
     ways: list[Way],
     ground_z: float,

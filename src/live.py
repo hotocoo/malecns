@@ -26,7 +26,7 @@ import json
 import threading
 from urllib.parse import unquote
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -63,6 +63,8 @@ class Shared:
     moving: dict | None = None
     frame_index: int = 0
     running: bool = True
+    simulation: object = None  # set once built, for the brain endpoints
+    anatomy: object = None  # (meta, positions, roles) for the 3D brain, built on first ask
 
     def publish(self, jpeg: bytes, telemetry: dict) -> None:
         with self.lock:
@@ -190,6 +192,12 @@ class Simulation:
         control_points = control_points_for_circuit(track, proj, load_law(), centerline=centerline)
         self.law = LawEnforcer(profile, control_points, self.env.track.centerline.cpu(), self.device)
         self.env.attach_law(self.law)
+        # Same world rules as training: traffic is solid (a hit ends the run and
+        # restarts it) and nothing is parked on the start line.
+        from train_camera import clear_starts, obstacle_provider
+
+        clear_starts(self.traffic, self.env)
+        self.env.attach_traffic(obstacle_provider(self.traffic, self.scene.fixtures))
         # The camera is the eye here too: without this the environment would
         # still hand out ray distances, and the connectome - evolved on a
         # 120-channel detection view - would be reading a 20-column ray fan.
@@ -256,6 +264,10 @@ class Simulation:
         agent.seed(0)
         self.agent = agent
         self.brain = brain
+        self.connectome = connectome
+        # Every spike of the one body driving, packed to bits for the 3D brain.
+        sink = torch.zeros(1, brain.n, device=device)
+        self.spike_mask = bytes((brain.n + 7) // 8)
         self.driver_note = (
             f"connectome, generation {saved.get('generation', 0)}, eyes {cfg.eye_encoding}"
             + (", calibrated readout" if calibrated else "")
@@ -263,7 +275,10 @@ class Simulation:
 
         def drive(observation: torch.Tensor) -> torch.Tensor:
             # The environment lives on the CPU; the brain may not.
-            return agent.act(observation.to(device), theta).to(observation.device)
+            sink.zero_()
+            action = agent.act(observation.to(device), theta, spike_sink=sink)
+            self.spike_mask = np.packbits((sink[0] > 0).to(torch.uint8).cpu().numpy()).tobytes()
+            return action.to(observation.device)
 
         return drive
 
@@ -448,6 +463,31 @@ class Simulation:
                 state["dn_mean"] = round(float(per_body.mean()), 4)
         return state
 
+    def brain_anatomy(self) -> tuple[dict, bytes, bytes] | None:
+        """(meta, positions float32, role ids + measured flags) for the 3D brain, or None."""
+        connectome = getattr(self, "connectome", None)
+        graph = Path("data/graph")
+        if connectome is None or not (graph / "positions.npy").exists():
+            return None
+        from viewer_config import BrainViewConfig, UiConfig
+
+        positions = np.load(graph / "positions.npy").astype(np.float32)
+        known_path = graph / "positions_known.npy"
+        known = np.load(known_path).astype(np.uint8) if known_path.exists() else np.ones(connectome.n, dtype=np.uint8)
+        names = list(connectome.roles.keys())
+        ids = np.full(connectome.n, 255, dtype=np.uint8)
+        for i, role in enumerate(names):
+            ids[np.asarray(connectome.roles[role], dtype=np.int64)] = i
+        ui = UiConfig()
+        meta = {
+            "neurons": connectome.n,
+            "measured": int(known.sum()),
+            "role_names": names,
+            "role_colours": [ui.role_colours.get(r, ui.role_fallback_colour) for r in names],
+            "view": asdict(BrainViewConfig()),
+        }
+        return meta, positions.tobytes(), ids.tobytes() + known.tobytes()
+
     def run(self, shared: Shared, fps: float) -> None:
         """Drive, render, detect and publish until asked to stop."""
         from scene import update_signals
@@ -522,12 +562,40 @@ PAGE = """<!doctype html>
       <canvas id="senses" width="880" height="230"></canvas>
     </div>
     <div class="panel">
+      <div class="label" id="brain-label">fly brain &mdash; the connectome driving this car, every spike at its soma</div>
+      <canvas id="brain" width="880" height="520" style="height:520px"></canvas>
+    </div>
+    <div class="panel">
       <div class="label">steering and pedal</div>
       <canvas id="controls" width="880" height="60"></canvas>
     </div>
   </div>
   <table id="telemetry"></table>
 </main>
+<script type="module">
+import { BrainView } from "/brain.js";
+const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+(async () => {
+  const label = document.getElementById("brain-label");
+  const reply = await fetch("/brain/meta.json");
+  if (!reply.ok) { label.textContent = "fly brain: " + (await reply.text()); return; }
+  const meta = await reply.json();
+  const colours = new Float32Array(8 * 3);
+  meta.role_colours.slice(0, 8).forEach((c, i) => colours.set(hex(c), i * 3));
+  const view = new BrainView(document.getElementById("brain"), colours, meta.view);
+  const [pos, roles] = await Promise.all(["/brain/positions.bin", "/brain/roles.bin"].map((u) => fetch(u).then((r) => r.arrayBuffer())));
+  const n = meta.neurons;
+  view.load(new Float32Array(pos), new Uint8Array(roles, 0, n), new Uint8Array(roles, n, n));
+  label.textContent = `fly brain \u00b7 ${n.toLocaleString()} neurons (${meta.measured.toLocaleString()} measured somata) \u00b7 drag to rotate, scroll to zoom`;
+  const pull = async () => {
+    try { view.applySpikes(new Uint8Array(await (await fetch("/brain/spikes.bin", { cache: "no-store" })).arrayBuffer())); } catch (e) {}
+    setTimeout(pull, 50);
+  };
+  pull();
+  const loop = () => { view.render(); requestAnimationFrame(loop); };
+  requestAnimationFrame(loop);
+})();
+</script>
 <script>
 const rows = [
   ["step","step"],["speed","speed_kmh"],["posted limit","limit_kmh"],["keeps","driving_side"],
@@ -936,7 +1004,40 @@ def make_handler(shared: Shared):
             if self.path.startswith("/3d"):
                 from camera import SURFACE_GLSL
 
-                self.html_reply(WORLD_PAGE.replace("/*SURFACE_GLSL*/", SURFACE_GLSL))
+                # the shader sits in a JS template literal: a backtick in a GLSL comment ended it
+                self.html_reply(WORLD_PAGE.replace("/*SURFACE_GLSL*/", SURFACE_GLSL.replace("`", "'")))
+                return
+            if self.path == "/brain.js":
+                body = Path("web/brain.js").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/javascript")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path.startswith("/brain/"):
+                simulation = shared.simulation
+                if simulation is None or getattr(simulation, "brain", None) is None:
+                    self.send_error(503, "no connectome is driving (scripted cruise or still loading)")
+                    return
+                if self.path.startswith("/brain/spikes.bin"):
+                    self.binary_reply(simulation.spike_mask)
+                    return
+                if shared.anatomy is None:
+                    shared.anatomy = simulation.brain_anatomy() or ()
+                anatomy = shared.anatomy
+                if not anatomy:
+                    self.send_error(404, "no soma positions: run src/build_positions.py --graph data/graph")
+                    return
+                meta, positions, roles = anatomy
+                if self.path.startswith("/brain/meta.json"):
+                    self.json_reply(meta)
+                elif self.path.startswith("/brain/positions.bin"):
+                    self.binary_reply(positions)
+                elif self.path.startswith("/brain/roles.bin"):
+                    self.binary_reply(roles)
+                else:
+                    self.send_error(404)
                 return
             if self.path.startswith("/vendor/"):
                 self.serve_vendor(self.path[len("/vendor/") :])
@@ -950,6 +1051,14 @@ def make_handler(shared: Shared):
             body = json.dumps(payload).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def binary_reply(self, body: bytes) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -1078,6 +1187,7 @@ def main(argv: list[str] | None = None) -> int:
             shared.running = False
             raise
         built["simulation"] = simulation
+        shared.simulation = simulation
         print(f"[live] {simulation.law.summary()}")
         header, mesh = simulation.world()
         with shared.lock:

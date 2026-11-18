@@ -31,7 +31,7 @@ from events import (  # noqa: E402
     HazardRates,
 )
 from roadlaw import LegalProfile  # noqa: E402
-from scene import CLASS_MOTORCYCLE, CLASS_PERSON, SceneConfig, Traffic  # noqa: E402
+from scene import CLASS_CAR, CLASS_MOTORCYCLE, CLASS_PERSON, Actor, SceneConfig, Traffic  # noqa: E402
 
 N = 256
 RADIUS = 300.0
@@ -228,3 +228,21 @@ class TestOverTime:
         d = director(rates=quiet)
         drive(d, seconds=300.0)
         assert sum(d.summary().values()) == 0
+
+
+def test_a_faster_car_queues_behind_a_slower_one_instead_of_driving_through_it():
+    d = director(vehicles=0, rates=HazardRates(per_km={}))
+    def car(progress: float, speed: float) -> Actor:
+        return Actor(
+            kind=CLASS_CAR, pos=d.point_at(progress, -2.0), heading=d.heading_at(progress),
+            size=np.array([4.4, 1.8, 1.45]), colour=np.zeros(3, dtype=np.float32),
+            progress=progress, speed_mps=speed, lane_offset_m=-2.0, target_speed_mps=speed,
+        )
+
+    slow, fast = car(0.30, 4.0), car(0.30 - 20.0 / d.lap_m, 14.0)
+    d.traffic.actors = [slow, fast]
+    for _ in range(int(60.0 / 0.05)):
+        d._advance_actors(0.05, ego_progress=0.8, ego_pos=d.point_at(0.8, -2.0), ego_speed=0.0)
+        gap = ((slow.progress - fast.progress) % 1.0) * d.lap_m - 4.4
+        assert gap > 0.0, "the follower drove into the car ahead"
+    assert fast.speed_mps < 6.0  # it settled to the leader's pace instead of its own 14 m/s

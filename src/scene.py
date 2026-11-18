@@ -87,6 +87,8 @@ class SceneConfig:
     # What a building is given when the survey measured neither its height nor
     # its storeys. Malaysian shoplots are typically two or three storeys.
     storey_m: float = 3.2
+    # A footprint cut back off the street smaller than this is a sliver, not a building.
+    min_building_m2: float = 6.0
     unknown_storeys: float = 3.0
 
     signal_height_m: float = 4.2  # head height above the road
@@ -117,6 +119,8 @@ class RoadMesh:
     # Per-vertex material of `surface` (see `streets.MAT_*`); None means the
     # whole surface is asphalt. Markings are always flat paint.
     surface_material: np.ndarray | None = None
+    # Ground the streets own (shapely), when built from a survey; buildings are cut back to it.
+    footprint: object = None
 
 
 @dataclass
@@ -297,6 +301,7 @@ def build_network(
         markings_colour=mesh.colours[is_paint],
         halfwidth_m=np.zeros(0),
         surface_material=mesh.materials[~is_paint],
+        footprint=streets.street_footprint(ways, StreetConfig()),
     )
 
 
@@ -307,8 +312,12 @@ def build_buildings(
     ground_z: float = 0.0,
     max_distance_m: float = 900.0,
     centre: np.ndarray | None = None,
+    clear_of=None,
 ) -> RoadMesh:
     """Every surveyed building near the circuit, extruded to its own height.
+
+    `clear_of` (a shapely geometry in the same frame, usually the street
+    footprint) is cut out of every footprint, so no wall stands on a road.
 
     A street with no buildings is a road in a field, and a camera driving it
     sees only sky. OSM carries the footprint of nearly every building in a
@@ -325,6 +334,11 @@ def build_buildings(
         empty = np.zeros((0, 3), dtype=np.float32)
         return RoadMesh(empty, empty, empty, empty, np.zeros(0))
 
+    from shapely.geometry import Polygon
+    from shapely.geometry.polygon import orient
+    from shapely.prepared import prep
+
+    clear = prep(clear_of) if clear_of is not None else None
     data = json.loads(path.read_text())
     walls: list[np.ndarray] = []
     shades: list[np.ndarray] = []
@@ -341,11 +355,26 @@ def build_buildings(
         height = float((feature.get("properties") or {}).get("height") or 0.0)
         if height <= 0.0:
             height = cfg.unknown_storeys * cfg.storey_m
-        wall, shade, material = _extrude(outline, ground_z, height, cfg)
-        if wall.shape[0]:
-            walls.append(wall)
-            shades.append(shade)
-            materials.append(material)
+        outlines = [outline]
+        if clear is not None:
+            footprint = Polygon(outline).buffer(0)
+            if clear.intersects(footprint):
+                left = footprint.difference(clear_of)
+                pieces = getattr(left, "geoms", [left])
+                # keep the survey's winding: walls are single-sided, and a piece
+                # wound the other way shows only its roof, floating in the air
+                winding = 1.0 if Polygon(outline).exterior.is_ccw else -1.0
+                outlines = [
+                    np.asarray(orient(p, sign=winding).exterior.coords[:-1], dtype=np.float64)
+                    for p in pieces
+                    if p.geom_type == "Polygon" and p.area >= cfg.min_building_m2
+                ]
+        for kept in outlines:
+            wall, shade, material = _extrude(kept, ground_z, height, cfg)
+            if wall.shape[0]:
+                walls.append(wall)
+                shades.append(shade)
+                materials.append(material)
 
     if not walls:
         empty = np.zeros((0, 3), dtype=np.float32)

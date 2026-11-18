@@ -120,7 +120,8 @@ def load_scene(track: Path, scene_cfg: SceneConfig | None = None) -> SceneBundle
     # The city the street runs through. Without it the camera sees a road in a
     # field, and so does the detector.
     buildings = build_buildings(
-        track.with_name(track.stem + "_buildings.geojson"), proj, scene_cfg, centre=centerline
+        track.with_name(track.stem + "_buildings.geojson"), proj, scene_cfg, centre=centerline,
+        clear_of=_lap_footprint(centerline, lane_halfwidth(profile, scene_cfg), network),
     )
     fixtures = place_signals(control_points, centerline, heights, profile, profile.driving_side, scene_cfg)
     fixtures += place_signs(control_points, centerline, heights, profile, profile.driving_side, scene_cfg)
@@ -135,6 +136,15 @@ def load_scene(track: Path, scene_cfg: SceneConfig | None = None) -> SceneBundle
         fixtures=fixtures,
         halfwidth=lane_halfwidth(profile, scene_cfg),
     )
+
+
+def _lap_footprint(centerline: np.ndarray, halfwidth: np.ndarray, network):
+    """The lap's own carriageway (per-sample half width) joined to the street network's footprint."""
+    import shapely
+
+    lap = shapely.union_all(shapely.buffer(shapely.points(centerline[:, :2]), np.asarray(halfwidth, dtype=np.float64)))
+    streets_owned = getattr(network, "footprint", None)
+    return lap if streets_owned is None else lap.union(streets_owned)
 
 
 def surveyed_heights_or_flat(track: Path, centerline: np.ndarray) -> np.ndarray:
