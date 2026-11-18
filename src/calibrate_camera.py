@@ -78,7 +78,7 @@ class LaneTeacher:
         lookahead_m: float,
         pace_fraction: float,
         gain: float,
-        corner_g: float = 0.30,
+        corner_g: float = 0.0,
         explore: float = 0.0,
         explore_tau_s: float = 0.6,
     ) -> None:
@@ -95,17 +95,20 @@ class LaneTeacher:
         self.left = torch.stack([-tangent[:, 1], tangent[:, 0]], dim=1)
         spacing = float((torch.roll(cl, -1, dims=0) - cl).norm(dim=1).mean())
         self.look = max(1, int(round(lookahead_m / max(spacing, 1e-6))))
-        # Corner speed from the centreline's own curvature at a comfortable
-        # lateral acceleration: a right-angle street corner of 6 m radius at
-        # 0.3 g is 15 km/h, which is how a street car takes it. Read ahead
-        # over a braking distance so the slowing starts before the corner.
-        angle = torch.atan2(tangent[:, 1], tangent[:, 0])
-        turn = torch.remainder(torch.roll(angle, -1, dims=0) - angle + torch.pi, 2 * torch.pi) - torch.pi
-        radius = spacing / turn.abs().clamp(min=1e-4)
-        corner = torch.sqrt(corner_g * 9.81 * radius).clamp(max=env.cfg.max_speed)
-        window = max(1, int(round(35.0 / max(spacing, 1e-6))))
-        stacked = torch.stack([torch.roll(corner, -k, dims=0) for k in range(window)], dim=1)
-        self.corner_speed = stacked.min(dim=1).values
+        # Target speed: the car's own minimum-lap-time profile (`Track.speed_ref`:
+        # grip circle, braking zones, traction, grade), so the teacher DAgger
+        # copies is already the fastest driver the car allows; the posted limit
+        # still caps it in `act`. `corner_g > 0` adds a comfort cap on top.
+        corner = env.track.speed_ref.clone()
+        if corner_g > 0.0:
+            angle = torch.atan2(tangent[:, 1], tangent[:, 0])
+            turn = torch.remainder(torch.roll(angle, -1, dims=0) - angle + torch.pi, 2 * torch.pi) - torch.pi
+            radius = spacing / turn.abs().clamp(min=1e-4)
+            comfort = torch.sqrt(corner_g * 9.81 * radius).clamp(max=env.cfg.max_speed)
+            window = max(1, int(round(35.0 / max(spacing, 1e-6))))
+            comfort = torch.stack([torch.roll(comfort, -k, dims=0) for k in range(window)], dim=1).min(dim=1).values
+            corner = torch.minimum(corner, comfort)
+        self.corner_speed = corner
         # Exploration (DART): the executed steering wanders with slow noise
         # while the label stays the clean correction, so the recorded data
         # covers the offsets and heading errors the brain must learn to undo.
@@ -215,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lams", default="3,10,30,100,300,1000")
     parser.add_argument("--lookahead", type=float, default=10.0, help="metres ahead the teacher aims at")
     parser.add_argument("--steer-gain", type=float, default=1.6)
-    parser.add_argument("--corner-g", type=float, default=0.30, help="lateral g the teacher takes corners at")
+    parser.add_argument("--corner-g", type=float, default=0.0, help="comfort lateral-g cap on corners; 0 = the car's minimum-lap-time profile")
     parser.add_argument("--explore", type=float, default=0.12, help="steering noise (DART) on the executed action while collecting")
     parser.add_argument("--steer-boost", type=float, default=1.0)
     parser.add_argument("--pedal-boost", type=float, default=1.0)
