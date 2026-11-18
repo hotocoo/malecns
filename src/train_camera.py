@@ -51,6 +51,7 @@ from events import Director, HazardRates
 from eye_camera import CameraSensor, SensorConfig, agent_config_for
 from law import load_law
 from lawreward import LawEnforcer, LawWeights
+from lane_head import default_lane_head
 from perceive import TRAINED_WEIGHTS, EyeConfig
 from roadlaw import control_points_for_circuit, legal_profile_for_circuit
 from scene import SceneConfig, Traffic
@@ -113,7 +114,12 @@ def build_world(args, device: torch.device, stage: Stage | None = None):
         traffic,
         CameraConfig(width=args.width, height=args.height),
         EyeConfig(columns=args.columns),
-        SensorConfig(stride=args.perception_stride, weights=args.weights, device=args.detector_device),
+        SensorConfig(
+            stride=args.perception_stride,
+            weights=args.weights,
+            device=args.detector_device,
+            lane_head=getattr(args, "lane_head", None) or None,
+        ),
         scene_cfg,
     )
     director = Director(
@@ -349,6 +355,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--revert-after", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--lane-head",
+        default=default_lane_head(),
+        help="learned lane model (lane_head.py) for the eye's lane slots; '' for the pixel rules",
+    )
+    parser.add_argument(
         "--pool",
         type=Path,
         default=None,
@@ -484,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
                 "readout": agent.readout_state(),
                 "track": str(args.track),
                 "weights": args.weights,
+                "lane_head": args.lane_head or None,
                 "columns": args.columns,
                 "camera": {"width": args.width, "height": args.height},
                 "saved_at": time.time(),

@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from camera import CameraConfig, DriverCamera
-from perceive import DEFAULT_WEIGHTS, Detector, DetectionEye, EyeConfig
+from perceive import DEFAULT_WEIGHTS, LANE_CHANNELS, Detector, DetectionEye, EyeConfig
 from scene import SceneConfig, Traffic, update_signals
 from lawreward import SignalTiming
 
@@ -38,6 +38,9 @@ class SensorConfig:
     weights: str = DEFAULT_WEIGHTS
     device: str | None = None
     detector_confidence: float = 0.25
+    # Learned lane model (lane_head.py); when set, its mirrored left/right
+    # channels replace the pixel-rule lane measurement in the eye's lane slots.
+    lane_head: str | None = None
 
 
 class CameraSensor:
@@ -67,6 +70,13 @@ class CameraSensor:
         # A caller may pass its own detector, which is how the tests run the
         # whole chain without loading weights.
         self.detector = detector if detector is not None else Detector(self.cfg.weights, device=self.cfg.device)
+        self.lane = None
+        if self.cfg.lane_head:
+            if not self.eye.config.include_lane:
+                raise ValueError("a lane head needs the eye's lane slots (EyeConfig.include_lane)")
+            from lane_head import LaneHead
+
+            self.lane = LaneHead(self.cfg.lane_head)
         self.timing = timing or SignalTiming()
         self._last: np.ndarray | None = None
         self._step = 0
@@ -125,6 +135,9 @@ class CameraSensor:
             self.detector_calls += 1
             detections = self.detector.detect(frames, self.cfg.detector_confidence)
             self._last = self.eye.encode_batch(detections, frames)
+            if self.lane is not None:
+                slots = len(LANE_CHANNELS)  # lane slots close the eye vector
+                self._last[:, -slots:] = self.lane.encode(frames, slots)
             self.last_frames = frames
             self.last_detections = detections
 

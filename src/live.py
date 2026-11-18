@@ -38,6 +38,7 @@ import defaults
 from defaults import CONTROL_DT_S
 from law import load_law
 from lawreward import GREEN, AMBER, RED, LawEnforcer, SignalTiming, signal_phase
+from lane_head import default_lane_head
 from perceive import CHANNELS, TRAINED_WEIGHTS, Detector, DetectionEye, EyeConfig, describe
 from roadlaw import control_points_for_circuit, legal_profile_for_circuit
 
@@ -137,6 +138,7 @@ class Simulation:
         device: str | None,
         checkpoint: Path | None = None,
         detect_every: int = 4,
+        lane_head: str | None = None,
     ) -> None:
         from car_env import CarEnv, load_geojson_centerline, street_car_config
         from dataset import load_scene
@@ -162,7 +164,7 @@ class Simulation:
             self.traffic,
             camera_cfg,
             eye_cfg,
-            SensorConfig(stride=detect_every, weights=weights, device=device),
+            SensorConfig(stride=detect_every, weights=weights, device=device, lane_head=lane_head or None),
             scene_cfg,
         )
         self.detector: Detector = self.sensor.detector
@@ -1158,6 +1160,11 @@ def main(argv: list[str] | None = None) -> int:
         default=Path("checkpoints/camera/driver.pt"),
         help="the evolved driver to watch; falls back to a scripted cruise when it does not fit this eye",
     )
+    parser.add_argument(
+        "--lane-head",
+        default=default_lane_head(),
+        help="learned lane model for the eye's lane slots; '' for the pixel rules (must match how the driver was trained)",
+    )
     args = parser.parse_args(argv)
 
     shared = Shared()
@@ -1181,6 +1188,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.device,
                 args.checkpoint,
                 args.detect_every,
+                args.lane_head,
             )
         except Exception as exc:  # the page would otherwise sit blank forever
             print(f"[live] simulation failed to start: {exc}")

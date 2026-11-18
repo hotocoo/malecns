@@ -44,6 +44,7 @@ from agent import ConnectomeAgent
 from brain import Brain, LIFConfig, load_connectome, pick_device, synchronize
 from calibrate import PRE_CLIP, fit_readout, install_fit
 from car_env import DONE_NAMES, CarEnv
+from lane_head import default_lane_head
 from perceive import TRAINED_WEIGHTS
 from train_camera import (
     CURRICULUM,
@@ -251,6 +252,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=Path, default=Path("checkpoints/camera/driver.pt"))
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--lane-head",
+        default=default_lane_head(),
+        help="learned lane model (lane_head.py) for the eye's lane slots; '' for the pixel rules",
+    )
     parser.add_argument("--pool", type=Path, default=None, help="directory of extra OSM routes; collection rounds rotate over --track plus these")
     parser.add_argument("--holdout", type=Path, default=None, help="route the final brain-alone check drives (default: --track)")
     args = parser.parse_args(argv)
@@ -349,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
             "readout": agent.readout_state(),
             "track": str(args.track),
             "weights": args.weights,
+            "lane_head": args.lane_head or None,
             "columns": args.columns,
             "camera": {"width": args.width, "height": args.height},
             "curriculum": [asdict(s) for s in CURRICULUM],

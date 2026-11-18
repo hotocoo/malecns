@@ -355,17 +355,18 @@ def build_buildings(
         height = float((feature.get("properties") or {}).get("height") or 0.0)
         if height <= 0.0:
             height = cfg.unknown_storeys * cfg.storey_m
+        # Walls are single-sided and face out only for a counter-clockwise ring;
+        # 64% of the KL survey is clockwise, which drew those buildings as a
+        # roof floating over nothing.
+        outline = np.asarray(orient(Polygon(outline), sign=1.0).exterior.coords[:-1], dtype=np.float64)
         outlines = [outline]
         if clear is not None:
             footprint = Polygon(outline).buffer(0)
             if clear.intersects(footprint):
                 left = footprint.difference(clear_of)
                 pieces = getattr(left, "geoms", [left])
-                # keep the survey's winding: walls are single-sided, and a piece
-                # wound the other way shows only its roof, floating in the air
-                winding = 1.0 if Polygon(outline).exterior.is_ccw else -1.0
                 outlines = [
-                    np.asarray(orient(p, sign=winding).exterior.coords[:-1], dtype=np.float64)
+                    np.asarray(orient(p, sign=1.0).exterior.coords[:-1], dtype=np.float64)
                     for p in pieces
                     if p.geom_type == "Polygon" and p.area >= cfg.min_building_m2
                 ]

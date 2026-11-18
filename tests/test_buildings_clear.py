@@ -37,10 +37,7 @@ def test_a_footprint_drawn_over_the_road_is_cut_back_off_it(tmp_path):
     assert bool((np.abs(clipped.surface[:, 1]) >= 4.0 - 1e-3).all())
 
 
-def test_a_cut_footprint_keeps_the_surveys_winding_so_its_walls_face_out(tmp_path):
-    import shapely
-    from shapely.geometry import Polygon
-
+def test_every_footprint_faces_out_whatever_way_the_survey_wound_it(tmp_path):
     proj = GeoProjection(lon0=101.7, lat0=3.15, scale=1.0)
     lat0 = np.deg2rad(3.15)
     for corners in (
@@ -52,13 +49,9 @@ def test_a_cut_footprint_keeps_the_surveys_winding_so_its_walls_face_out(tmp_pat
         ring = np.stack([lon, lat], axis=1).tolist()
         path = tmp_path / "w.geojson"
         path.write_text(json.dumps({"features": [{"geometry": {"coordinates": [ring + [ring[0]]]}, "properties": {"height": 9}}]}))
-        road = LineString([(-50, -12), (50, -12)]).buffer(6.0)  # trims the plot's south edge only
-        whole = build_buildings(path, proj, SceneConfig())
-        clipped = build_buildings(path, proj, SceneConfig(), clear_of=road)
-        # first wall triangle's normal points the same way (in or out) as the uncut building's
-        def facing(mesh):
+        for clear in (None, LineString([(-50, -12), (50, -12)]).buffer(6.0)):
+            mesh = build_buildings(path, proj, SceneConfig(), clear_of=clear)
             a, b, c = (mesh.surface[i].astype(np.float64) for i in range(3))
-            n = np.cross(b - a, c - a)[:2]
-            centre = mesh.surface[:, :2].mean(axis=0)
-            return float(np.sign(np.dot(n, a[:2] - centre)))
-        assert facing(clipped) == facing(whole)
+            normal = np.cross(b - a, c - a)[:2]
+            # a wall of a convex footprint faces away from the footprint's centre
+            assert float(np.dot(normal, a[:2] - mesh.surface[:, :2].mean(axis=0))) > 0.0
